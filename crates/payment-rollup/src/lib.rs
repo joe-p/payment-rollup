@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use sha2::{Digest, Sha512_256};
 
@@ -42,10 +42,20 @@ const ENCODED_TX_SIZE: usize = 32 + 8 + 32 + 8;
 
 const ENCODED_ACCOUNT_SIZE: usize = 8 + 8 + 32;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationError {
     InvalidAuthAddress,
     InvalidNonce,
+    /// A transaction spends from an address the witness proves holds no account.
+    UnknownSender,
+    InsufficientFunds,
+    AmountOverflow,
+    /// A witness proof is internally inconsistent; see [`MerkleProof`].
+    MalformedProof,
+    /// A witness does not describe the state at the point in the block where it is used.
+    StaleWitness,
+    /// Replaying the transactions from `old_root` did not land on the block's `new_root`.
+    RootMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +186,133 @@ pub struct SignedTransaction {
     sig: Signature,
 }
 
+/// Everything a verifier needs to know about one leaf slot at the moment it is written.
+///
+/// `proof` serves twice: with `old_account` it pins the pre-state against the running root, and
+/// with the computed post-state it yields the next root. The siblings are never checked directly
+/// -- a witness carrying the wrong ones simply fails to reproduce the running root.
+pub struct LeafWitness {
+    /// State of the slot immediately before the write, or `None` for an empty slot.
+    old_account: Option<Account>,
+    proof: MerkleProof,
+}
+
+/// A transaction together with the two leaf slots it writes.
+///
+/// Pairing them in one struct is what makes a witness count mismatch unrepresentable: there is no
+/// way to build a block whose witnesses have drifted out of step with its transactions.
+pub struct SignedTransactionWithWitnesses {
+    stxn: SignedTransaction,
+    sender_witness: LeafWitness,
+    receiver_witness: LeafWitness,
+}
+
+impl SignedTransactionWithWitnesses {
+    pub fn stxn(&self) -> &SignedTransaction {
+        &self.stxn
+    }
+}
+
+/// A batch of transactions and the root transition they produce.
+///
+/// The witnesses make the transition verifiable by [`verify_block`] without any account state, so
+/// a verifier holding nothing but these bytes can confirm that `old_root` becomes `new_root`.
 pub struct Block {
     old_root: [u8; 32],
     new_root: [u8; 32],
-    txns: Vec<SignedTransaction>,
+    txns: Vec<SignedTransactionWithWitnesses>,
+}
+
+impl Block {
+    pub fn old_root(&self) -> [u8; 32] {
+        self.old_root
+    }
+
+    pub fn new_root(&self) -> [u8; 32] {
+        self.new_root
+    }
+
+    pub fn txns(&self) -> &[SignedTransactionWithWitnesses] {
+        &self.txns
+    }
+}
+
+/// The root implied by `account` sitting at `address`, or an error if `proof` is malformed.
+fn root_with(
+    address: &Address,
+    account: Option<&Account>,
+    proof: &MerkleProof,
+) -> Result<[u8; 32], VerificationError> {
+    merkle::root_from_proof(address, account, proof).ok_or(VerificationError::MalformedProof)
+}
+
+/// Check that `witness` describes the slot for `address` as it stands at `root`.
+fn expect_pre_state(
+    address: &Address,
+    witness: &LeafWitness,
+    root: [u8; 32],
+) -> Result<(), VerificationError> {
+    if root_with(address, witness.old_account.as_ref(), &witness.proof)? == root {
+        Ok(())
+    } else {
+        Err(VerificationError::StaleWitness)
+    }
+}
+
+/// Replay `block` against its own witnesses, with no access to a [`Ledger`].
+///
+/// Each transaction writes two slots -- sender then receiver -- and every write both checks the
+/// pre-state against the running root and advances it. Chaining the roots this way means a
+/// self-payment needs no special case: the receiver write reads the slot the sender write just
+/// produced, and the root comparison enforces that it agrees.
+///
+/// Nothing here trusts the witness. Addresses come from the transactions, post-states are computed
+/// rather than supplied, and a created account is pinned to [`Account::empty`], so a prover cannot
+/// choose the `auth_address` of an account it brings into existence.
+pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
+    let mut root = block.old_root;
+
+    for entry in &block.txns {
+        let txn = &entry.stxn.txn;
+        let (sender_addr, receiver_addr, amt) = (txn.sender, txn.receiver, txn.amount);
+
+        expect_pre_state(&sender_addr, &entry.sender_witness, root)?;
+        let mut sender = entry
+            .sender_witness
+            .old_account
+            .ok_or(VerificationError::UnknownSender)?;
+        // TODO: crypto verification
+        entry.stxn.sig.verify_auth(&sender)?;
+        sender.amount = sender
+            .amount
+            .checked_sub(amt)
+            .ok_or(VerificationError::InsufficientFunds)?;
+        sender.update_nonce(txn.nonce)?;
+        root = root_with(&sender_addr, Some(&sender), &entry.sender_witness.proof)?;
+
+        // Read against the root the sender write just produced, so a self-payment sees the debited
+        // balance and the bumped nonce.
+        expect_pre_state(&receiver_addr, &entry.receiver_witness, root)?;
+        let mut receiver = entry
+            .receiver_witness
+            .old_account
+            .unwrap_or_else(|| Account::empty(receiver_addr));
+        receiver.amount = receiver
+            .amount
+            .checked_add(amt)
+            .ok_or(VerificationError::AmountOverflow)?;
+        root = root_with(
+            &receiver_addr,
+            Some(&receiver),
+            &entry.receiver_witness.proof,
+        )?;
+    }
+
+    if root == block.new_root {
+        Ok(())
+    } else {
+        Err(VerificationError::RootMismatch)
+    }
 }
 
 #[derive(Default)]
@@ -229,45 +362,52 @@ impl Ledger {
     }
 
     pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
-        let mut touched: HashSet<Address> = HashSet::new();
         let old_root = self.state_root();
+        let mut txns = Vec::with_capacity(stxns.len());
 
-        for stxn in &stxns {
+        for stxn in stxns {
             let sender_addr = stxn.txn.sender;
             let receiver_addr = stxn.txn.receiver;
             let amt = stxn.txn.amount;
+
+            let sender_witness = LeafWitness {
+                old_account: self.accounts.get(&sender_addr).copied(),
+                proof: self.tree.proof(&sender_addr),
+            };
 
             let sender = self.accounts.get_mut(&sender_addr).unwrap();
             stxn.sig.verify_auth(sender).unwrap();
             // TODO: crypto verification
             sender.amount = sender.amount.checked_sub(amt).unwrap();
             sender.update_nonce(stxn.txn.nonce).unwrap();
-            touched.insert(sender_addr);
+            let sender = *sender;
+            self.tree.update(&sender_addr, Some(&sender));
+
+            // Captured after the sender write, so a self-payment witnesses the debited balance.
+            let receiver_witness = LeafWitness {
+                old_account: self.accounts.get(&receiver_addr).copied(),
+                proof: self.tree.proof(&receiver_addr),
+            };
 
             let receiver = self
                 .accounts
                 .entry(receiver_addr)
                 .or_insert_with(|| Account::empty(receiver_addr));
             receiver.amount = receiver.amount.checked_add(amt).unwrap();
-            touched.insert(receiver_addr);
-        }
+            let receiver = *receiver;
+            self.tree.update(&receiver_addr, Some(&receiver));
 
-        self.commit(touched);
+            txns.push(SignedTransactionWithWitnesses {
+                stxn,
+                sender_witness,
+                receiver_witness,
+            });
+        }
 
         Block {
             old_root,
             new_root: self.state_root(),
-            txns: stxns,
-        }
-    }
-
-    /// Rehash the tree for each touched address, reading its final state from `accounts`. The
-    /// order of `touched` does not matter: an address has one fixed leaf slot, so the root depends
-    /// only on the account set.
-    fn commit(&mut self, touched: HashSet<Address>) {
-        for address in touched {
-            let account = self.accounts.get(&address).copied();
-            self.tree.update(&address, account.as_ref());
+            txns,
         }
     }
 }
@@ -305,6 +445,138 @@ mod tests {
         ledger.insert_account(address, account);
 
         address
+    }
+
+    /// A payment of `amount` from the account for `key` to `receiver`, signed by `key`.
+    fn stxn(key: &[u8], nonce: u64, receiver: Address, amount: u64) -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                sender: address_from_public_key(SCHEME, key),
+                nonce,
+                receiver,
+                amount,
+            },
+            sig: signature(key),
+        }
+    }
+
+    /// A ledger holding `a key` and `b key`, and the address the `fresh key` account would live at
+    /// once something pays it.
+    fn three_txn_block() -> (Block, Address, Address, Address) {
+        let mut ledger = Ledger::new();
+        let a = fund(&mut ledger, b"a key", 1_000);
+        let b = fund(&mut ledger, b"b key", 500);
+        let fresh = address_from_public_key(SCHEME, b"fresh key");
+
+        let block = ledger.get_block(vec![
+            // A plain payment, a payment that brings a new account into existence, and a
+            // self-payment -- the three shapes a witness has to cover.
+            stxn(b"a key", 1, b, 100),
+            stxn(b"b key", 1, fresh, 50),
+            stxn(b"a key", 2, a, 25),
+        ]);
+
+        (block, a, b, fresh)
+    }
+
+    #[test]
+    fn a_block_verifies_with_no_access_to_the_ledger() {
+        let (block, ..) = three_txn_block();
+
+        assert_eq!(verify_block(&block), Ok(()));
+    }
+
+    #[test]
+    fn verify_block_agrees_with_the_ledger_that_built_it() {
+        let mut ledger = Ledger::new();
+        let sender = fund(&mut ledger, b"sender key", 1_000);
+        let receiver = fund(&mut ledger, b"receiver key", 5);
+
+        let before = ledger.state_root();
+        let block = ledger.get_block(vec![stxn(b"sender key", 1, receiver, 250)]);
+
+        assert_eq!(block.old_root(), before);
+        assert_eq!(block.new_root(), ledger.state_root());
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(ledger.account(&sender).unwrap().amount(), 750);
+    }
+
+    #[test]
+    fn verify_block_rejects_a_doctored_pre_state() {
+        let (mut block, ..) = three_txn_block();
+
+        // Claim the sender was richer than it was. The witness proof pins the pre-state to the
+        // running root, so an inflated balance cannot reproduce it.
+        block.txns[0].sender_witness.old_account = Some(account_at(b"a key", 0, 1_000_000).1);
+
+        assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
+    }
+
+    #[test]
+    fn a_created_account_cannot_have_its_auth_address_chosen() {
+        let (mut block, ..) = three_txn_block();
+        let attacker = address_from_public_key(SCHEME, b"attacker key");
+
+        // The second transaction creates `fresh`, so its receiver slot is empty. Claiming it
+        // already held an account the attacker can sign for would hand them the balance.
+        block.txns[1].receiver_witness.old_account = Some(Account::new(0, 0, attacker));
+
+        assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
+    }
+
+    #[test]
+    fn verify_block_rejects_a_transition_to_the_wrong_root() {
+        let (mut block, ..) = three_txn_block();
+        block.new_root = [0xff; 32];
+
+        assert_eq!(verify_block(&block), Err(VerificationError::RootMismatch));
+    }
+
+    #[test]
+    fn verify_block_rejects_a_dropped_transaction() {
+        let (mut block, ..) = three_txn_block();
+
+        // A witness can no longer go missing on its own -- it travels with its transaction. Drop
+        // the whole entry and the remaining two no longer reach the claimed `new_root`.
+        block.txns.pop();
+
+        assert_eq!(verify_block(&block), Err(VerificationError::RootMismatch));
+    }
+
+    #[test]
+    fn verify_block_rejects_reordered_transactions() {
+        let (mut block, ..) = three_txn_block();
+
+        // The swap carries each transaction's own witnesses with it, and it still fails: a witness
+        // describes one specific point in the root chain, so order is load-bearing on its own.
+        block.txns.swap(0, 1);
+
+        assert!(verify_block(&block).is_err());
+    }
+
+    #[test]
+    fn verify_block_rejects_spending_from_an_empty_slot() {
+        let mut ledger = Ledger::new();
+        let receiver = fund(&mut ledger, b"receiver key", 10);
+        let funded = fund(&mut ledger, b"sender key", 100);
+
+        let mut block = ledger.get_block(vec![stxn(b"sender key", 1, receiver, 40)]);
+
+        // Rewrite the transaction to spend from an address with no account, and hand it the
+        // matching absence proof from before the block -- the strongest witness there is for that
+        // slot. A missing sender must still be rejected outright.
+        let empty = address_from_public_key(SCHEME, b"no account here");
+        let mut fresh_ledger = Ledger::new();
+        fresh_ledger.insert_account(receiver, account_at(b"receiver key", 0, 10).1);
+        fresh_ledger.insert_account(funded, account_at(b"sender key", 0, 100).1);
+
+        block.txns[0].stxn.txn.sender = empty;
+        block.txns[0].sender_witness = LeafWitness {
+            old_account: None,
+            proof: fresh_ledger.proof(&empty),
+        };
+
+        assert_eq!(verify_block(&block), Err(VerificationError::UnknownSender));
     }
 
     #[test]
@@ -438,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_commit_matches_rebuilding_from_final_state() {
+    fn sequential_writes_match_rebuilding_from_final_state() {
         let a_sig = signature(b"a key");
         let b_sig = signature(b"b key");
 
@@ -448,9 +720,10 @@ mod tests {
         // `c` starts empty, so plain account creation is all it needs.
         let c = ledger.create_account(SCHEME, b"c key");
 
-        // `a` and `b` are each touched by more than one transaction, so the batched commit
-        // rehashes their paths once instead of twice and three times respectively.
-        ledger.get_block(vec![
+        // `a` and `b` are each written by more than one transaction, so their leaf slots are
+        // rehashed repeatedly. The end state must still match a ledger built directly from it: an
+        // address has one fixed slot, so the root depends only on the final account set.
+        let block = ledger.get_block(vec![
             SignedTransaction {
                 txn: Transaction {
                     sender: a,
@@ -494,6 +767,7 @@ mod tests {
         assert_eq!(ledger.account(&b), expected.account(&b));
         assert_eq!(ledger.account(&c), expected.account(&c));
         assert_eq!(ledger.state_root(), expected.state_root());
+        assert_eq!(verify_block(&block), Ok(()));
 
         for address in [a, b, c] {
             assert!(verify_proof(

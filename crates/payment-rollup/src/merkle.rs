@@ -202,19 +202,20 @@ impl MerkleProof {
     }
 }
 
-/// Check `proof` against `root` without access to the tree, so a verifier holding only the state
-/// root can run it.
+/// The root implied by putting `account` in the slot for `address` and hashing up along `proof`,
+/// or `None` if `proof` is malformed.
 ///
-/// Pass `Some(account)` to prove that `address` holds exactly that account, or `None` to prove
-/// that it holds no account at all.
-pub fn verify_proof(
-    root: &[u8; 32],
+/// The same `proof` describes the path both before and after a write, so a caller replaying a
+/// state transition can verify the pre-state and compute the post-state root from one witness:
+/// call this with the old account and compare against the current root, then call it again with
+/// the new account to get the next root.
+pub(crate) fn root_from_proof(
     address: &Address,
     account: Option<&Account>,
     proof: &MerkleProof,
-) -> bool {
+) -> Option<[u8; 32]> {
     if proof.non_empty_count() != proof.siblings.len() {
-        return false;
+        return None;
     }
 
     let empty = empty_hashes();
@@ -237,7 +238,21 @@ pub fn verify_proof(
         };
     }
 
-    &current == root
+    Some(current)
+}
+
+/// Check `proof` against `root` without access to the tree, so a verifier holding only the state
+/// root can run it.
+///
+/// Pass `Some(account)` to prove that `address` holds exactly that account, or `None` to prove
+/// that it holds no account at all.
+pub fn verify_proof(
+    root: &[u8; 32],
+    address: &Address,
+    account: Option<&Account>,
+    proof: &MerkleProof,
+) -> bool {
+    root_from_proof(address, account, proof) == Some(*root)
 }
 
 #[cfg(test)]
