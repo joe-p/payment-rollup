@@ -177,6 +177,8 @@ pub struct SignedTransaction {
 }
 
 pub struct Block {
+    old_root: [u8; 32],
+    new_root: [u8; 32],
     txns: Vec<SignedTransaction>,
 }
 
@@ -226,10 +228,11 @@ impl Ledger {
         self.tree.proof(address)
     }
 
-    pub fn process_block(&mut self, block: Block) {
+    pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
         let mut touched: HashSet<Address> = HashSet::new();
+        let old_root = self.state_root();
 
-        for stxn in &block.txns {
+        for stxn in &stxns {
             let sender_addr = stxn.txn.sender;
             let receiver_addr = stxn.txn.receiver;
             let amt = stxn.txn.amount;
@@ -250,6 +253,12 @@ impl Ledger {
         }
 
         self.commit(touched);
+
+        Block {
+            old_root,
+            new_root: self.state_root(),
+            txns: stxns,
+        }
     }
 
     /// Rehash the tree for each touched address, reading its final state from `accounts`. The
@@ -308,17 +317,15 @@ mod tests {
 
         let before = ledger.state_root();
 
-        ledger.process_block(Block {
-            txns: vec![SignedTransaction {
-                txn: Transaction {
-                    sender: sender_addr,
-                    nonce: 1,
-                    receiver: receiver_addr,
-                    amount: 250,
-                },
-                sig: sender_sig,
-            }],
-        });
+        ledger.get_block(vec![SignedTransaction {
+            txn: Transaction {
+                sender: sender_addr,
+                nonce: 1,
+                receiver: receiver_addr,
+                amount: 250,
+            },
+            sig: sender_sig,
+        }]);
 
         assert_ne!(ledger.state_root(), before);
         assert_eq!(ledger.account(&sender_addr).unwrap().amount(), 750);
@@ -407,17 +414,15 @@ mod tests {
             &ledger.proof(&new_addr),
         ));
 
-        ledger.process_block(Block {
-            txns: vec![SignedTransaction {
-                txn: Transaction {
-                    sender: sender_addr,
-                    nonce: 1,
-                    receiver: new_addr,
-                    amount: 300,
-                },
-                sig: sender_sig,
-            }],
-        });
+        ledger.get_block(vec![SignedTransaction {
+            txn: Transaction {
+                sender: sender_addr,
+                nonce: 1,
+                receiver: new_addr,
+                amount: 300,
+            },
+            sig: sender_sig,
+        }]);
 
         let created = *ledger.account(&new_addr).unwrap();
         assert_eq!(created, account_at(b"never seen", 0, 300).1);
@@ -445,37 +450,35 @@ mod tests {
 
         // `a` and `b` are each touched by more than one transaction, so the batched commit
         // rehashes their paths once instead of twice and three times respectively.
-        ledger.process_block(Block {
-            txns: vec![
-                SignedTransaction {
-                    txn: Transaction {
-                        sender: a,
-                        nonce: 1,
-                        receiver: b,
-                        amount: 100,
-                    },
-                    sig: a_sig,
+        ledger.get_block(vec![
+            SignedTransaction {
+                txn: Transaction {
+                    sender: a,
+                    nonce: 1,
+                    receiver: b,
+                    amount: 100,
                 },
-                SignedTransaction {
-                    txn: Transaction {
-                        sender: b,
-                        nonce: 1,
-                        receiver: c,
-                        amount: 50,
-                    },
-                    sig: b_sig,
+                sig: a_sig,
+            },
+            SignedTransaction {
+                txn: Transaction {
+                    sender: b,
+                    nonce: 1,
+                    receiver: c,
+                    amount: 50,
                 },
-                SignedTransaction {
-                    txn: Transaction {
-                        sender: signature(b"a key").address(),
-                        nonce: 2,
-                        receiver: b,
-                        amount: 25,
-                    },
-                    sig: signature(b"a key"),
+                sig: b_sig,
+            },
+            SignedTransaction {
+                txn: Transaction {
+                    sender: signature(b"a key").address(),
+                    nonce: 2,
+                    receiver: b,
+                    amount: 25,
                 },
-            ],
-        });
+                sig: signature(b"a key"),
+            },
+        ]);
 
         let mut expected = Ledger::new();
         for (key, nonce, amount) in [
@@ -509,17 +512,15 @@ mod tests {
         let mut ledger = Ledger::new();
         let addr = fund(&mut ledger, b"self key", 100);
 
-        ledger.process_block(Block {
-            txns: vec![SignedTransaction {
-                txn: Transaction {
-                    sender: addr,
-                    nonce: 1,
-                    receiver: addr,
-                    amount: 40,
-                },
-                sig,
-            }],
-        });
+        ledger.get_block(vec![SignedTransaction {
+            txn: Transaction {
+                sender: addr,
+                nonce: 1,
+                receiver: addr,
+                amount: 40,
+            },
+            sig,
+        }]);
 
         let account = *ledger.account(&addr).unwrap();
         assert_eq!(account.amount(), 100);
