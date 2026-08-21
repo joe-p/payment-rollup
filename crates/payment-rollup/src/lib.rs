@@ -131,9 +131,13 @@ impl Account {
     }
 }
 
-pub struct Payment {
+pub struct TransactionHeader {
     sender: Address,
     nonce: u64,
+}
+
+pub struct Payment {
+    header: TransactionHeader,
     receiver: Address,
     amount: u64,
 }
@@ -143,10 +147,10 @@ impl Payment {
         let mut buf = [0u8; ENCODED_TX_SIZE];
         let mut offset = 0;
 
-        buf[offset..offset + self.sender.len()].copy_from_slice(&self.sender);
-        offset += self.sender.len();
+        buf[offset..offset + self.header.sender.len()].copy_from_slice(&self.header.sender);
+        offset += self.header.sender.len();
 
-        let nonce_bytes = self.nonce.to_be_bytes();
+        let nonce_bytes = self.header.nonce.to_be_bytes();
         buf[offset..offset + nonce_bytes.len()].copy_from_slice(&nonce_bytes);
         offset += nonce_bytes.len();
 
@@ -167,13 +171,13 @@ pub enum Transaction {
 impl Transaction {
     pub fn sender(&self) -> Address {
         match self {
-            Transaction::Payment(payment) => payment.sender,
+            Transaction::Payment(payment) => payment.header.sender,
         }
     }
 
     pub fn nonce(&self) -> u64 {
         match self {
-            Transaction::Payment(payment) => payment.nonce,
+            Transaction::Payment(payment) => payment.header.nonce,
         }
     }
 
@@ -405,42 +409,47 @@ impl Ledger {
         let mut txns = Vec::with_capacity(stxns.len());
 
         for stxn in stxns {
-            let sender_addr = stxn.txn.sender();
-            let receiver_addr = stxn.txn.receiver();
-            let amt = stxn.txn.amount();
+            match &stxn.txn {
+                Transaction::Payment(pay) => {
+                    let sender_addr = pay.header.sender;
 
-            let sender_witness = LeafWitness {
-                old_account: self.accounts.get(&sender_addr).copied(),
-                proof: self.tree.proof(&sender_addr),
-            };
+                    let sender_witness = LeafWitness {
+                        old_account: self.accounts.get(&sender_addr).copied(),
+                        proof: self.tree.proof(&sender_addr),
+                    };
 
-            let sender = self.accounts.get_mut(&sender_addr).unwrap();
-            stxn.sig.verify_auth(sender).unwrap();
-            // TODO: crypto verification
-            sender.amount = sender.amount.checked_sub(amt).unwrap();
-            sender.update_nonce(stxn.txn.nonce()).unwrap();
-            let sender = *sender;
-            self.tree.update(&sender_addr, Some(&sender));
+                    let receiver_addr = pay.receiver;
+                    let amt = pay.amount;
 
-            // Captured after the sender write, so a self-payment witnesses the debited balance.
-            let receiver_witness = LeafWitness {
-                old_account: self.accounts.get(&receiver_addr).copied(),
-                proof: self.tree.proof(&receiver_addr),
-            };
+                    let sender = self.accounts.get_mut(&sender_addr).unwrap();
+                    stxn.sig.verify_auth(sender).unwrap();
+                    // TODO: crypto verification
+                    sender.amount = sender.amount.checked_sub(amt).unwrap();
+                    sender.update_nonce(pay.header.nonce).unwrap();
+                    let sender = *sender;
+                    self.tree.update(&sender_addr, Some(&sender));
 
-            let receiver = self
-                .accounts
-                .entry(receiver_addr)
-                .or_insert_with(|| Account::empty(receiver_addr));
-            receiver.amount = receiver.amount.checked_add(amt).unwrap();
-            let receiver = *receiver;
-            self.tree.update(&receiver_addr, Some(&receiver));
+                    // Captured after the sender write, so a self-payment witnesses the debited balance.
+                    let receiver_witness = LeafWitness {
+                        old_account: self.accounts.get(&receiver_addr).copied(),
+                        proof: self.tree.proof(&receiver_addr),
+                    };
 
-            txns.push(SignedTransactionWithWitnesses {
-                stxn,
-                sender_witness,
-                receiver_witness,
-            });
+                    let receiver = self
+                        .accounts
+                        .entry(receiver_addr)
+                        .or_insert_with(|| Account::empty(receiver_addr));
+                    receiver.amount = receiver.amount.checked_add(amt).unwrap();
+                    let receiver = *receiver;
+                    self.tree.update(&receiver_addr, Some(&receiver));
+
+                    txns.push(SignedTransactionWithWitnesses {
+                        stxn,
+                        sender_witness,
+                        receiver_witness,
+                    });
+                }
+            }
         }
 
         Block {
@@ -490,8 +499,10 @@ mod tests {
     fn stxn(key: &[u8], nonce: u64, receiver: Address, amount: u64) -> SignedTransaction {
         SignedTransaction {
             txn: Transaction::Payment(Payment {
-                sender: address_from_public_key(SCHEME, key),
-                nonce,
+                header: TransactionHeader {
+                    sender: address_from_public_key(SCHEME, key),
+                    nonce,
+                },
                 receiver,
                 amount,
             }),
@@ -610,7 +621,7 @@ mod tests {
         fresh_ledger.insert_account(funded, account_at(b"sender key", 0, 100).1);
 
         let Transaction::Payment(payment) = &mut block.txns[0].stxn.txn;
-        payment.sender = empty;
+        payment.header.sender = empty;
         block.txns[0].sender_witness = LeafWitness {
             old_account: None,
             proof: fresh_ledger.proof(&empty),
@@ -631,8 +642,10 @@ mod tests {
 
         ledger.get_block(vec![SignedTransaction {
             txn: Transaction::Payment(Payment {
-                sender: sender_addr,
-                nonce: 1,
+                header: TransactionHeader {
+                    sender: sender_addr,
+                    nonce: 1,
+                },
                 receiver: receiver_addr,
                 amount: 250,
             }),
@@ -728,8 +741,10 @@ mod tests {
 
         ledger.get_block(vec![SignedTransaction {
             txn: Transaction::Payment(Payment {
-                sender: sender_addr,
-                nonce: 1,
+                header: TransactionHeader {
+                    sender: sender_addr,
+                    nonce: 1,
+                },
                 receiver: new_addr,
                 amount: 300,
             }),
@@ -766,8 +781,10 @@ mod tests {
         let block = ledger.get_block(vec![
             SignedTransaction {
                 txn: Transaction::Payment(Payment {
-                    sender: a,
-                    nonce: 1,
+                    header: TransactionHeader {
+                        sender: a,
+                        nonce: 1,
+                    },
                     receiver: b,
                     amount: 100,
                 }),
@@ -775,8 +792,10 @@ mod tests {
             },
             SignedTransaction {
                 txn: Transaction::Payment(Payment {
-                    sender: b,
-                    nonce: 1,
+                    header: TransactionHeader {
+                        sender: b,
+                        nonce: 1,
+                    },
                     receiver: c,
                     amount: 50,
                 }),
@@ -784,8 +803,10 @@ mod tests {
             },
             SignedTransaction {
                 txn: Transaction::Payment(Payment {
-                    sender: signature(b"a key").address(),
-                    nonce: 2,
+                    header: TransactionHeader {
+                        sender: signature(b"a key").address(),
+                        nonce: 2,
+                    },
                     receiver: b,
                     amount: 25,
                 }),
@@ -828,8 +849,10 @@ mod tests {
 
         ledger.get_block(vec![SignedTransaction {
             txn: Transaction::Payment(Payment {
-                sender: addr,
-                nonce: 1,
+                header: TransactionHeader {
+                    sender: addr,
+                    nonce: 1,
+                },
                 receiver: addr,
                 amount: 40,
             }),
