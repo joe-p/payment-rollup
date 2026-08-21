@@ -131,14 +131,14 @@ impl Account {
     }
 }
 
-pub struct Transaction {
+pub struct Payment {
     sender: Address,
     nonce: u64,
     receiver: Address,
     amount: u64,
 }
 
-impl Transaction {
+impl Payment {
     pub fn bytes_to_sign(&self) -> [u8; ENCODED_TX_SIZE] {
         let mut buf = [0u8; ENCODED_TX_SIZE];
         let mut offset = 0;
@@ -157,6 +157,42 @@ impl Transaction {
         buf[offset..offset + amount_bytes.len()].copy_from_slice(&amount_bytes);
 
         buf
+    }
+}
+
+pub enum Transaction {
+    Payment(Payment),
+}
+
+impl Transaction {
+    pub fn sender(&self) -> Address {
+        match self {
+            Transaction::Payment(payment) => payment.sender,
+        }
+    }
+
+    pub fn nonce(&self) -> u64 {
+        match self {
+            Transaction::Payment(payment) => payment.nonce,
+        }
+    }
+
+    pub fn receiver(&self) -> Address {
+        match self {
+            Transaction::Payment(payment) => payment.receiver,
+        }
+    }
+
+    pub fn amount(&self) -> u64 {
+        match self {
+            Transaction::Payment(payment) => payment.amount,
+        }
+    }
+
+    pub fn bytes_to_sign(&self) -> [u8; ENCODED_TX_SIZE] {
+        match self {
+            Transaction::Payment(payment) => payment.bytes_to_sign(),
+        }
     }
 }
 
@@ -277,7 +313,7 @@ pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
 
     for entry in &block.txns {
         let txn = &entry.stxn.txn;
-        let (sender_addr, receiver_addr, amt) = (txn.sender, txn.receiver, txn.amount);
+        let (sender_addr, receiver_addr, amt) = (txn.sender(), txn.receiver(), txn.amount());
 
         expect_pre_state(&sender_addr, &entry.sender_witness, root)?;
         let mut sender = entry
@@ -290,7 +326,7 @@ pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
             .amount
             .checked_sub(amt)
             .ok_or(VerificationError::InsufficientFunds)?;
-        sender.update_nonce(txn.nonce)?;
+        sender.update_nonce(txn.nonce())?;
         root = root_with(&sender_addr, Some(&sender), &entry.sender_witness.proof)?;
 
         // Read against the root the sender write just produced, so a self-payment sees the debited
@@ -369,9 +405,9 @@ impl Ledger {
         let mut txns = Vec::with_capacity(stxns.len());
 
         for stxn in stxns {
-            let sender_addr = stxn.txn.sender;
-            let receiver_addr = stxn.txn.receiver;
-            let amt = stxn.txn.amount;
+            let sender_addr = stxn.txn.sender();
+            let receiver_addr = stxn.txn.receiver();
+            let amt = stxn.txn.amount();
 
             let sender_witness = LeafWitness {
                 old_account: self.accounts.get(&sender_addr).copied(),
@@ -382,7 +418,7 @@ impl Ledger {
             stxn.sig.verify_auth(sender).unwrap();
             // TODO: crypto verification
             sender.amount = sender.amount.checked_sub(amt).unwrap();
-            sender.update_nonce(stxn.txn.nonce).unwrap();
+            sender.update_nonce(stxn.txn.nonce()).unwrap();
             let sender = *sender;
             self.tree.update(&sender_addr, Some(&sender));
 
@@ -453,12 +489,12 @@ mod tests {
     /// A payment of `amount` from the account for `key` to `receiver`, signed by `key`.
     fn stxn(key: &[u8], nonce: u64, receiver: Address, amount: u64) -> SignedTransaction {
         SignedTransaction {
-            txn: Transaction {
+            txn: Transaction::Payment(Payment {
                 sender: address_from_public_key(SCHEME, key),
                 nonce,
                 receiver,
                 amount,
-            },
+            }),
             sig: signature(key),
         }
     }
@@ -573,7 +609,8 @@ mod tests {
         fresh_ledger.insert_account(receiver, account_at(b"receiver key", 0, 10).1);
         fresh_ledger.insert_account(funded, account_at(b"sender key", 0, 100).1);
 
-        block.txns[0].stxn.txn.sender = empty;
+        let Transaction::Payment(payment) = &mut block.txns[0].stxn.txn;
+        payment.sender = empty;
         block.txns[0].sender_witness = LeafWitness {
             old_account: None,
             proof: fresh_ledger.proof(&empty),
@@ -593,12 +630,12 @@ mod tests {
         let before = ledger.state_root();
 
         ledger.get_block(vec![SignedTransaction {
-            txn: Transaction {
+            txn: Transaction::Payment(Payment {
                 sender: sender_addr,
                 nonce: 1,
                 receiver: receiver_addr,
                 amount: 250,
-            },
+            }),
             sig: sender_sig,
         }]);
 
@@ -690,12 +727,12 @@ mod tests {
         ));
 
         ledger.get_block(vec![SignedTransaction {
-            txn: Transaction {
+            txn: Transaction::Payment(Payment {
                 sender: sender_addr,
                 nonce: 1,
                 receiver: new_addr,
                 amount: 300,
-            },
+            }),
             sig: sender_sig,
         }]);
 
@@ -728,30 +765,30 @@ mod tests {
         // address has one fixed slot, so the root depends only on the final account set.
         let block = ledger.get_block(vec![
             SignedTransaction {
-                txn: Transaction {
+                txn: Transaction::Payment(Payment {
                     sender: a,
                     nonce: 1,
                     receiver: b,
                     amount: 100,
-                },
+                }),
                 sig: a_sig,
             },
             SignedTransaction {
-                txn: Transaction {
+                txn: Transaction::Payment(Payment {
                     sender: b,
                     nonce: 1,
                     receiver: c,
                     amount: 50,
-                },
+                }),
                 sig: b_sig,
             },
             SignedTransaction {
-                txn: Transaction {
+                txn: Transaction::Payment(Payment {
                     sender: signature(b"a key").address(),
                     nonce: 2,
                     receiver: b,
                     amount: 25,
-                },
+                }),
                 sig: signature(b"a key"),
             },
         ]);
@@ -790,12 +827,12 @@ mod tests {
         let addr = fund(&mut ledger, b"self key", 100);
 
         ledger.get_block(vec![SignedTransaction {
-            txn: Transaction {
+            txn: Transaction::Payment(Payment {
                 sender: addr,
                 nonce: 1,
                 receiver: addr,
                 amount: 40,
-            },
+            }),
             sig,
         }]);
 
