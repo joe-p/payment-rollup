@@ -1,93 +1,246 @@
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-use sha2::{Digest, Sha512_256};
+use sha2::{Digest, Sha256};
 
 use crate::{Account, Address};
 
-/// Number of levels between the leaves and the root. An [`Address`] is 32 bytes, so every bit of
-/// the address is one step down the tree and each address has its own leaf.
-const DEPTH: u16 = 256;
+/// Longest path the tree can produce. An [`Address`] is 32 bytes, so 256 levels give every address
+/// a position of its own. Paths only run that deep when two addresses agree on all but their last
+/// bit; in practice they run about `log2(accounts)` deep. See [`SparseMerkleTree`].
+const DEPTH: usize = 256;
 
-/// Hash of a slot that holds no account.
-const EMPTY_LEAF: [u8; 32] = [0u8; 32];
+/// Hash of a subtree holding no accounts.
+///
+/// One constant serves every depth. Making it depth-dependent would buy nothing: a subtree hash is
+/// only ever reached by descending a fixed number of levels from the root, so the path that leads
+/// to it already pins its depth.
+const EMPTY_SUBTREE: [u8; 32] = [0u8; 32];
 
-/// `EMPTY[l]` is the hash of a subtree of height `l` containing no accounts at all. `EMPTY[DEPTH]`
-/// is the root of an empty tree.
-fn empty_hashes() -> &'static [[u8; 32]; DEPTH as usize + 1] {
-    static EMPTY: OnceLock<[[u8; 32]; DEPTH as usize + 1]> = OnceLock::new();
-
-    EMPTY.get_or_init(|| {
-        let mut table = [EMPTY_LEAF; DEPTH as usize + 1];
-        for level in 1..=DEPTH as usize {
-            table[level] = node_hash(&table[level - 1], &table[level - 1]);
-        }
-        table
-    })
-}
-
+/// Commitment to one account, which doubles as the hash of any subtree holding only that account.
+///
+/// The whole address is committed to, not just the path bits below the point where the leaf sits,
+/// so a leaf cannot be relocated: a verifier that reaches this hash by descending `d` levels knows
+/// the address it names really does start with those `d` bits.
 fn leaf_hash(address: &Address, account: &Account) -> [u8; 32] {
-    let mut hash_input = Vec::new();
-    hash_input.extend(b"LEAF");
-    hash_input.extend(address);
-    hash_input.extend(account.encode());
+    let mut hasher = Sha256::new();
+    hasher.update(b"LEAF");
+    hasher.update(address);
+    hasher.update(account.encode());
 
-    Sha512_256::digest(hash_input).into()
+    hasher.finalize().into()
 }
 
+/// Commitment to a subtree holding two or more accounts.
+///
+/// The tag domain-separates this from [`leaf_hash`], which is what makes a leaf's depth
+/// unforgeable: short of a collision, a hash cannot pass as both a leaf and a branch, so a prover
+/// cannot claim a leaf sits higher or lower than it does.
 fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hash_input = Vec::new();
-    hash_input.extend(b"NODE");
-    hash_input.extend(left);
-    hash_input.extend(right);
+    let mut hasher = Sha256::new();
+    hasher.update(b"NODE");
+    hasher.update(left);
+    hasher.update(right);
 
-    Sha512_256::digest(hash_input).into()
+    hasher.finalize().into()
 }
 
-/// The bit of `address` at `index`, reading most significant bit first.
-fn bit_at(address: &Address, index: usize) -> u8 {
-    (address[index / 8] >> (7 - index % 8)) & 1
+/// The bit of `address` that decides which way to go at `depth`, reading most significant first.
+fn bit_at(address: &Address, depth: usize) -> usize {
+    ((address[depth / 8] >> (7 - depth % 8)) & 1) as usize
 }
 
-fn flip_bit(address: &mut Address, index: usize) {
-    address[index / 8] ^= 1 << (7 - index % 8);
-}
-
-/// The key of the node at `level` that `address` descends through: the top `DEPTH - level` bits of
-/// the address, with the rest zeroed.
-fn prefix(address: &Address, level: u16) -> Address {
-    let significant_bits = (DEPTH - level) as usize;
-    let full_bytes = significant_bits / 8;
-    let leftover_bits = significant_bits % 8;
-
-    let mut key = [0u8; 32];
-    key[..full_bytes].copy_from_slice(&address[..full_bytes]);
-    if leftover_bits > 0 {
-        key[full_bytes] = address[full_bytes] & (0xffu8 << (8 - leftover_bits));
+/// How many leading bits `a` and `b` share, or [`DEPTH`] when they are equal.
+///
+/// This is the depth of the branch that separates two addresses, and so the length of the paths
+/// leading to them.
+fn common_prefix_len(a: &Address, b: &Address) -> usize {
+    for (index, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            return index * 8 + (x ^ y).leading_zeros() as usize;
+        }
     }
 
-    key
+    DEPTH
 }
 
-/// The key of the sibling that the `address` node at `level` is hashed with.
-fn sibling_key(address: &Address, level: u16) -> Address {
-    let mut key = prefix(address, level);
-    flip_bit(&mut key, (DEPTH - 1 - level) as usize);
+/// One position in the tree.
+///
+/// The three cases are exactly the three things a subtree can hold -- nothing, one account, or two
+/// or more -- and each has its own hash, so the shape of the tree is determined by its contents
+/// alone.
+#[derive(Debug)]
+enum Node {
+    Empty,
+    Leaf { address: Address, account: Account },
+    Branch(Box<Branch>),
+}
 
-    key
+#[derive(Debug)]
+struct Branch {
+    /// Cached [`node_hash`] of the two children, kept current by [`Branch::rehash`].
+    hash: [u8; 32],
+    children: [Node; 2],
+}
+
+impl Branch {
+    fn rehash(&mut self) {
+        self.hash = node_hash(&self.children[0].hash(), &self.children[1].hash());
+    }
+}
+
+impl Node {
+    fn branch(left: Node, right: Node) -> Node {
+        Node::Branch(Box::new(Branch {
+            hash: node_hash(&left.hash(), &right.hash()),
+            children: [left, right],
+        }))
+    }
+
+    fn hash(&self) -> [u8; 32] {
+        match self {
+            Node::Empty => EMPTY_SUBTREE,
+            Node::Leaf { address, account } => leaf_hash(address, account),
+            Node::Branch(branch) => branch.hash,
+        }
+    }
+
+    /// Write `account` into the slot for `address` within this subtree, which sits at `depth`.
+    fn insert(&mut self, depth: usize, address: &Address, account: &Account) {
+        match self {
+            Node::Empty => {
+                *self = Node::Leaf {
+                    address: *address,
+                    account: *account,
+                };
+            }
+            Node::Leaf {
+                address: held,
+                account: held_account,
+            } => {
+                if *held == *address {
+                    *held_account = *account;
+                } else {
+                    // The slot is taken by someone else, so the leaf sitting here has to move down
+                    // far enough that the two addresses part ways.
+                    *self = Node::split(depth, (*held, *held_account), (*address, *account));
+                }
+            }
+            Node::Branch(branch) => {
+                branch.children[bit_at(address, depth)].insert(depth + 1, address, account);
+                branch.rehash();
+            }
+        }
+    }
+
+    /// Clear the slot for `address`, then pull the tree back into shape.
+    fn remove(&mut self, depth: usize, address: &Address) {
+        match self {
+            Node::Empty => {}
+            Node::Leaf { address: held, .. } => {
+                if *held == *address {
+                    *self = Node::Empty;
+                }
+            }
+            Node::Branch(branch) => {
+                branch.children[bit_at(address, depth)].remove(depth + 1, address);
+                branch.rehash();
+                self.collapse();
+            }
+        }
+    }
+
+    /// Replace a branch that has been emptied down to one account or none with what it holds.
+    ///
+    /// Without this a removal would leave branches standing over a single leaf, and the tree would
+    /// no longer be the canonical shape for its contents -- two ledgers holding the same accounts
+    /// would disagree on the root.
+    fn collapse(&mut self) {
+        let Node::Branch(branch) = self else { return };
+
+        let promoted = match &mut branch.children {
+            [Node::Empty, Node::Empty] => Node::Empty,
+            [leaf @ Node::Leaf { .. }, Node::Empty] | [Node::Empty, leaf @ Node::Leaf { .. }] => {
+                std::mem::replace(leaf, Node::Empty)
+            }
+            _ => return,
+        };
+
+        *self = promoted;
+    }
+
+    /// A subtree at `depth` holding exactly `a` and `b`, whose addresses must differ.
+    ///
+    /// The two leaves sit just under the bit where their addresses first diverge, with a chain of
+    /// one-child branches above them -- the shortest arrangement the addresses allow.
+    fn split(depth: usize, a: (Address, Account), b: (Address, Account)) -> Node {
+        let split_depth = common_prefix_len(&a.0, &b.0);
+
+        let a_leaf = Node::Leaf {
+            address: a.0,
+            account: a.1,
+        };
+        let b_leaf = Node::Leaf {
+            address: b.0,
+            account: b.1,
+        };
+
+        let mut node = if bit_at(&a.0, split_depth) == 0 {
+            Node::branch(a_leaf, b_leaf)
+        } else {
+            Node::branch(b_leaf, a_leaf)
+        };
+
+        // Above the split the two addresses agree, so either one gives the same path back up.
+        for level in (depth..split_depth).rev() {
+            node = if bit_at(&a.0, level) == 0 {
+                Node::branch(node, Node::Empty)
+            } else {
+                Node::branch(Node::Empty, node)
+            };
+        }
+
+        node
+    }
+
+    /// Walk towards `address`, pushing the sibling hash passed at each level, and report what the
+    /// path runs into.
+    fn prove(&self, depth: usize, address: &Address, siblings: &mut Vec<[u8; 32]>) -> Slot {
+        match self {
+            Node::Empty => Slot::Own,
+            Node::Leaf {
+                address: held,
+                account,
+            } => {
+                if *held == *address {
+                    Slot::Own
+                } else {
+                    Slot::Neighbor {
+                        address: *held,
+                        account: *account,
+                    }
+                }
+            }
+            Node::Branch(branch) => {
+                let taken = bit_at(address, depth);
+                siblings.push(branch.children[1 - taken].hash());
+
+                branch.children[taken].prove(depth + 1, address, siblings)
+            }
+        }
+    }
 }
 
 /// A sparse Merkle tree over account state, keyed by [`Address`].
 ///
-/// Every address has a fixed leaf slot, so the root depends only on the set of accounts and not on
-/// the order they were written. Subtrees holding no accounts collapse to the precomputed constants
-/// in [`empty_hashes`] and are never stored, which keeps the node map proportional to the number
-/// of accounts rather than to the size of the address space.
+/// Every address has one fixed position, so the root depends only on the set of accounts and not on
+/// the order they were written.
+///
+/// Subtrees are compressed: one holding no accounts is [`EMPTY_SUBTREE`] and one holding a single
+/// account is just that account's [`leaf_hash`], whatever depth it sits at. A path therefore stops
+/// as soon as it has separated its address from every other account in the tree -- about
+/// `log2(accounts)` levels -- rather than running the full [`DEPTH`]. Since verifying one proof
+/// costs one hash per level, that is the difference between a few dozen hashes and 256, which is
+/// what makes [`crate::verify_block`] affordable inside a zkVM.
 pub struct SparseMerkleTree {
-    /// Non-empty nodes at levels `0..DEPTH`, keyed by `(level, prefix)`. Nodes equal to their
-    /// empty-subtree constant are pruned, so a present entry always means a non-empty subtree.
-    nodes: HashMap<(u16, Address), [u8; 32]>,
-    root: [u8; 32],
+    root: Node,
 }
 
 impl Default for SparseMerkleTree {
@@ -98,143 +251,162 @@ impl Default for SparseMerkleTree {
 
 impl SparseMerkleTree {
     pub fn new() -> Self {
-        Self {
-            nodes: HashMap::new(),
-            root: empty_hashes()[DEPTH as usize],
-        }
+        Self { root: Node::Empty }
     }
 
     pub fn root(&self) -> [u8; 32] {
-        self.root
+        self.root.hash()
     }
 
-    /// Write `account` into the slot for `address`, or clear the slot when it is `None`, then
-    /// rehash the path up to the root. Costs `DEPTH` hashes.
+    /// Write `account` into the slot for `address`, or clear the slot when it is `None`.
     pub fn update(&mut self, address: &Address, account: Option<&Account>) {
-        let empty = empty_hashes();
-
-        let mut current = match account {
-            Some(account) => leaf_hash(address, account),
-            None => EMPTY_LEAF,
-        };
-        self.store(0, *address, current);
-
-        for level in 0..DEPTH {
-            let sibling = self
-                .nodes
-                .get(&(level, sibling_key(address, level)))
-                .copied()
-                .unwrap_or(empty[level as usize]);
-
-            current = if bit_at(address, (DEPTH - 1 - level) as usize) == 0 {
-                node_hash(&current, &sibling)
-            } else {
-                node_hash(&sibling, &current)
-            };
-
-            if level + 1 < DEPTH {
-                self.store(level + 1, prefix(address, level + 1), current);
-            }
+        match account {
+            Some(account) => self.root.insert(0, address, account),
+            None => self.root.remove(0, address),
         }
-
-        self.root = current;
     }
 
     /// Prove what the tree holds for `address`. An address with no account yields a non-inclusion
     /// proof, which [`verify_proof`] checks by passing `None` as the account.
     pub fn proof(&self, address: &Address) -> MerkleProof {
-        let mut bitmap = [0u8; 32];
         let mut siblings = Vec::new();
+        let slot = self.root.prove(0, address, &mut siblings);
 
-        for level in 0..DEPTH {
-            if let Some(sibling) = self.nodes.get(&(level, sibling_key(address, level))) {
-                bitmap[(level / 8) as usize] |= 1 << (level % 8);
-                siblings.push(*sibling);
-            }
-        }
-
-        MerkleProof { bitmap, siblings }
-    }
-
-    fn store(&mut self, level: u16, key: Address, hash: [u8; 32]) {
-        if hash == empty_hashes()[level as usize] {
-            self.nodes.remove(&(level, key));
-        } else {
-            self.nodes.insert((level, key), hash);
-        }
+        MerkleProof { siblings, slot }
     }
 }
 
-/// A path from a leaf slot to the root.
+/// What the end of a [`MerkleProof`]'s path holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// The proven address's own position: empty, or holding that address's account.
+    Own,
+    /// Another account's leaf, occupying the position the proven address descends into because no
+    /// third account forces the two of them apart yet.
+    ///
+    /// This is the second shape a non-inclusion proof takes, and the reason a proof reveals a
+    /// neighboring account. Writing to the proven address pushes this leaf down; see
+    /// [`root_from_proof`].
+    Neighbor { address: Address, account: Account },
+}
+
+/// A path from the root down to one position in the tree.
 ///
-/// Most of the `DEPTH` siblings on any real path are empty-subtree constants, so only the
-/// non-empty ones are carried. Bit `l` of `bitmap` (byte `l / 8`, bit `l % 8`) is set when the
-/// sibling at level `l` is non-empty and consumes the next entry of `siblings`; when it is clear
-/// the sibling is `empty_hashes()[l]`.
+/// `siblings[i]` is the hash of the subtree turned away from at depth `i`, so `siblings.len()` is
+/// the depth of the position the path ends at -- there is no separate depth field to disagree with
+/// it. The siblings themselves are never checked: a proof carrying the wrong ones simply fails to
+/// reproduce the root it is measured against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MerkleProof {
-    bitmap: [u8; 32],
     siblings: Vec<[u8; 32]>,
+    slot: Slot,
 }
 
 impl MerkleProof {
-    fn sibling_at(&self, level: u16) -> Option<usize> {
-        if self.bitmap[(level / 8) as usize] & (1 << (level % 8)) == 0 {
-            return None;
-        }
-
-        // The index into `siblings` is how many bits are set below `level`.
-        let whole_bytes = (level / 8) as usize;
-        let set_below: u32 = self.bitmap[..whole_bytes]
-            .iter()
-            .map(|byte| byte.count_ones())
-            .sum::<u32>()
-            + (self.bitmap[whole_bytes] & ((1u8 << (level % 8)) - 1)).count_ones();
-
-        Some(set_below as usize)
+    /// How deep the proven position sits, and so how many hashes verifying costs.
+    pub fn depth(&self) -> usize {
+        self.siblings.len()
     }
 
-    fn non_empty_count(&self) -> usize {
-        self.bitmap
-            .iter()
-            .map(|byte| byte.count_ones() as usize)
-            .sum()
+    pub fn slot(&self) -> &Slot {
+        &self.slot
     }
+}
+
+/// A neighbor has to be a different address that genuinely descends alongside `address` as far as
+/// `depth`, or the proof is describing a leaf in a position its own address contradicts.
+fn check_neighbor(address: &Address, neighbor: &Address, depth: usize) -> Option<()> {
+    if neighbor != address && common_prefix_len(address, neighbor) >= depth {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Hash of the subtree at `depth` once `address` moves in beside the neighbor already there.
+///
+/// The neighbor is pushed down to just below the bit where the two addresses diverge, which is
+/// fixed by the addresses themselves -- a prover has no say in the resulting shape.
+fn subtree_with_both(
+    depth: usize,
+    (address, account): (&Address, &Account),
+    (neighbor, held): (&Address, &Account),
+) -> [u8; 32] {
+    let split_depth = common_prefix_len(address, neighbor);
+    let (own, other) = (leaf_hash(address, account), leaf_hash(neighbor, held));
+
+    let mut current = if bit_at(address, split_depth) == 0 {
+        node_hash(&own, &other)
+    } else {
+        node_hash(&other, &own)
+    };
+
+    for level in (depth..split_depth).rev() {
+        current = if bit_at(address, level) == 0 {
+            node_hash(&current, &EMPTY_SUBTREE)
+        } else {
+            node_hash(&EMPTY_SUBTREE, &current)
+        };
+    }
+
+    current
 }
 
 /// The root implied by putting `account` in the slot for `address` and hashing up along `proof`,
 /// or `None` if `proof` is malformed.
 ///
-/// The same `proof` describes the path both before and after a write, so a caller replaying a
+/// The same `proof` describes the position both before and after a write, so a caller replaying a
 /// state transition can verify the pre-state and compute the post-state root from one witness:
 /// call this with the old account and compare against the current root, then call it again with
-/// the new account to get the next root.
+/// the new account to get the next root. Compression does not cost that property, because each of
+/// the four combinations of slot and account is a state the position can actually be in:
+///
+/// - `Own` with no account -- the position is empty, so nothing in the tree shares its prefix.
+/// - `Own` with an account -- the account is there, or is being written into the empty position.
+/// - `Neighbor` with no account -- the position is held by someone else, so `address` is absent.
+/// - `Neighbor` with an account -- `address` is being written in, pushing the neighbor down.
 pub(crate) fn root_from_proof(
     address: &Address,
     account: Option<&Account>,
     proof: &MerkleProof,
 ) -> Option<[u8; 32]> {
-    if proof.non_empty_count() != proof.siblings.len() {
+    let depth = proof.siblings.len();
+    if depth > DEPTH {
         return None;
     }
 
-    let empty = empty_hashes();
+    let mut current = match (&proof.slot, account) {
+        (Slot::Own, None) => EMPTY_SUBTREE,
+        (Slot::Own, Some(account)) => leaf_hash(address, account),
+        (
+            Slot::Neighbor {
+                address: neighbor,
+                account: held,
+            },
+            None,
+        ) => {
+            check_neighbor(address, neighbor, depth)?;
 
-    let mut current = match account {
-        Some(account) => leaf_hash(address, account),
-        None => EMPTY_LEAF,
+            leaf_hash(neighbor, held)
+        }
+        (
+            Slot::Neighbor {
+                address: neighbor,
+                account: held,
+            },
+            Some(account),
+        ) => {
+            check_neighbor(address, neighbor, depth)?;
+
+            subtree_with_both(depth, (address, account), (neighbor, held))
+        }
     };
 
-    for level in 0..DEPTH {
-        let sibling = match proof.sibling_at(level) {
-            Some(index) => proof.siblings[index],
-            None => empty[level as usize],
-        };
-
-        current = if bit_at(address, (DEPTH - 1 - level) as usize) == 0 {
-            node_hash(&current, &sibling)
+    for level in (0..depth).rev() {
+        current = if bit_at(address, level) == 0 {
+            node_hash(&current, &proof.siblings[level])
         } else {
-            node_hash(&sibling, &current)
+            node_hash(&proof.siblings[level], &current)
         };
     }
 
@@ -263,6 +435,12 @@ mod tests {
         [byte; 32]
     }
 
+    /// A spread-out address, so a set of them behaves like real ones rather than sharing long
+    /// prefixes the way `address` does.
+    fn hashed_address(index: u8) -> Address {
+        Sha256::digest([index]).into()
+    }
+
     fn account(amount: u64) -> Account {
         Account {
             nonce: 1,
@@ -271,25 +449,61 @@ mod tests {
         }
     }
 
-    // Pin the hashing scheme -- node tag, empty-leaf constant, depth -- against accidental change.
-    // Cross-checked against an independent implementation.
-    #[test]
-    fn empty_root_is_stable() {
-        assert_eq!(
-            hex(&SparseMerkleTree::new().root()),
-            "fe97272becc2fc97ef3e38b630eb0addc17fe30cdf38c7d2ed1ff382e05321b3"
-        );
+    fn tree_of(accounts: &[(Address, Account)]) -> SparseMerkleTree {
+        let mut tree = SparseMerkleTree::new();
+        for (address, account) in accounts {
+            tree.update(address, Some(account));
+        }
+
+        tree
     }
 
-    // Pins the rest of the scheme: leaf tag, account encoding, and the MSB-first path order.
+    // The compressed shape shows up directly in the root for the two smallest trees: no accounts
+    // is the empty constant, and one account is that account's leaf with nothing hashed on top.
     #[test]
-    fn single_account_root_is_stable() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
+    fn an_empty_tree_is_the_empty_subtree_constant() {
+        assert_eq!(SparseMerkleTree::new().root(), EMPTY_SUBTREE);
+    }
+
+    #[test]
+    fn a_lone_account_is_the_root() {
+        let tree = tree_of(&[(address(1), account(100))]);
+
+        assert_eq!(tree.root(), leaf_hash(&address(1), &account(100)));
+        assert_eq!(tree.proof(&address(1)).depth(), 0);
+    }
+
+    // Pins the whole scheme -- tags, account encoding, MSB-first paths, and where compression puts
+    // each leaf -- against accidental change. Both roots are cross-checked against an independent
+    // implementation written from the recursive definition of a subtree rather than from
+    // `Node::insert`, so a bug in the incremental path would show up here.
+    #[test]
+    fn multi_account_root_is_stable() {
+        let tree = tree_of(&[
+            (address(1), account(100)),
+            (address(2), account(200)),
+            (address(0xff), account(300)),
+        ]);
 
         assert_eq!(
             hex(&tree.root()),
-            "d4cf2f7596438543714fdcb768db08cd27b052fc32951e0e2f39a69e6376f9d3"
+            "26e30a25a264091a00f99f703695a6d67fddbbbae981762863882907302211ee"
+        );
+    }
+
+    // The same, over enough spread-out addresses to exercise branches at many depths rather than
+    // the one long shared prefix the `address` helper produces.
+    #[test]
+    fn a_wide_tree_root_is_stable() {
+        let tree = tree_of(
+            &(0..64u8)
+                .map(|index| (hashed_address(index), account(index as u64)))
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            hex(&tree.root()),
+            "139e97278186c78129ecc582dc3a93575948afcf35831b747d3044bcac6b2fd3"
         );
     }
 
@@ -303,53 +517,78 @@ mod tests {
 
         tree.update(&address(1), None);
         assert_eq!(tree.root(), empty_root);
-        assert!(tree.nodes.is_empty(), "cleared slots must not leave nodes");
+        assert!(
+            matches!(tree.root, Node::Empty),
+            "cleared slots must not leave nodes"
+        );
     }
 
     #[test]
     fn root_is_independent_of_write_order() {
-        let mut forwards = SparseMerkleTree::new();
-        forwards.update(&address(1), Some(&account(100)));
-        forwards.update(&address(2), Some(&account(200)));
+        let accounts = [
+            (address(1), account(100)),
+            (address(2), account(200)),
+            (address(0xff), account(300)),
+        ];
+        let mut reversed = accounts;
+        reversed.reverse();
 
-        let mut backwards = SparseMerkleTree::new();
-        backwards.update(&address(2), Some(&account(200)));
-        backwards.update(&address(1), Some(&account(100)));
-
-        assert_eq!(forwards.root(), backwards.root());
+        assert_eq!(tree_of(&accounts).root(), tree_of(&reversed).root());
     }
 
     #[test]
     fn amount_change_changes_the_root() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
+        let mut tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
         let before = tree.root();
 
         tree.update(&address(1), Some(&account(101)));
         assert_ne!(tree.root(), before);
     }
 
+    // The point of compressing: a path stops once it has separated its address from the others, so
+    // proof cost tracks the account count rather than the 256-bit address space.
+    #[test]
+    fn proof_depth_tracks_the_account_count_not_the_address_space() {
+        let accounts: Vec<_> = (0..64u8)
+            .map(|index| (hashed_address(index), account(index as u64)))
+            .collect();
+        let tree = tree_of(&accounts);
+
+        let deepest = accounts
+            .iter()
+            .map(|(address, _)| tree.proof(address).depth())
+            .max()
+            .unwrap();
+
+        assert!(
+            (6..24).contains(&deepest),
+            "64 accounts should sit around log2(64) deep, got {deepest}"
+        );
+        assert!(
+            deepest < DEPTH,
+            "a compressed path must beat the full depth"
+        );
+    }
+
     #[test]
     fn inclusion_proof_verifies() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
-        tree.update(&address(2), Some(&account(200)));
-        tree.update(&address(0xff), Some(&account(300)));
+        let tree = tree_of(&[
+            (address(1), account(100)),
+            (address(2), account(200)),
+            (address(0xff), account(300)),
+        ]);
 
-        let proof = tree.proof(&address(2));
         assert!(verify_proof(
             &tree.root(),
             &address(2),
             Some(&account(200)),
-            &proof
+            &tree.proof(&address(2))
         ));
     }
 
     #[test]
     fn inclusion_proof_rejects_wrong_inputs() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
-        tree.update(&address(2), Some(&account(200)));
+        let tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
 
         let root = tree.root();
         let proof = tree.proof(&address(2));
@@ -372,26 +611,118 @@ mod tests {
         );
     }
 
+    // Absence proved by reaching an empty subtree: the address parts from everything in the tree
+    // before anything is sitting in its way.
     #[test]
-    fn non_inclusion_proof_verifies_until_the_slot_is_filled() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
+    fn non_inclusion_by_empty_subtree_verifies_until_the_slot_is_filled() {
+        let mut tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
 
-        let proof = tree.proof(&address(2));
-        assert!(verify_proof(&tree.root(), &address(2), None, &proof));
+        let absent = address(0xff);
+        let proof = tree.proof(&absent);
+        assert_eq!(proof.slot(), &Slot::Own);
+        assert!(verify_proof(&tree.root(), &absent, None, &proof));
 
-        tree.update(&address(2), Some(&account(200)));
+        tree.update(&absent, Some(&account(300)));
         assert!(
-            !verify_proof(&tree.root(), &address(2), None, &proof),
+            !verify_proof(&tree.root(), &absent, None, &proof),
             "a stale absence proof must not verify against the new root"
         );
     }
 
+    // The other shape: absence proved by naming the account already sitting where the address
+    // would go.
+    #[test]
+    fn non_inclusion_by_neighbor_verifies_until_the_slot_is_filled() {
+        let mut tree = tree_of(&[(address(1), account(100))]);
+
+        let absent = address(2);
+        let proof = tree.proof(&absent);
+        assert_eq!(
+            proof.slot(),
+            &Slot::Neighbor {
+                address: address(1),
+                account: account(100),
+            }
+        );
+        assert!(verify_proof(&tree.root(), &absent, None, &proof));
+
+        tree.update(&absent, Some(&account(200)));
+        assert!(
+            !verify_proof(&tree.root(), &absent, None, &proof),
+            "a stale absence proof must not verify against the new root"
+        );
+    }
+
+    // Writing through a neighbor witness has to land on the same root as inserting normally --
+    // this is what lets `verify_block` compute a post-state root from a single witness.
+    #[test]
+    fn writing_beside_a_neighbor_reaches_the_real_root() {
+        let mut tree = tree_of(&[(address(1), account(100)), (address(0xff), account(300))]);
+
+        let new = address(2);
+        let proof = tree.proof(&new);
+        assert!(matches!(proof.slot(), Slot::Neighbor { .. }));
+
+        let computed = root_from_proof(&new, Some(&account(200)), &proof);
+        tree.update(&new, Some(&account(200)));
+
+        assert_eq!(computed, Some(tree.root()));
+        assert!(verify_proof(
+            &tree.root(),
+            &new,
+            Some(&account(200)),
+            &tree.proof(&new)
+        ));
+    }
+
+    #[test]
+    fn a_neighbor_must_share_the_proven_prefix() {
+        let tree = tree_of(&[
+            (address(1), account(100)),
+            (address(2), account(200)),
+            (address(0xff), account(300)),
+        ]);
+
+        let absent = address(3);
+        let mut proof = tree.proof(&absent);
+        assert!(proof.depth() > 0, "the check only bites below the root");
+
+        // Point the neighbor at an account that parts from `absent` above where the proof claims
+        // it sits, which would put a leaf somewhere its own address says it cannot be.
+        proof.slot = Slot::Neighbor {
+            address: address(0xff),
+            account: account(300),
+        };
+        assert_eq!(root_from_proof(&absent, None, &proof), None);
+        assert_eq!(root_from_proof(&absent, Some(&account(1)), &proof), None);
+    }
+
+    #[test]
+    fn a_neighbor_cannot_be_the_proven_address() {
+        let tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
+
+        let mut proof = tree.proof(&address(2));
+        proof.slot = Slot::Neighbor {
+            address: address(2),
+            account: account(200),
+        };
+
+        assert_eq!(root_from_proof(&address(2), None, &proof), None);
+    }
+
+    #[test]
+    fn a_proof_deeper_than_the_address_space_is_rejected() {
+        let tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
+
+        let mut proof = tree.proof(&address(1));
+        proof.siblings = vec![EMPTY_SUBTREE; DEPTH + 1];
+
+        assert_eq!(root_from_proof(&address(1), None, &proof), None);
+    }
+
     #[test]
     fn malformed_proof_is_rejected() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
-        tree.update(&address(2), Some(&account(200)));
+        let tree = tree_of(&[(address(1), account(100)), (address(2), account(200))]);
 
         let mut proof = tree.proof(&address(2));
         assert!(!proof.siblings.is_empty());
@@ -405,15 +736,67 @@ mod tests {
         ));
     }
 
+    // Removal has to collapse the branches it empties, or the tree stops being the canonical shape
+    // for its contents and two ledgers holding the same accounts disagree on the root.
     #[test]
-    fn proof_carries_only_non_empty_siblings() {
-        let mut tree = SparseMerkleTree::new();
-        tree.update(&address(1), Some(&account(100)));
-        tree.update(&address(2), Some(&account(200)));
+    fn removal_restores_the_shape_a_fresh_tree_would_have() {
+        let keep: Vec<_> = (0..16u8)
+            .map(|index| (hashed_address(index), account(index as u64)))
+            .collect();
+        let mut tree = tree_of(&keep);
 
-        // Two accounts differ in the first bit where their addresses diverge, so exactly one
-        // sibling on the path is non-empty.
-        assert_eq!(tree.proof(&address(1)).siblings.len(), 1);
+        let extras: Vec<_> = (16..32u8)
+            .map(|index| (hashed_address(index), account(index as u64)))
+            .collect();
+        for (address, account) in &extras {
+            tree.update(address, Some(account));
+        }
+        for (address, _) in &extras {
+            tree.update(address, None);
+        }
+
+        assert_eq!(tree.root(), tree_of(&keep).root());
+        for (address, account) in &keep {
+            assert!(verify_proof(
+                &tree.root(),
+                address,
+                Some(account),
+                &tree.proof(address)
+            ));
+        }
+        for (address, _) in &extras {
+            assert!(verify_proof(
+                &tree.root(),
+                address,
+                None,
+                &tree.proof(address)
+            ));
+        }
+    }
+
+    // `Node::split` and `subtree_with_both` are the prover-side and verifier-side halves of the
+    // same rule, so they must not drift apart.
+    #[test]
+    fn split_matches_the_verifier_side_computation() {
+        let (a, b) = (address(1), address(2));
+        let (a_account, b_account) = (account(100), account(200));
+
+        for depth in 0..=common_prefix_len(&a, &b) {
+            assert_eq!(
+                Node::split(depth, (a, a_account), (b, b_account)).hash(),
+                subtree_with_both(depth, (&a, &a_account), (&b, &b_account)),
+                "disagreement at depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_and_a_branch_hash_differently() {
+        let leaf = leaf_hash(&address(1), &account(100));
+
+        assert_ne!(leaf, node_hash(&leaf, &EMPTY_SUBTREE));
+        assert_ne!(leaf, EMPTY_SUBTREE);
+        assert_ne!(node_hash(&EMPTY_SUBTREE, &EMPTY_SUBTREE), EMPTY_SUBTREE);
     }
 
     fn hex(bytes: &[u8; 32]) -> String {

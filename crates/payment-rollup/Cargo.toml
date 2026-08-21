@@ -6,4 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-sha2 = "0.11.0"
+# 0.10.x, not 0.11: SP1 only ships patched crates for 0.9.9 / 0.10.6 / 0.10.8 / 0.10.9, and the
+# patch is what routes `Sha256` through the sha256 precompile. The guest workspace needs
+#
+#   [patch.crates-io]
+#   sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.8-sp1-6.0.0" }
+#
+# with the tag matching the SP1 version in use. Only SHA-256 is accelerated -- SHA-512/256 has no
+# precompile and runs its 64-bit arithmetic in software on a 32-bit VM, so it is not used anywhere.
+sha2 = "0.10.8"

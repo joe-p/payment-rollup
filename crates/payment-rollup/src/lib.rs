@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use sha2::{Digest, Sha512_256};
+use sha2::{Digest, Sha256};
 
 mod merkle;
 
-pub use merkle::{MerkleProof, SparseMerkleTree, verify_proof};
+pub use merkle::{MerkleProof, Slot, SparseMerkleTree, verify_proof};
 
 pub type Address = [u8; 32];
 
@@ -30,12 +30,12 @@ impl Scheme {
 /// The scheme identifier is committed to, so the same key bytes under two schemes give two
 /// different addresses.
 pub fn address_from_public_key(scheme: Scheme, pub_key: &[u8]) -> Address {
-    let mut hash_input = Vec::new();
-    hash_input.extend(b"ADDR");
-    hash_input.extend(scheme.identifier());
-    hash_input.extend(pub_key);
+    let mut hasher = Sha256::new();
+    hasher.update(b"ADDR");
+    hasher.update(scheme.identifier());
+    hasher.update(pub_key);
 
-    Sha512_256::digest(hash_input).into()
+    hasher.finalize().into()
 }
 
 const ENCODED_TX_SIZE: usize = 32 + 8 + 32 + 8;
@@ -190,7 +190,10 @@ pub struct SignedTransaction {
 ///
 /// `proof` serves twice: with `old_account` it pins the pre-state against the running root, and
 /// with the computed post-state it yields the next root. The siblings are never checked directly
-/// -- a witness carrying the wrong ones simply fails to reproduce the running root.
+/// -- a witness carrying the wrong ones simply fails to reproduce the running root -- and neither
+/// is the depth the proof implies, for the same reason. The one thing checked outright is a
+/// [`Slot::Neighbor`]'s address, which has to be consistent with the path that reached it; see
+/// [`merkle::root_from_proof`].
 pub struct LeafWitness {
     /// State of the slot immediately before the write, or `None` for an empty slot.
     old_account: Option<Account>,
