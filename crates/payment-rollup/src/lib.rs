@@ -12,6 +12,9 @@ const SCHEME_SIZE: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheme {
+    /// Signing authority for this account is granted via crypto signatures
+    /// Instead, it is directly managed by the sequencer
+    Managed,
     Ed25519,
     Falcon1024HybridEd25519,
 }
@@ -19,6 +22,7 @@ pub enum Scheme {
 impl Scheme {
     pub fn identifier(&self) -> [u8; SCHEME_SIZE] {
         match self {
+            Scheme::Managed => *b"man",
             Scheme::Ed25519 => *b"edd",
             Scheme::Falcon1024HybridEd25519 => *b"f1h",
         }
@@ -464,7 +468,7 @@ impl Ledger {
 mod tests {
     use super::*;
 
-    const SCHEME: Scheme = Scheme::Ed25519;
+    const SCHEME: Scheme = Scheme::Managed;
 
     fn signature(pub_key: &[u8]) -> Signature {
         Signature {
