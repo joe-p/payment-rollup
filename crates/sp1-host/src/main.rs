@@ -7,7 +7,9 @@
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
-use sp1_host::{GENESIS_ROOT, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios};
+use sp1_host::{
+    DEPOSIT_CHAIN_GENESIS, GENESIS_ROOT, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
+};
 
 const USAGE: &str = "\
 Emit settlement fixtures for the rollup verifier contract.
@@ -102,17 +104,25 @@ fn run() -> Result<(), String> {
         let settlement = Settlement::for_block(&block)
             .map_err(|error| format!("scenario {}: {error}", scenario.name))?;
 
+        // Every scenario settles against a fresh contract now that deposits carry value in, so this
+        // is an invariant rather than a per-scenario caveat -- and a loud failure if it ever breaks,
+        // since there is no longer any way to put a contract at a root by hand.
+        if !settlement.settles_from_genesis() {
+            return Err(format!(
+                "scenario {}: starts from {} rather than genesis, and there is no way to seed a \
+                 contract to meet it",
+                scenario.name,
+                hex(&settlement.old_root()),
+            ));
+        }
+
         eprintln!(
-            "{}: {} txns, {} B in {} chunk(s), {}",
+            "{}: {} txns ({} deposits), {} B in {} chunk(s)",
             scenario.name,
             settlement.txn_count(),
+            settlement.deposits().len(),
             settlement.batch_length(),
             settlement.chunk_count(),
-            if settlement.settles_from_genesis() {
-                "settles against a fresh contract".to_string()
-            } else {
-                format!("needs seedStateRoot({})", hex(&settlement.old_root()))
-            },
         );
 
         emitted.push(fixture(scenario, &settlement, args.include_sidecar));
@@ -124,6 +134,7 @@ fn run() -> Result<(), String> {
         "chunkSize": sp1_host::CHUNK_SIZE,
         "publicValuesSize": PUBLIC_VALUES_SIZE,
         "genesisRoot": hex(&GENESIS_ROOT),
+        "depositChainGenesis": hex(&DEPOSIT_CHAIN_GENESIS),
         "scenarios": emitted,
     });
 
@@ -165,12 +176,23 @@ fn fixture(
         "description": scenario.description,
         "txnCount": settlement.txn_count(),
 
-        // `verifyBatch` takes only this; the roots and the commitment below are the same bytes
-        // sliced out, emitted separately so a failing assertion can name which third disagreed.
+        // `verifyBatch` takes only this; the roots, the commitment and the chain ends below are the
+        // same bytes sliced out, emitted separately so a failing assertion can name which fifth
+        // disagreed.
         "publicValues": hex(settlement.public_values()),
         "oldRoot": hex(&settlement.old_root()),
         "newRoot": hex(&settlement.new_root()),
         "batchCommitment": hex(&settlement.batch_commitment()),
+        "depositChainFrom": hex(&settlement.deposit_chain_from()),
+        "depositChainTo": hex(&settlement.deposit_chain_to()),
+
+        // One `deposit(payment, recipient)` call each, in this order, before the batch is opened.
+        // The chain only reaches `depositChainTo` if L1 sees exactly these, exactly here.
+        "deposits": settlement
+            .deposits()
+            .iter()
+            .map(|(recipient, amount)| json!({ "recipient": hex(recipient), "amount": amount }))
+            .collect::<Vec<_>>(),
 
         // `openBatch(batchLength)`, then one `accumulateChunk(chunk)` per entry, in this order.
         "batchLength": settlement.batch_length(),

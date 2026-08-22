@@ -11,6 +11,20 @@ pub use merkle::{MerkleProof, Slot, SparseMerkleTree, verify_proof};
 
 pub type Address = [u8; 32];
 
+/// The sender of a [`Deposit`]: the one address no key can produce.
+///
+/// Every real address is `sha256("ADDR" || scheme || pub_key)` (see [`address_from_public_key`]),
+/// so standing here means finding a SHA-256 preimage for thirty-two zero bytes. Nothing can spend
+/// from it and no user account can ever collide with it, which is what makes it safe to use as a
+/// marker for "this value came from outside the rollup".
+///
+/// It is only ever a marker. [`verify_batch`] never reads or writes an account here, so the address
+/// never enters the tree at all.
+///
+/// Numerically equal to `merkle::EMPTY_SUBTREE`, and unrelated to it: that is a hash in the tree's
+/// namespace, this is an address. Do not unify the two constants.
+pub const ZERO_ADDRESS: Address = [0u8; 32];
+
 const SCHEME_SIZE: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +97,12 @@ pub enum VerificationError {
     /// [`Sidecar::decode`] rules this out at the wire boundary, so it can only be reached by
     /// pairing a batch and sidecar that were never meant for each other.
     SidecarLengthMismatch,
+    /// A [`TxnSidecar`] is not of the shape its [`Transaction`] calls for.
+    ///
+    /// Like [`VerificationError::SidecarLengthMismatch`], unreachable from the wire:
+    /// [`Sidecar::decode`] reads each entry in the shape the batch's transaction kinds dictate, so
+    /// a mismatched pair cannot be encoded. It exists for sidecars built by hand.
+    SidecarKindMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,33 +253,63 @@ impl Payment {
     }
 }
 
+/// Value entering the rollup from L1.
+///
+/// Carries a header like any other transaction, but its sender is always [`ZERO_ADDRESS`]: the
+/// funds come from outside the rollup, so there is no account to debit. [`Deposit::new`] is the
+/// only constructor and pins the sender, which makes a deposit from anywhere else unconstructible.
+///
+/// The sender is not on the wire. It is a constant, and the batch format's whole thesis is that a
+/// replaying node derives what it can, so [`Batch::decode`] fills it in. See [`Batch::encode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deposit {
+    header: TransactionHeader,
+    receiver: Address,
+    amount: u64,
+}
+
+impl Deposit {
+    pub fn new(receiver: Address, amount: u64) -> Self {
+        Self {
+            header: TransactionHeader {
+                sender: ZERO_ADDRESS,
+            },
+            receiver,
+            amount,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transaction {
     Payment(Payment),
+    Deposit(Deposit),
 }
 
 impl Transaction {
+    /// Who the transaction spends from, which for a [`Deposit`] is [`ZERO_ADDRESS`].
+    ///
+    /// Total rather than optional precisely because deposits carry a header: a caller never has to
+    /// case on the kind to ask this, and the one address that comes back for a deposit is the one
+    /// that can never be an account.
     pub fn sender(&self) -> Address {
         match self {
             Transaction::Payment(payment) => payment.header.sender,
+            Transaction::Deposit(deposit) => deposit.header.sender,
         }
     }
 
     pub fn receiver(&self) -> Address {
         match self {
             Transaction::Payment(payment) => payment.receiver,
+            Transaction::Deposit(deposit) => deposit.receiver,
         }
     }
 
     pub fn amount(&self) -> u64 {
         match self {
             Transaction::Payment(payment) => payment.amount,
-        }
-    }
-
-    pub fn bytes_to_sign(&self, nonce: u64) -> [u8; ENCODED_TX_SIZE] {
-        match self {
-            Transaction::Payment(payment) => payment.bytes_to_sign(nonce),
+            Transaction::Deposit(deposit) => deposit.amount,
         }
     }
 }
@@ -294,19 +344,31 @@ impl Signature {
     }
 }
 
-/// A transaction as submitted by a user, before the sequencer has placed it in a block.
+/// A transaction as submitted, before the sequencer has placed it in a block.
 ///
 /// This is a mempool type, not a wire type: the two halves are separated on the way into a block,
 /// the transaction going into the [`Batch`] and the signature into the [`Sidecar`].
+///
+/// An enum rather than a struct with an optional signature, so that "a deposit carries no
+/// signature" is a fact about the type rather than a case every reader has to remember to handle.
+/// A signed deposit is unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SignedTransaction {
-    txn: Transaction,
-    sig: Signature,
+pub enum SignedTransaction {
+    Payment { payment: Payment, sig: Signature },
+    Deposit { deposit: Deposit },
 }
 
 impl SignedTransaction {
-    pub fn new(txn: Transaction, sig: Signature) -> Self {
-        Self { txn, sig }
+    pub fn payment(payment: Payment, sig: Signature) -> Self {
+        SignedTransaction::Payment { payment, sig }
+    }
+
+    /// A deposit, which nobody signs.
+    ///
+    /// Authorization comes from L1 instead: the settlement contract only accepts a batch whose
+    /// deposits fold to the chain it built as the deposits arrived. See [`accumulate_deposit`].
+    pub fn deposit(deposit: Deposit) -> Self {
+        SignedTransaction::Deposit { deposit }
     }
 }
 
@@ -331,10 +393,36 @@ pub struct LeafWitness {
 /// transaction does. The addresses and the amount come from the [`Batch`], the nonce is derived,
 /// and post-states are computed -- so a doctored sidecar produces a rejected block, not a
 /// redirected payment.
+///
+/// The shape mirrors [`Transaction`], because the two halves of a transaction need different things
+/// witnessed. [`Sidecar::decode`] reads each entry in the shape the batch's kinds call for, so an
+/// entry paired with the wrong kind is not representable on the wire.
+// A deposit entry is well under half the size of a payment entry, so every deposit in a batch
+// carries a payment entry's worth of slack. Boxing the large variant would recover it at the cost
+// of a heap allocation per *payment* during decode -- and this decode runs in the guest, where
+// payments are the common case and allocation is paid for in cycles. The slack is transient,
+// unpublished, and bounded by the batch; the allocations would not be.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TxnSidecar {
+pub enum TxnSidecar {
+    Payment(PaymentSidecar),
+    Deposit(DepositSidecar),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentSidecar {
     sig: Signature,
     sender_witness: LeafWitness,
+    receiver_witness: LeafWitness,
+}
+
+/// A deposit witnesses one slot, not two.
+///
+/// There is no sender witness because there is no sender account -- [`ZERO_ADDRESS`] is a marker
+/// and never enters the tree -- and no signature because a deposit is authorized on L1 rather than
+/// by a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositSidecar {
     receiver_witness: LeafWitness,
 }
 
@@ -393,6 +481,8 @@ impl Sidecar {
 pub struct Block {
     old_root: [u8; 32],
     new_root: [u8; 32],
+    old_deposit_chain: [u8; 32],
+    new_deposit_chain: [u8; 32],
     batch: Batch,
     sidecar: Sidecar,
 }
@@ -406,6 +496,17 @@ impl Block {
         self.new_root
     }
 
+    /// Deposit chain the block starts from; see [`accumulate_deposit`].
+    pub fn old_deposit_chain(&self) -> [u8; 32] {
+        self.old_deposit_chain
+    }
+
+    /// Deposit chain the block's deposits fold it to. Equal to `old_deposit_chain` when the block
+    /// contains no deposits.
+    pub fn new_deposit_chain(&self) -> [u8; 32] {
+        self.new_deposit_chain
+    }
+
     pub fn batch(&self) -> &Batch {
         &self.batch
     }
@@ -413,6 +514,42 @@ impl Block {
     pub fn sidecar(&self) -> &Sidecar {
         &self.sidecar
     }
+}
+
+/// Where the deposit chain starts: no deposit has ever been accepted.
+///
+/// Thirty-two zero bytes, matching the genesis state root, and for the same reason -- a chain over
+/// nothing should be the value a fresh contract holds without having to be told.
+pub const DEPOSIT_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
+
+/// Fold one deposit into the running chain.
+///
+/// This is how the settlement contract knows a batch credited exactly the deposits L1 accepted, and
+/// no others. The contract extends the chain as each deposit arrives; the guest folds the same hash
+/// over the deposits it decodes out of the batch and commits where it landed. The contract pins
+/// both ends -- the value it settled last time, and the value it holds now -- and with both ends
+/// fixed the folds between them are determined, short of a SHA-256 collision.
+///
+/// Chaining is what makes one 32-byte word enough. Because each step consumes the last, the value
+/// pins the set, the order, and the count at once: inventing, dropping, reordering, or altering a
+/// deposit all diverge the fold at that step and never recover. It is an exclusion proof as much as
+/// an inclusion proof, which is what stops a prover minting a credit L1 never saw.
+///
+/// Only `receiver` and `amount` are hashed, and that is a rule rather than an omission: every field
+/// in this preimage has to be reconstructible by the guest from the batch bytes alone. An L1 nonce
+/// or the L1 payer's address would not be, so committing to either would mean carrying it on the
+/// wire forever to buy something the chaining already provides.
+///
+/// The preimage is 79 bytes, far inside [`AVM_MAX_BYTE_SLICE`]. The domain tag keeps a chain value
+/// from ever being mistakable for a state root, a chunk digest, or a chunk accumulator.
+pub fn accumulate_deposit(chain: &[u8; 32], receiver: &Address, amount: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"DEPOSIT");
+    hasher.update(chain);
+    hasher.update(receiver);
+    hasher.update(amount.to_be_bytes());
+
+    hasher.finalize().into()
 }
 
 /// The root implied by `account` sitting at `address`, or an error if `proof` is malformed.
@@ -437,70 +574,106 @@ fn expect_pre_state(
     }
 }
 
-/// Replay `batch` against `sidecar`, from `old_root`, and return the root it lands on.
+/// Credit `amount` to `receiver` against the running `root`, and return the root that produces.
 ///
-/// This is the guest's entry point, and it is deliberately not told what root to expect: the
-/// settlement contract compares the returned root against what it has stored, so there is no
+/// The second half of a payment and the whole of a deposit. A created account is pinned to
+/// [`Account::empty`], so a prover cannot choose the `auth_address` of an account it brings into
+/// existence -- which is also what lets a depositor spend immediately with the key their address
+/// was derived from.
+fn credit(
+    receiver_addr: &Address,
+    witness: &LeafWitness,
+    amount: u64,
+    root: [u8; 32],
+) -> Result<[u8; 32], VerificationError> {
+    expect_pre_state(receiver_addr, witness, root)?;
+
+    let mut receiver = witness
+        .old_account
+        .unwrap_or_else(|| Account::empty(*receiver_addr));
+    receiver.amount = receiver
+        .amount
+        .checked_add(amount)
+        .ok_or(VerificationError::AmountOverflow)?;
+
+    root_with(receiver_addr, Some(&receiver), &witness.proof)
+}
+
+/// Replay `batch` against `sidecar`, from `old_root` and `deposit_anchor`, and return the root and
+/// deposit chain it lands on.
+///
+/// This is the guest's entry point, and it is deliberately not told what to expect for either: the
+/// settlement contract compares both returned values against what it has stored, so there is no
 /// prover-supplied answer for the replay to be checked against.
 ///
-/// Each transaction writes two slots -- sender then receiver -- and every write both checks the
-/// pre-state against the running root and advances it. Chaining the roots this way means a
-/// self-payment needs no special case: the receiver write reads the slot the sender write just
-/// produced, and the root comparison enforces that it agrees.
+/// A payment writes two slots -- sender then receiver -- and every write both checks the pre-state
+/// against the running root and advances it. Chaining the roots this way means a self-payment needs
+/// no special case: the receiver write reads the slot the sender write just produced, and the root
+/// comparison enforces that it agrees.
+///
+/// A deposit writes one. There is no sender to debit, so total balances rise -- the mint is backed
+/// by the settlement contract's own ALGO rather than by conservation inside the tree, and what
+/// authorizes it is the deposit chain: see [`accumulate_deposit`]. A reserve account funding
+/// deposits from inside the tree would only relocate the mint, since the reserve would have to be
+/// minted into as well, at the cost of a second write and witness on every deposit.
+///
+/// Deposits and payments interleave freely. The chain constrains the order of deposits relative to
+/// each other and nothing more, which is what lets a payment spend a deposit credited earlier in
+/// the same batch.
 ///
 /// Nothing here trusts the sidecar. Addresses and amounts come from the batch, nonces are derived
-/// from the witnessed account, post-states are computed rather than supplied, and a created
-/// account is pinned to [`Account::empty`], so a prover cannot choose the `auth_address` of an
-/// account it brings into existence.
+/// from the witnessed account, and post-states are computed rather than supplied, so a doctored
+/// sidecar produces a rejected block rather than a redirected payment.
 pub fn verify_batch(
     old_root: [u8; 32],
+    deposit_anchor: [u8; 32],
     batch: &Batch,
     sidecar: &Sidecar,
-) -> Result<[u8; 32], VerificationError> {
+) -> Result<([u8; 32], [u8; 32]), VerificationError> {
     if batch.txns.len() != sidecar.entries.len() {
         return Err(VerificationError::SidecarLengthMismatch);
     }
 
     let mut root = old_root;
+    let mut deposit_chain = deposit_anchor;
 
     for (txn, entry) in batch.txns.iter().zip(&sidecar.entries) {
-        let (sender_addr, receiver_addr, amt) = (txn.sender(), txn.receiver(), txn.amount());
+        match (txn, entry) {
+            (Transaction::Payment(payment), TxnSidecar::Payment(entry)) => {
+                let (sender_addr, receiver_addr, amt) =
+                    (payment.header.sender, payment.receiver, payment.amount);
 
-        expect_pre_state(&sender_addr, &entry.sender_witness, root)?;
-        let mut sender = entry
-            .sender_witness
-            .old_account
-            .ok_or(VerificationError::UnknownSender)?;
-        entry.sig.verify_auth(&sender)?;
-        sender.amount = sender
-            .amount
-            .checked_sub(amt)
-            .ok_or(VerificationError::InsufficientFunds)?;
-        sender.bump_nonce()?;
-        // `sender.nonce` now holds the only nonce this transaction could carry, which is the value
-        // the signature must have been made over.
-        // TODO: crypto verification of `entry.sig` over `txn.bytes_to_sign(sender.nonce)`.
-        root = root_with(&sender_addr, Some(&sender), &entry.sender_witness.proof)?;
+                expect_pre_state(&sender_addr, &entry.sender_witness, root)?;
+                let mut sender = entry
+                    .sender_witness
+                    .old_account
+                    .ok_or(VerificationError::UnknownSender)?;
+                entry.sig.verify_auth(&sender)?;
+                sender.amount = sender
+                    .amount
+                    .checked_sub(amt)
+                    .ok_or(VerificationError::InsufficientFunds)?;
+                sender.bump_nonce()?;
+                // `sender.nonce` now holds the only nonce this transaction could carry, which is
+                // the value the signature must have been made over.
+                // TODO: crypto verification of `entry.sig` over `payment.bytes_to_sign(sender.nonce)`.
+                root = root_with(&sender_addr, Some(&sender), &entry.sender_witness.proof)?;
 
-        // Read against the root the sender write just produced, so a self-payment sees the debited
-        // balance and the bumped nonce.
-        expect_pre_state(&receiver_addr, &entry.receiver_witness, root)?;
-        let mut receiver = entry
-            .receiver_witness
-            .old_account
-            .unwrap_or_else(|| Account::empty(receiver_addr));
-        receiver.amount = receiver
-            .amount
-            .checked_add(amt)
-            .ok_or(VerificationError::AmountOverflow)?;
-        root = root_with(
-            &receiver_addr,
-            Some(&receiver),
-            &entry.receiver_witness.proof,
-        )?;
+                // Read against the root the sender write just produced, so a self-payment sees the
+                // debited balance and the bumped nonce.
+                root = credit(&receiver_addr, &entry.receiver_witness, amt, root)?;
+            }
+            (Transaction::Deposit(deposit), TxnSidecar::Deposit(entry)) => {
+                let (receiver_addr, amt) = (deposit.receiver, deposit.amount);
+
+                root = credit(&receiver_addr, &entry.receiver_witness, amt, root)?;
+                deposit_chain = accumulate_deposit(&deposit_chain, &receiver_addr, amt);
+            }
+            _ => return Err(VerificationError::SidecarKindMismatch),
+        }
     }
 
-    Ok(root)
+    Ok((root, deposit_chain))
 }
 
 /// Longest application argument a settlement transaction can carry, as of go-algorand 5.0 (AVM
@@ -606,28 +779,43 @@ pub fn batch_commitment(batch_bytes: &[u8]) -> [u8; 32] {
     accumulator
 }
 
-pub const PUBLIC_VALUES_SIZE: usize = 32 + 32 + 32;
+pub const PUBLIC_VALUES_SIZE: usize = 32 * 5;
 
-/// What a proof exposes: the root it started from, the root it reached, and which batch got it
-/// there.
+/// What a proof exposes: the two roots, which batch got between them, and the two ends of the
+/// deposit chain the batch consumed.
 ///
-/// Laid out here so the guest and the settlement contract read the same 96 bytes the same way. The
-/// contract's side is: check the first root against the root it has stored, check the commitment
-/// against a hash of the batch bytes it was handed in the same transaction, verify the proof, then
-/// store the second root.
+/// ```text
+/// [  0.. 32)  old_root
+/// [ 32.. 64)  new_root
+/// [ 64.. 96)  batch_commitment
+/// [ 96..128)  old_deposit_chain
+/// [128..160)  new_deposit_chain
+/// ```
 ///
-/// That last check is what makes the data available: the bytes have to be presented to the
-/// contract, not merely promised, or the root advances with nothing to reconstruct state from.
+/// Laid out here so the guest and the settlement contract read the same 160 bytes the same way. The
+/// contract's side is: check `old_root` against the root it has stored, check the commitment
+/// against a hash of the batch bytes it was handed across the preceding transactions, check both
+/// deposit-chain ends against what it has recorded, verify the proof, then store `new_root`.
+///
+/// The commitment check is what makes the data available: the bytes have to be presented to the
+/// contract, not merely promised, or the root advances with nothing to reconstruct state from. The
+/// two deposit-chain checks are what make the batch's deposits exactly L1's; see
+/// [`accumulate_deposit`]. Both ends are pinned rather than just the last, so a prover cannot pick
+/// an anchor that makes a fabricated fold land correctly.
 pub fn public_values(
     old_root: &[u8; 32],
     new_root: &[u8; 32],
     batch_bytes: &[u8],
+    old_deposit_chain: &[u8; 32],
+    new_deposit_chain: &[u8; 32],
 ) -> [u8; PUBLIC_VALUES_SIZE] {
     let mut buf = [0u8; PUBLIC_VALUES_SIZE];
 
     buf[..32].copy_from_slice(old_root);
     buf[32..64].copy_from_slice(new_root);
-    buf[64..].copy_from_slice(&batch_commitment(batch_bytes));
+    buf[64..96].copy_from_slice(&batch_commitment(batch_bytes));
+    buf[96..128].copy_from_slice(old_deposit_chain);
+    buf[128..].copy_from_slice(new_deposit_chain);
 
     buf
 }
@@ -669,35 +857,48 @@ impl std::error::Error for ExecutionError {}
 
 /// The whole of what a proof asserts, computed from the same bytes the guest is handed.
 ///
-/// This is the guest program with the zkVM taken out: decode both halves, replay from `old_root`,
-/// and lay out the public values. The guest is a wrapper that reads its three inputs, calls this,
-/// and commits what comes back -- so there is one implementation of "what this proof says", and a
-/// host can reach the committed values without proving anything.
+/// This is the guest program with the zkVM taken out: decode both halves, replay from `old_root`
+/// and `deposit_anchor`, and lay out the public values. The guest is a wrapper that reads its four
+/// inputs, calls this, and commits what comes back -- so there is one implementation of "what this
+/// proof says", and a host can reach the committed values without proving anything.
 ///
-/// Note there is still no expected root among the inputs. The replay reports where it landed, and
-/// the settlement contract is the only thing that decides whether that is the root it was holding.
+/// Note there is still no expected root among the inputs, and for the same reason no expected
+/// deposit chain. The replay reports where it landed on both, and the settlement contract is the
+/// only thing that decides whether those are the values it was holding.
 pub fn execute(
     old_root: [u8; 32],
+    deposit_anchor: [u8; 32],
     batch_bytes: &[u8],
     sidecar_bytes: &[u8],
 ) -> Result<[u8; PUBLIC_VALUES_SIZE], ExecutionError> {
     let batch = Batch::decode(batch_bytes)?;
-    let sidecar = Sidecar::decode(sidecar_bytes, batch.len())?;
+    let sidecar = Sidecar::decode(sidecar_bytes, &batch)?;
 
-    let new_root = verify_batch(old_root, &batch, &sidecar)?;
+    let (new_root, new_deposit_chain) = verify_batch(old_root, deposit_anchor, &batch, &sidecar)?;
 
-    Ok(public_values(&old_root, &new_root, batch_bytes))
+    Ok(public_values(
+        &old_root,
+        &new_root,
+        batch_bytes,
+        &deposit_anchor,
+        &new_deposit_chain,
+    ))
 }
 
-/// Replay a whole [`Block`] and check it reaches its own `new_root`.
+/// Replay a whole [`Block`] and check it reaches its own `new_root` and `new_deposit_chain`.
 ///
 /// The sequencer-side convenience wrapper around [`verify_batch`]: a block already carries the
-/// root it claims, so this is the one place `RootMismatch` can come from. The guest calls
+/// values it claims, so this is the one place `RootMismatch` can come from. The guest calls
 /// [`verify_batch`] directly and lets the settlement contract make the comparison.
 pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
-    let root = verify_batch(block.old_root, &block.batch, &block.sidecar)?;
+    let (root, deposit_chain) = verify_batch(
+        block.old_root,
+        block.old_deposit_chain,
+        &block.batch,
+        &block.sidecar,
+    )?;
 
-    if root == block.new_root {
+    if root == block.new_root && deposit_chain == block.new_deposit_chain {
         Ok(())
     } else {
         Err(VerificationError::RootMismatch)
@@ -710,11 +911,22 @@ pub struct Ledger {
     /// Commitment to `accounts`, kept in step with every write so [`Ledger::state_root`] is always
     /// current.
     tree: SparseMerkleTree,
+    /// Fold over every deposit this ledger has applied, mirroring what the settlement contract
+    /// holds. Never reset -- it is an anchor, not a per-block accumulator.
+    deposit_chain: [u8; 32],
 }
 
 impl Ledger {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            deposit_chain: DEPOSIT_CHAIN_GENESIS,
+            ..Self::default()
+        }
+    }
+
+    /// The deposit chain as it stands, which is what the next block will anchor to.
+    pub fn deposit_chain(&self) -> [u8; 32] {
+        self.deposit_chain
     }
 
     pub fn account(&self, address: &Address) -> Option<&Account> {
@@ -758,21 +970,22 @@ impl Ledger {
     /// is what fixes which nonce each signature has to cover.
     pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
         let old_root = self.state_root();
+        let old_deposit_chain = self.deposit_chain;
         let mut txns = Vec::with_capacity(stxns.len());
         let mut entries = Vec::with_capacity(stxns.len());
 
-        for SignedTransaction { txn, sig } in stxns {
-            match &txn {
-                Transaction::Payment(pay) => {
-                    let sender_addr = pay.header.sender;
+        for stxn in stxns {
+            let txn = match stxn {
+                SignedTransaction::Payment { payment, sig } => {
+                    let sender_addr = payment.header.sender;
 
                     let sender_witness = LeafWitness {
                         old_account: self.accounts.get(&sender_addr).copied(),
                         proof: self.tree.proof(&sender_addr),
                     };
 
-                    let receiver_addr = pay.receiver;
-                    let amt = pay.amount;
+                    let receiver_addr = payment.receiver;
+                    let amt = payment.amount;
 
                     let sender = self.accounts.get_mut(&sender_addr).unwrap();
                     sig.verify_auth(sender).unwrap();
@@ -783,26 +996,27 @@ impl Ledger {
                     self.tree.update(&sender_addr, Some(&sender));
 
                     // Captured after the sender write, so a self-payment witnesses the debited balance.
-                    let receiver_witness = LeafWitness {
-                        old_account: self.accounts.get(&receiver_addr).copied(),
-                        proof: self.tree.proof(&receiver_addr),
-                    };
+                    let receiver_witness = self.credit(receiver_addr, amt);
 
-                    let receiver = self
-                        .accounts
-                        .entry(receiver_addr)
-                        .or_insert_with(|| Account::empty(receiver_addr));
-                    receiver.amount = receiver.amount.checked_add(amt).unwrap();
-                    let receiver = *receiver;
-                    self.tree.update(&receiver_addr, Some(&receiver));
-
-                    entries.push(TxnSidecar {
+                    entries.push(TxnSidecar::Payment(PaymentSidecar {
                         sig,
                         sender_witness,
                         receiver_witness,
-                    });
+                    }));
+
+                    Transaction::Payment(payment)
                 }
-            }
+                SignedTransaction::Deposit { deposit } => {
+                    let receiver_witness = self.credit(deposit.receiver, deposit.amount);
+
+                    self.deposit_chain =
+                        accumulate_deposit(&self.deposit_chain, &deposit.receiver, deposit.amount);
+
+                    entries.push(TxnSidecar::Deposit(DepositSidecar { receiver_witness }));
+
+                    Transaction::Deposit(deposit)
+                }
+            };
 
             txns.push(txn);
         }
@@ -810,9 +1024,33 @@ impl Ledger {
         Block {
             old_root,
             new_root: self.state_root(),
+            old_deposit_chain,
+            new_deposit_chain: self.deposit_chain,
             batch: Batch { txns },
             sidecar: Sidecar { entries },
         }
+    }
+
+    /// Credit `amount` to `receiver`, returning the witness for the slot as it stood beforehand.
+    ///
+    /// The witness is captured before the write and after everything preceding it, which is what
+    /// makes a self-payment work: the receiver half witnesses the balance the sender half just
+    /// debited. Mirrors [`credit`] on the verifying side.
+    fn credit(&mut self, receiver: Address, amount: u64) -> LeafWitness {
+        let witness = LeafWitness {
+            old_account: self.accounts.get(&receiver).copied(),
+            proof: self.tree.proof(&receiver),
+        };
+
+        let account = self
+            .accounts
+            .entry(receiver)
+            .or_insert_with(|| Account::empty(receiver));
+        account.amount = account.amount.checked_add(amount).unwrap();
+        let account = *account;
+        self.tree.update(&receiver, Some(&account));
+
+        witness
     }
 }
 
@@ -859,28 +1097,32 @@ mod tests {
     ///
     /// No nonce: the sequencer assigns it, so a test only controls the order it submits in.
     fn stxn(key: &[u8], receiver: Address, amount: u64) -> SignedTransaction {
-        SignedTransaction {
-            txn: Transaction::Payment(Payment {
-                header: TransactionHeader {
-                    sender: address_from_public_key(SCHEME, key),
-                },
-                receiver,
-                amount,
-            }),
-            sig: signature(key),
-        }
+        payment(key, address_from_public_key(SCHEME, key), receiver, amount)
     }
 
     /// A payment from `sender` to `receiver`, signed by `key`, for the cases where the two are
     /// deliberately not derived from each other.
     fn payment(key: &[u8], sender: Address, receiver: Address, amount: u64) -> SignedTransaction {
-        SignedTransaction {
-            txn: Transaction::Payment(Payment {
+        SignedTransaction::payment(
+            Payment {
                 header: TransactionHeader { sender },
                 receiver,
                 amount,
-            }),
-            sig: signature(key),
+            },
+            signature(key),
+        )
+    }
+
+    /// A deposit crediting the account for `key`.
+    fn deposit(key: &[u8], amount: u64) -> SignedTransaction {
+        SignedTransaction::deposit(Deposit::new(address_from_public_key(SCHEME, key), amount))
+    }
+
+    /// The payment entry at `index`, for tests that doctor one of its witnesses.
+    fn payment_entry(block: &mut Block, index: usize) -> &mut PaymentSidecar {
+        match &mut block.sidecar.entries[index] {
+            TxnSidecar::Payment(entry) => entry,
+            TxnSidecar::Deposit(_) => panic!("entry {index} is a deposit, not a payment"),
         }
     }
 
@@ -931,7 +1173,7 @@ mod tests {
 
         // Claim the sender was richer than it was. The witness proof pins the pre-state to the
         // running root, so an inflated balance cannot reproduce it.
-        block.sidecar.entries[0].sender_witness.old_account =
+        payment_entry(&mut block, 0).sender_witness.old_account =
             Some(account_at(b"a key", 0, 1_000_000).1);
 
         assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
@@ -944,7 +1186,8 @@ mod tests {
 
         // The second transaction creates `fresh`, so its receiver slot is empty. Claiming it
         // already held an account the attacker can sign for would hand them the balance.
-        block.sidecar.entries[1].receiver_witness.old_account = Some(Account::new(0, 0, attacker));
+        payment_entry(&mut block, 1).receiver_witness.old_account =
+            Some(Account::new(0, 0, attacker));
 
         assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
     }
@@ -991,24 +1234,37 @@ mod tests {
         block.sidecar.entries.pop();
 
         assert_eq!(
-            verify_batch(block.old_root, &block.batch, &block.sidecar),
+            verify_batch(
+                block.old_root,
+                block.old_deposit_chain,
+                &block.batch,
+                &block.sidecar
+            ),
             Err(VerificationError::SidecarLengthMismatch)
         );
     }
 
-    // The settlement contract reads these 96 bytes by offset, so the layout is as load-bearing as
+    // The settlement contract reads these 160 bytes by offset, so the layout is as load-bearing as
     // the roots themselves.
     #[test]
     fn public_values_lay_out_the_transition_and_the_batch_commitment() {
         let (block, ..) = three_txn_block();
         let batch_bytes = block.batch().encode();
 
-        let values = public_values(&block.old_root(), &block.new_root(), &batch_bytes);
+        let values = public_values(
+            &block.old_root(),
+            &block.new_root(),
+            &batch_bytes,
+            &block.old_deposit_chain(),
+            &block.new_deposit_chain(),
+        );
 
         assert_eq!(values.len(), PUBLIC_VALUES_SIZE);
         assert_eq!(&values[..32], &block.old_root());
         assert_eq!(&values[32..64], &block.new_root());
-        assert_eq!(&values[64..], &batch_commitment(&batch_bytes));
+        assert_eq!(&values[64..96], &batch_commitment(&batch_bytes));
+        assert_eq!(&values[96..128], &block.old_deposit_chain());
+        assert_eq!(&values[128..], &block.new_deposit_chain());
 
         // The commitment is domain-separated and covers every byte, so a batch that differs
         // anywhere cannot be presented against this proof.
@@ -1033,15 +1289,192 @@ mod tests {
     // single hash of `tag || accumulator || chunk` would need 4131 bytes and be unimplementable
     // on-chain, which is why the fold digests the chunk first.
     #[test]
+    fn no_key_can_produce_the_zero_address() {
+        // Not a proof -- that rests on SHA-256 preimage resistance -- but it pins the claim the
+        // marker depends on against every scheme, so a future one that hashed differently would
+        // have to defend itself here.
+        for scheme in Scheme::ALL {
+            for key in [b"".as_slice(), b"a key", b"\x00", &[0u8; 32]] {
+                assert_ne!(address_from_public_key(scheme, key), ZERO_ADDRESS);
+            }
+        }
+    }
+
+    #[test]
+    fn a_deposit_is_always_from_the_zero_address() {
+        let receiver = address_from_public_key(SCHEME, b"receiver");
+
+        assert_eq!(
+            Transaction::Deposit(Deposit::new(receiver, 1)).sender(),
+            ZERO_ADDRESS
+        );
+    }
+
+    #[test]
+    fn a_deposit_creates_and_credits_an_account() {
+        let mut ledger = Ledger::new();
+        let block = ledger.get_block(vec![deposit(b"a key", 1_000)]);
+        let a = address_from_public_key(SCHEME, b"a key");
+
+        // A deposit is the only way a block starting from the empty ledger can fund anything.
+        assert_eq!(block.old_root(), Ledger::new().state_root());
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(ledger.account(&a).unwrap().amount(), 1_000);
+        // Pinned to `Account::empty`, so the depositor can spend with the key their address was
+        // derived from and nobody else can.
+        assert_eq!(ledger.account(&a).unwrap().auth_address(), a);
+        assert_eq!(ledger.account(&a).unwrap().nonce(), 0);
+    }
+
+    #[test]
+    fn a_deposit_can_be_spent_in_the_same_batch_that_created_it() {
+        let mut ledger = Ledger::new();
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        let block = ledger.get_block(vec![deposit(b"a key", 1_000), stxn(b"a key", b, 400)]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(ledger.account(&b).unwrap().amount(), 400);
+    }
+
+    #[test]
+    fn an_empty_batch_leaves_the_deposit_chain_unchanged() {
+        let block = Ledger::new().get_block(vec![]);
+
+        assert_eq!(block.old_deposit_chain(), DEPOSIT_CHAIN_GENESIS);
+        assert_eq!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_eq!(verify_block(&block), Ok(()));
+    }
+
+    // "Unchanged" is what a batch with no deposits commits, which is why an empty deposit set needs
+    // no distinguishing seed constant: the settlement contract compares the chain it holds against
+    // the chain the batch landed on, and with deposits pending those cannot be equal.
+    #[test]
+    fn a_batch_that_skips_a_pending_deposit_lands_short_of_the_chain() {
+        let mut settled = Ledger::new();
+        let posted = settled.get_block(vec![deposit(b"a key", 1_000)]);
+
+        // What L1 would hold after accepting two deposits, only one of which the batch credits.
+        let contract_chain = accumulate_deposit(
+            &posted.new_deposit_chain(),
+            &address_from_public_key(SCHEME, b"b key"),
+            500,
+        );
+
+        assert_ne!(posted.new_deposit_chain(), contract_chain);
+    }
+
+    #[test]
+    fn the_deposit_chain_pins_order() {
+        let ab = Ledger::new()
+            .get_block(vec![deposit(b"a key", 1_000), deposit(b"b key", 500)])
+            .new_deposit_chain();
+        let ba = Ledger::new()
+            .get_block(vec![deposit(b"b key", 500), deposit(b"a key", 1_000)])
+            .new_deposit_chain();
+
+        assert_ne!(ab, ba);
+    }
+
+    #[test]
+    fn the_deposit_chain_pins_count() {
+        let one = Ledger::new()
+            .get_block(vec![deposit(b"a key", 1_000)])
+            .new_deposit_chain();
+        let two = Ledger::new()
+            .get_block(vec![deposit(b"a key", 1_000), deposit(b"a key", 1_000)])
+            .new_deposit_chain();
+
+        assert_ne!(one, two);
+    }
+
+    // Each step consumes the last, so position is already committed to. This is why the L1 nonce
+    // does not need to be in the preimage -- which matters, because the guest could not reconstruct
+    // it from the batch bytes if it were.
+    #[test]
+    fn two_identical_deposits_do_not_collapse() {
+        let mut ledger = Ledger::new();
+        let block = ledger.get_block(vec![deposit(b"a key", 1_000), deposit(b"a key", 1_000)]);
+
+        let first = accumulate_deposit(
+            &DEPOSIT_CHAIN_GENESIS,
+            &address_from_public_key(SCHEME, b"a key"),
+            1_000,
+        );
+
+        assert_ne!(first, block.new_deposit_chain());
+        assert_eq!(
+            ledger
+                .account(&address_from_public_key(SCHEME, b"a key"))
+                .unwrap()
+                .amount(),
+            2_000
+        );
+    }
+
+    // The whole point of the chain: a prover that credits an account L1 never funded lands on a
+    // value the contract is not holding, so the fabricated mint cannot settle.
+    #[test]
+    fn a_fabricated_deposit_diverges_the_chain() {
+        let mut honest = Ledger::new();
+        let real = honest.get_block(vec![deposit(b"a key", 1_000)]);
+
+        let mut greedy = Ledger::new();
+        let forged = greedy.get_block(vec![
+            deposit(b"a key", 1_000),
+            deposit(b"attacker key", 1_000_000),
+        ]);
+
+        // Both replay cleanly on their own terms -- the fraud is not detectable inside the guest.
+        assert_eq!(verify_block(&real), Ok(()));
+        assert_eq!(verify_block(&forged), Ok(()));
+
+        // It is detectable against L1's chain, which is the only copy that counts.
+        assert_ne!(forged.new_deposit_chain(), real.new_deposit_chain());
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_sidecar_of_the_wrong_kind() {
+        let mut ledger = Ledger::new();
+        let mut block = ledger.get_block(vec![deposit(b"a key", 1_000)]);
+
+        // A payment entry against a deposit: unreachable over the wire, since `Sidecar::decode`
+        // reads the shape the batch calls for, but reachable by hand.
+        block.sidecar.entries[0] = TxnSidecar::Payment(PaymentSidecar {
+            sig: signature(b"a key"),
+            sender_witness: LeafWitness {
+                old_account: None,
+                proof: ledger.proof(&ZERO_ADDRESS),
+            },
+            receiver_witness: LeafWitness {
+                old_account: None,
+                proof: ledger.proof(&address_from_public_key(SCHEME, b"a key")),
+            },
+        });
+
+        assert_eq!(
+            verify_batch(
+                block.old_root,
+                block.old_deposit_chain,
+                &block.batch,
+                &block.sidecar
+            ),
+            Err(VerificationError::SidecarKindMismatch)
+        );
+    }
+
+    #[test]
     fn every_preimage_a_contract_must_hash_fits_in_one_avm_value() {
         let seed_preimage = b"BATCH".len() + size_of::<u64>();
         let digest_preimage = CHUNK_SIZE;
         let fold_preimage = b"CHUNK".len() + 32 + 32;
+        let deposit_preimage = b"DEPOSIT".len() + 32 + 32 + size_of::<u64>();
 
         for (name, len) in [
             ("seed", seed_preimage),
             ("chunk digest", digest_preimage),
             ("fold step", fold_preimage),
+            ("deposit fold", deposit_preimage),
         ] {
             assert!(
                 len <= AVM_MAX_BYTE_SLICE,
@@ -1146,9 +1579,11 @@ mod tests {
         fresh_ledger.insert_account(receiver, account_at(b"receiver key", 0, 10).1);
         fresh_ledger.insert_account(funded, account_at(b"sender key", 0, 100).1);
 
-        let Transaction::Payment(payment) = &mut block.batch.txns[0];
+        let Transaction::Payment(payment) = &mut block.batch.txns[0] else {
+            panic!("the first transaction of the fixture block is a payment")
+        };
         payment.header.sender = empty;
-        block.sidecar.entries[0].sender_witness = LeafWitness {
+        payment_entry(&mut block, 0).sender_witness = LeafWitness {
             old_account: None,
             proof: fresh_ledger.proof(&empty),
         };

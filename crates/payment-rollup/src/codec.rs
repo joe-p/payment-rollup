@@ -18,14 +18,16 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::{
-    Account, Address, Batch, ENCODED_ACCOUNT_SIZE, LeafWitness, MerkleProof, Payment, SCHEME_SIZE,
-    Scheme, Sidecar, Signature, Slot, Transaction, TransactionHeader, TxnSidecar, merkle::DEPTH,
+    Account, Address, Batch, Deposit, DepositSidecar, ENCODED_ACCOUNT_SIZE, LeafWitness,
+    MerkleProof, Payment, PaymentSidecar, SCHEME_SIZE, Scheme, Sidecar, Signature, Slot,
+    Transaction, TransactionHeader, TxnSidecar, merkle::DEPTH,
 };
 
 const BATCH_VERSION: u8 = 0;
 const SIDECAR_VERSION: u8 = 0;
 
 const KIND_PAYMENT: u8 = 0;
+const KIND_DEPOSIT: u8 = 1;
 
 const ABSENT: u8 = 0;
 const PRESENT: u8 = 1;
@@ -33,13 +35,21 @@ const PRESENT: u8 = 1;
 const SLOT_OWN: u8 = 0;
 const SLOT_NEIGHBOR: u8 = 1;
 
-/// Smallest a transaction can encode to: a kind tag, two one-byte address references, and a
-/// one-byte amount. Used to reject a count no remaining input could back.
-const MIN_ENCODED_TXN_SIZE: usize = 1 + 1 + 1 + 1;
+/// Smallest a witness can encode to: an absent account, depth zero, and its own slot.
+const MIN_ENCODED_WITNESS_SIZE: usize = 1 + 1 + 1;
 
-/// Smallest a sidecar entry can encode to: a scheme, two empty length-prefixed byte strings, and
-/// two witnesses of an empty slot at depth zero.
-const MIN_ENCODED_ENTRY_SIZE: usize = SCHEME_SIZE + 1 + 1 + 2 * (1 + 1 + 1);
+/// Smallest a transaction can encode to: a deposit, being a kind tag, a one-byte address reference,
+/// and a one-byte amount. Used to reject a count no remaining input could back.
+///
+/// This is the minimum over every kind, not the size of any particular one. [`Reader::count`]
+/// rejects when `count * stride` exceeds what is left, so a stride larger than the smallest kind
+/// would reject *valid* input -- a batch of nothing but deposits, for instance.
+const MIN_ENCODED_TXN_SIZE: usize = 1 + 1 + 1;
+
+/// Smallest a sidecar entry can encode to: a deposit entry, being a single witness.
+///
+/// The minimum over every kind, for the reason given on [`MIN_ENCODED_TXN_SIZE`].
+const MIN_ENCODED_ENTRY_SIZE: usize = MIN_ENCODED_WITNESS_SIZE;
 
 /// Why a byte string is not a [`Batch`] or a [`Sidecar`].
 ///
@@ -282,19 +292,27 @@ impl Batch {
     /// ```text
     /// version    u8 = 0
     /// count      varint
-    /// count x:
-    ///   kind     u8 = 0 (payment)
-    ///   sender   address reference
-    ///   receiver address reference
-    ///   amount   varint
+    /// count x, kind u8, then one of:
+    ///   kind 0 (payment)
+    ///     sender   address reference
+    ///     receiver address reference
+    ///     amount   varint
+    ///   kind 1 (deposit)
+    ///     receiver address reference
+    ///     amount   varint
     ///
     /// address reference:
     ///   varint 0 -> 32 literal bytes follow, appended to the dictionary
     ///   varint n -> the nth address added to the dictionary, one-based
     /// ```
     ///
-    /// No roots, no nonces, no signatures, no witnesses: a replaying node derives all of them.
-    /// A payment between two addresses the block has already mentioned costs four bytes.
+    /// No roots, no nonces, no signatures, no witnesses: a replaying node derives all of them. A
+    /// deposit's sender is derived too -- it is always [`crate::ZERO_ADDRESS`], so writing it would
+    /// be paying for a constant. A payment between two addresses the block has already mentioned
+    /// costs four bytes; a deposit to one costs three.
+    ///
+    /// Deposits share the address dictionary with payments, so a deposit and a later payment to the
+    /// same account cost one reference between them.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut dictionary = Dictionary::default();
@@ -309,6 +327,11 @@ impl Batch {
                     dictionary.put(&mut buf, &payment.header.sender);
                     dictionary.put(&mut buf, &payment.receiver);
                     put_varint(&mut buf, payment.amount);
+                }
+                Transaction::Deposit(deposit) => {
+                    buf.push(KIND_DEPOSIT);
+                    dictionary.put(&mut buf, &deposit.receiver);
+                    put_varint(&mut buf, deposit.amount);
                 }
             }
         }
@@ -337,6 +360,13 @@ impl Batch {
                     receiver: dictionary.take(&mut reader)?,
                     amount: reader.varint()?,
                 }),
+                // The sender is not on the wire; `Deposit::new` is what fills it in, so there is
+                // one place the marker address is written and no way for the two sides to drift.
+                KIND_DEPOSIT => {
+                    let receiver = dictionary.take(&mut reader)?;
+
+                    Transaction::Deposit(Deposit::new(receiver, reader.varint()?))
+                }
                 kind => return Err(DecodeError::UnknownTransactionKind(kind)),
             });
         }
@@ -412,18 +442,26 @@ impl Sidecar {
     /// ```text
     /// version    u8 = 0
     /// count      varint
-    /// count x:
-    ///   scheme   3 bytes (Scheme::identifier)
-    ///   pub_key  varint length, then bytes
-    ///   sig      varint length, then bytes
-    ///   sender   witness
-    ///   receiver witness
+    /// count x, in the shape the batch's transaction of the same index calls for:
+    ///   payment
+    ///     scheme   3 bytes (Scheme::identifier)
+    ///     pub_key  varint length, then bytes
+    ///     sig      varint length, then bytes
+    ///     sender   witness
+    ///     receiver witness
+    ///   deposit
+    ///     receiver witness
     ///
     /// witness:
     ///   present  u8: 0 absent, 1 followed by a 48-byte account
     ///   depth    varint, then depth x 32-byte siblings
     ///   slot     u8: 0 own, 1 followed by a 32-byte address and a 48-byte account
     /// ```
+    ///
+    /// There is no kind tag on an entry. The batch already says what each transaction is, and
+    /// reading each entry in the shape its transaction demands means an entry paired with the wrong
+    /// kind cannot be written down at all -- the same move as taking the count from the batch
+    /// rather than the wire, one step further.
     ///
     /// The scheme is written as its [`Scheme::identifier`] rather than a compact tag so there is
     /// no second scheme mapping to drift out of step with address derivation. The three bytes are
@@ -435,23 +473,32 @@ impl Sidecar {
         put_varint(&mut buf, self.entries.len() as u64);
 
         for entry in &self.entries {
-            buf.extend_from_slice(&entry.sig.scheme.identifier());
-            put_bytes(&mut buf, &entry.sig.pub_key);
-            put_bytes(&mut buf, &entry.sig.sig);
-            put_witness(&mut buf, &entry.sender_witness);
-            put_witness(&mut buf, &entry.receiver_witness);
+            match entry {
+                TxnSidecar::Payment(entry) => {
+                    buf.extend_from_slice(&entry.sig.scheme.identifier());
+                    put_bytes(&mut buf, &entry.sig.pub_key);
+                    put_bytes(&mut buf, &entry.sig.sig);
+                    put_witness(&mut buf, &entry.sender_witness);
+                    put_witness(&mut buf, &entry.receiver_witness);
+                }
+                TxnSidecar::Deposit(entry) => {
+                    put_witness(&mut buf, &entry.receiver_witness);
+                }
+            }
         }
 
         buf
     }
 
-    /// Rebuild a sidecar for a batch of `expected` transactions.
+    /// Rebuild the sidecar belonging to `batch`.
     ///
-    /// Taking the count from the caller is what replaces the old pairing of a transaction with its
-    /// witnesses in one struct: the batch decodes first, and a sidecar that does not line up with
-    /// it is rejected here rather than reaching [`crate::verify_batch`] misaligned.
-    pub fn decode(bytes: &[u8], expected: usize) -> Result<Self, DecodeError> {
+    /// Taking both the count and the shapes from the batch is what replaces the old pairing of a
+    /// transaction with its witnesses in one struct: the batch decodes first, and a sidecar that
+    /// does not line up with it is rejected here rather than reaching [`crate::verify_batch`]
+    /// misaligned.
+    pub fn decode(bytes: &[u8], batch: &Batch) -> Result<Self, DecodeError> {
         let mut reader = Reader::new(bytes);
+        let expected = batch.len();
 
         reader.expect_version(SIDECAR_VERSION)?;
         let found = reader.count(MIN_ENCODED_ENTRY_SIZE)?;
@@ -460,19 +507,26 @@ impl Sidecar {
         }
 
         let mut entries = Vec::with_capacity(found);
-        for _ in 0..found {
-            let identifier = reader.array::<SCHEME_SIZE>()?;
-            let scheme = Scheme::from_identifier(&identifier)
-                .ok_or(DecodeError::UnknownScheme(identifier))?;
+        for txn in batch.txns() {
+            entries.push(match txn {
+                Transaction::Payment(_) => {
+                    let identifier = reader.array::<SCHEME_SIZE>()?;
+                    let scheme = Scheme::from_identifier(&identifier)
+                        .ok_or(DecodeError::UnknownScheme(identifier))?;
 
-            entries.push(TxnSidecar {
-                sig: Signature {
-                    scheme,
-                    pub_key: reader.bytes()?,
-                    sig: reader.bytes()?,
-                },
-                sender_witness: take_witness(&mut reader)?,
-                receiver_witness: take_witness(&mut reader)?,
+                    TxnSidecar::Payment(PaymentSidecar {
+                        sig: Signature {
+                            scheme,
+                            pub_key: reader.bytes()?,
+                            sig: reader.bytes()?,
+                        },
+                        sender_witness: take_witness(&mut reader)?,
+                        receiver_witness: take_witness(&mut reader)?,
+                    })
+                }
+                Transaction::Deposit(_) => TxnSidecar::Deposit(DepositSidecar {
+                    receiver_witness: take_witness(&mut reader)?,
+                }),
             });
         }
         reader.finish()?;
@@ -490,20 +544,24 @@ mod tests {
     const SCHEME: Scheme = Scheme::Managed;
 
     fn signed(key: &[u8], receiver: Address, amount: u64) -> SignedTransaction {
-        SignedTransaction {
-            txn: Transaction::Payment(Payment {
+        SignedTransaction::payment(
+            Payment {
                 header: TransactionHeader {
                     sender: address_from_public_key(SCHEME, key),
                 },
                 receiver,
                 amount,
-            }),
-            sig: Signature {
+            },
+            Signature {
                 scheme: SCHEME,
                 pub_key: key.to_vec(),
                 sig: Vec::new(),
             },
-        }
+        )
+    }
+
+    fn deposit(key: &[u8], amount: u64) -> SignedTransaction {
+        SignedTransaction::deposit(Deposit::new(address_from_public_key(SCHEME, key), amount))
     }
 
     fn fund(ledger: &mut Ledger, key: &[u8], amount: u64) -> Address {
@@ -512,6 +570,14 @@ mod tests {
         ledger.insert_account(address, account);
 
         address
+    }
+
+    /// The payment entry at `index`, for tests that doctor one of its witnesses.
+    fn payment_entry(sidecar: &mut Sidecar, index: usize) -> &mut PaymentSidecar {
+        match &mut sidecar.entries[index] {
+            TxnSidecar::Payment(entry) => entry,
+            TxnSidecar::Deposit(_) => panic!("entry {index} is a deposit, not a payment"),
+        }
     }
 
     /// A block covering the three witness shapes -- a plain payment, one that brings an account
@@ -542,7 +608,7 @@ mod tests {
         let block = block();
         let bytes = block.sidecar.encode();
 
-        assert_eq!(Sidecar::decode(&bytes, 3), Ok(block.sidecar));
+        assert_eq!(Sidecar::decode(&bytes, &block.batch), Ok(block.sidecar));
     }
 
     #[test]
@@ -550,8 +616,8 @@ mod tests {
         let batch = Batch::default();
         let sidecar = Sidecar::default();
 
-        assert_eq!(Batch::decode(&batch.encode()), Ok(batch));
-        assert_eq!(Sidecar::decode(&sidecar.encode(), 0), Ok(sidecar));
+        assert_eq!(Batch::decode(&batch.encode()), Ok(batch.clone()));
+        assert_eq!(Sidecar::decode(&sidecar.encode(), &batch), Ok(sidecar));
     }
 
     // The whole point of the split: the guest is handed the bytes the chain will record, decodes
@@ -563,11 +629,11 @@ mod tests {
         let (batch_bytes, sidecar_bytes) = (block.batch.encode(), block.sidecar.encode());
 
         let batch = Batch::decode(&batch_bytes).unwrap();
-        let sidecar = Sidecar::decode(&sidecar_bytes, batch.len()).unwrap();
+        let sidecar = Sidecar::decode(&sidecar_bytes, &batch).unwrap();
 
         assert_eq!(
-            verify_batch(block.old_root, &batch, &sidecar),
-            Ok(block.new_root)
+            verify_batch(block.old_root, block.old_deposit_chain, &batch, &sidecar),
+            Ok((block.new_root, block.new_deposit_chain))
         );
     }
 
@@ -637,12 +703,19 @@ mod tests {
     #[test]
     fn a_doctored_sidecar_cannot_redirect_a_payment() {
         let block = block();
-        let mut sidecar = Sidecar::decode(&block.sidecar.encode(), 3).unwrap();
-        let entry = &mut sidecar.entries[0];
+        let mut sidecar = Sidecar::decode(&block.sidecar.encode(), &block.batch).unwrap();
+        let TxnSidecar::Payment(entry) = &mut sidecar.entries[0] else {
+            panic!("the first transaction of the fixture block is a payment")
+        };
         std::mem::swap(&mut entry.sender_witness, &mut entry.receiver_witness);
 
         assert_eq!(
-            verify_batch(block.old_root, &block.batch, &sidecar),
+            verify_batch(
+                block.old_root,
+                block.old_deposit_chain,
+                &block.batch,
+                &sidecar
+            ),
             Err(crate::VerificationError::StaleWitness)
         );
     }
@@ -672,12 +745,13 @@ mod tests {
 
     #[test]
     fn an_unknown_scheme_is_rejected() {
-        let mut bytes = block().sidecar.encode();
+        let block = block();
+        let mut bytes = block.sidecar.encode();
         // Byte 0 is the version, byte 1 the count, bytes 2..5 the first entry's scheme.
         bytes[2..5].copy_from_slice(b"???");
 
         assert_eq!(
-            Sidecar::decode(&bytes, 3),
+            Sidecar::decode(&bytes, &block.batch),
             Err(DecodeError::UnknownScheme(*b"???"))
         );
     }
@@ -732,11 +806,11 @@ mod tests {
     #[test]
     fn a_proof_deeper_than_the_address_space_is_rejected() {
         let mut block = block();
-        block.sidecar.entries[0].sender_witness.proof =
+        payment_entry(&mut block.sidecar, 0).sender_witness.proof =
             MerkleProof::from_parts(vec![[0u8; 32]; DEPTH + 1], Slot::Own);
 
         assert_eq!(
-            Sidecar::decode(&block.sidecar.encode(), 3),
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
             Err(DecodeError::ProofTooDeep(DEPTH + 1))
         );
     }
@@ -834,14 +908,82 @@ mod tests {
     // lives here, at the wire boundary.
     #[test]
     fn a_sidecar_that_does_not_match_its_batch_is_rejected() {
-        let bytes = block().sidecar.encode();
+        let mut block = block();
+        let bytes = block.sidecar.encode();
+        block.batch.txns.pop();
 
         assert_eq!(
-            Sidecar::decode(&bytes, 2),
+            Sidecar::decode(&bytes, &block.batch),
             Err(DecodeError::SidecarLengthMismatch {
                 expected: 2,
                 found: 3,
             })
         );
+    }
+
+    #[test]
+    fn a_deposit_round_trips() {
+        let block = Ledger::new().get_block(vec![deposit(b"a key", 1_000)]);
+        let decoded = Batch::decode(&block.batch.encode()).unwrap();
+
+        assert_eq!(decoded, block.batch);
+
+        // The sender is the one field the wire does not carry, so it is the one that can silently
+        // drift between the encoder and the decoder.
+        assert_eq!(decoded.txns[0].sender(), crate::ZERO_ADDRESS);
+    }
+
+    #[test]
+    fn a_mixed_batch_round_trips() {
+        let mut ledger = Ledger::new();
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        let block = ledger.get_block(vec![
+            deposit(b"a key", 1_000),
+            signed(b"a key", b, 100),
+            deposit(b"b key", 7),
+        ]);
+
+        assert_eq!(
+            Batch::decode(&block.batch.encode()),
+            Ok(block.batch.clone())
+        );
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+    }
+
+    // A deposit encodes to three bytes at its smallest, below the four a payment needs. The stride
+    // `Reader::count` screens with has to be the minimum over kinds or it rejects valid input --
+    // and a batch of nothing but deposits is exactly the shape that trips it.
+    #[test]
+    fn a_deposit_dense_batch_is_not_rejected_by_the_count_check() {
+        let mut ledger = Ledger::new();
+        let deposits: Vec<_> = (0..64u8).map(|i| deposit(&[b'k', i], 1_000)).collect();
+
+        let block = ledger.get_block(deposits);
+        let bytes = block.batch.encode();
+
+        assert_eq!(Batch::decode(&bytes), Ok(block.batch.clone()));
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+    }
+
+    // A deposit is a kind tag, an address reference, and an amount -- 37 bytes to an address the
+    // batch has not mentioned, 5 to one it has.
+    #[test]
+    fn a_deposit_costs_what_the_format_says_it_does() {
+        let cold = Ledger::new().get_block(vec![deposit(b"a key", 1_000)]);
+        // 1 version + 1 count + 1 kind + 33 fresh address + 2 amount varint
+        assert_eq!(cold.batch.encode().len(), 38);
+
+        let mut ledger = Ledger::new();
+        let warm = ledger.get_block(vec![deposit(b"a key", 1_000), deposit(b"a key", 1_000)]);
+        // The second deposit reuses the dictionary entry the first one made: kind, a one-byte
+        // reference, and the same two-byte amount.
+        assert_eq!(warm.batch.encode().len(), 38 + 4);
     }
 }

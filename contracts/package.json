@@ -7,7 +7,8 @@
     "build:contracts": "puya-ts contracts",
     "build:clients": "tsx scripts/generate_clients.ts",
     "build:fixtures": "cargo run -q -p sp1-host -- --out fixtures/settlements.json",
-    "build": "npm run build:contracts && npm run build:clients && npm run build:fixtures"
+    "build": "pnpm run build:contracts && pnpm run build:clients && pnpm run build:fixtures",
+    "test": "npx vitest"
   },
   "keywords": [],
   "author": "",

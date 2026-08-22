@@ -1,15 +1,18 @@
 //! Everything a settlement transaction needs, produced without a zkVM.
 //!
 //! The guest is [`payment_rollup::execute`] wrapped in zkVM io, so running that function directly
-//! gives the exact 96 bytes a proof would commit -- the roots and the batch commitment -- for the
-//! cost of replaying the block. What is missing is only the proof that the replay happened, which
-//! is precisely the part the settlement contract does not check yet.
+//! gives the exact 160 bytes a proof would commit -- the roots, the batch commitment, and the two
+//! ends of the deposit chain -- for the cost of replaying the block. What is missing is only the
+//! proof that the replay happened, which is precisely the part the settlement contract does not
+//! check yet.
 //!
 //! So a [`Settlement`] is the whole of a settlement's argument list: the declared batch length to
-//! open with, the chunks to post, and the public values to settle against. See [`scenarios`] for
-//! the blocks these are built from.
+//! open with, the chunks to post, the deposits to replay onto L1 first, and the public values to
+//! settle against. See [`scenarios`] for the blocks these are built from.
 
-use payment_rollup::{Block, ExecutionError, VerificationError, chunk_count, execute};
+use payment_rollup::{
+    Address, Block, ExecutionError, Transaction, VerificationError, chunk_count, execute,
+};
 
 pub mod scenarios;
 
@@ -25,11 +28,18 @@ pub use payment_rollup::{CHUNK_SIZE, PUBLIC_VALUES_SIZE};
 /// contract there -- see [`Settlement::settles_from_genesis`].
 pub const GENESIS_ROOT: [u8; 32] = [0u8; 32];
 
+/// The deposit chain a freshly deployed contract starts life holding; see
+/// [`payment_rollup::accumulate_deposit`].
+pub use payment_rollup::DEPOSIT_CHAIN_GENESIS;
+
 /// One block, reduced to the arguments the settlement contract takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settlement {
     old_root: [u8; 32],
     new_root: [u8; 32],
+    old_deposit_chain: [u8; 32],
+    new_deposit_chain: [u8; 32],
+    deposits: Vec<(Address, u64)>,
     txn_count: usize,
     batch_bytes: Vec<u8>,
     sidecar_bytes: Vec<u8>,
@@ -46,24 +56,67 @@ impl Settlement {
         let batch_bytes = block.batch().encode();
         let sidecar_bytes = block.sidecar().encode();
 
-        let public_values = execute(block.old_root(), &batch_bytes, &sidecar_bytes)?;
+        let public_values = execute(
+            block.old_root(),
+            block.old_deposit_chain(),
+            &batch_bytes,
+            &sidecar_bytes,
+        )?;
 
         // The guest is never told what root to expect, so the replay landing somewhere other than
-        // the root this block claims is a real disagreement and not a redundant check.
-        if public_values[32..64] != block.new_root() {
+        // the root this block claims is a real disagreement and not a redundant check. The same
+        // goes for the deposit chain.
+        if public_values[32..64] != block.new_root()
+            || public_values[128..] != block.new_deposit_chain()
+        {
             return Err(ExecutionError::Verification(
                 VerificationError::RootMismatch,
             ));
         }
 
+        // Read back off the wire rather than out of the in-memory block, so this is the list a
+        // replaying node would reconstruct -- which is what the e2e has to feed L1 to reach the
+        // chain the batch folds to.
+        let deposits = payment_rollup::Batch::decode(&batch_bytes)?
+            .txns()
+            .iter()
+            .filter_map(|txn| match txn {
+                Transaction::Deposit(_) => Some((txn.receiver(), txn.amount())),
+                Transaction::Payment(_) => None,
+            })
+            .collect();
+
         Ok(Self {
             old_root: block.old_root(),
             new_root: block.new_root(),
+            old_deposit_chain: block.old_deposit_chain(),
+            new_deposit_chain: block.new_deposit_chain(),
+            deposits,
             txn_count: block.batch().len(),
             batch_bytes,
             sidecar_bytes,
             public_values,
         })
+    }
+
+    /// The deposit chain the batch anchors to: what the contract must have settled last time.
+    pub fn deposit_chain_from(&self) -> [u8; 32] {
+        self.old_deposit_chain
+    }
+
+    /// The deposit chain the batch's deposits fold it to: what the contract must be holding when it
+    /// settles.
+    pub fn deposit_chain_to(&self) -> [u8; 32] {
+        self.new_deposit_chain
+    }
+
+    /// Every deposit the batch credits, in the order it credits them.
+    ///
+    /// These have to be replayed onto L1 -- one `deposit` call each, in this order -- before the
+    /// batch can settle, because [`Self::deposit_chain_to`] is only reachable by folding them in
+    /// exactly this sequence.
+    pub fn deposits(&self) -> &[(Address, u64)] {
+        &self.deposits
     }
 
     pub fn old_root(&self) -> [u8; 32] {
@@ -89,7 +142,7 @@ impl Settlement {
         &self.sidecar_bytes
     }
 
-    /// The 96 bytes a proof would commit, and the single argument `verifyBatch` takes.
+    /// The 160 bytes a proof would commit, and the single argument `verifyBatch` takes.
     pub fn public_values(&self) -> &[u8; PUBLIC_VALUES_SIZE] {
         &self.public_values
     }
@@ -97,7 +150,7 @@ impl Settlement {
     /// The batch commitment the contract's accumulator has to arrive at, read out of the public
     /// values rather than recomputed -- this is the value the contract compares against.
     pub fn batch_commitment(&self) -> [u8; 32] {
-        self.public_values[64..].try_into().unwrap()
+        self.public_values[64..96].try_into().unwrap()
     }
 
     /// What `openBatch` is called with, and what fixes where every chunk boundary falls.
@@ -114,16 +167,14 @@ impl Settlement {
         chunk_count(self.batch_bytes.len())
     }
 
-    /// Whether a freshly deployed contract will accept this, or whether its root has to be seeded
-    /// to [`Settlement::old_root`] first.
+    /// Whether a freshly deployed contract will accept this.
     ///
-    /// Only a block replayed from the empty ledger can settle against a new contract, and today
-    /// that means a block that spends nothing -- there is no deposit path, so there is no way to
-    /// prove a route from genesis to a funded state. A fixture that starts from a funded ledger has
-    /// to be put there by hand, which is what the contract's `seedStateRoot` is for: call it with
-    /// this settlement's `oldRoot` before opening the batch.
+    /// Now that a batch can carry deposits, every funded state is reachable from the empty ledger
+    /// by a block that opens with them -- so this should hold for every scenario, and the host
+    /// tests assert exactly that. It is kept as a named invariant rather than deleted because it is
+    /// the property that let the contract's `seedStateRoot` escape hatch be removed.
     pub fn settles_from_genesis(&self) -> bool {
-        self.old_root == GENESIS_ROOT
+        self.old_root == GENESIS_ROOT && self.old_deposit_chain == DEPOSIT_CHAIN_GENESIS
     }
 }
 
@@ -136,7 +187,9 @@ pub fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    use payment_rollup::{accumulate_chunk, chunk_accumulator_seed, chunk_digest};
+    use payment_rollup::{
+        accumulate_chunk, accumulate_deposit, chunk_accumulator_seed, chunk_digest,
+    };
 
     /// The contract's side of the fold: seed from the declared length, then one step per posted
     /// chunk. If this does not land on the commitment in the public values, the chunks being
@@ -159,12 +212,70 @@ mod tests {
             assert_eq!(&settlement.public_values[..32], &settlement.old_root());
             assert_eq!(&settlement.public_values[32..64], &settlement.new_root());
             assert_eq!(
+                &settlement.public_values[96..128],
+                &settlement.deposit_chain_from()
+            );
+            assert_eq!(
+                &settlement.public_values[128..],
+                &settlement.deposit_chain_to()
+            );
+            assert_eq!(
                 accumulate_as_the_contract_would(&settlement),
                 settlement.batch_commitment(),
                 "{}: the posted chunks must fold to the committed commitment",
                 scenario.name
             );
         }
+    }
+
+    /// The contract's side of the deposit chain: one fold per deposit, as they arrive. If this does
+    /// not land on what the guest committed, the two implementations of the fold disagree.
+    #[test]
+    fn every_scenario_deposit_chain_folds_from_its_anchor() {
+        for scenario in scenarios::all() {
+            let settlement = Settlement::for_block(&(scenario.build)()).unwrap();
+
+            let mut chain = settlement.deposit_chain_from();
+            for (receiver, amount) in settlement.deposits() {
+                chain = accumulate_deposit(&chain, receiver, *amount);
+            }
+
+            assert_eq!(
+                chain,
+                settlement.deposit_chain_to(),
+                "{}: replaying the deposits onto L1 must reach the chain the batch folds to",
+                scenario.name
+            );
+        }
+    }
+
+    // A batch with no deposits leaves the chain where it was, which is what makes the empty-deposit
+    // case need no distinguishing seed: "unchanged" is already a distinguishable commitment.
+    #[test]
+    fn a_scenario_without_deposits_leaves_the_chain_alone() {
+        let settlement =
+            Settlement::for_block(&(scenarios::find("genesis-empty-batch").unwrap().build)())
+                .unwrap();
+
+        assert!(settlement.deposits().is_empty());
+        assert_eq!(
+            settlement.deposit_chain_to(),
+            settlement.deposit_chain_from()
+        );
+    }
+
+    // Deposits are the only way value enters, so a scenario that moves money has to start with one.
+    #[test]
+    fn a_deposit_bearing_scenario_exists() {
+        assert!(
+            scenarios::all().iter().any(|scenario| {
+                !Settlement::for_block(&(scenario.build)())
+                    .unwrap()
+                    .deposits()
+                    .is_empty()
+            }),
+            "the deposit path needs a fixture that actually carries deposits"
+        );
     }
 
     #[test]
@@ -186,15 +297,20 @@ mod tests {
         }
     }
 
-    // Without one of these there is nothing to run end to end against a newly deployed contract,
-    // which is the whole point of the fixtures.
+    // Every scenario, not merely one: with deposits carrying value in, there is no longer any state
+    // a block cannot prove its way to from the empty ledger, so nothing needs its root seeded.
     #[test]
-    fn at_least_one_scenario_settles_against_a_fresh_contract() {
-        assert!(scenarios::all().iter().any(|scenario| {
-            Settlement::for_block(&(scenario.build)())
-                .unwrap()
-                .settles_from_genesis()
-        }));
+    fn every_scenario_settles_against_a_fresh_contract() {
+        for scenario in scenarios::all() {
+            assert!(
+                Settlement::for_block(&(scenario.build)())
+                    .unwrap()
+                    .settles_from_genesis(),
+                "{} does not start from genesis, and there is no longer a way to seed a contract \
+                 to meet it",
+                scenario.name
+            );
+        }
     }
 
     #[test]
