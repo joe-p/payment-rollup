@@ -5,7 +5,7 @@ use crate::{Account, Address};
 /// Longest path the tree can produce. An [`Address`] is 32 bytes, so 256 levels give every address
 /// a position of its own. Paths only run that deep when two addresses agree on all but their last
 /// bit; in practice they run about `log2(accounts)` deep. See [`SparseMerkleTree`].
-const DEPTH: usize = 256;
+pub(crate) const DEPTH: usize = 256;
 
 /// Hash of a subtree holding no accounts.
 ///
@@ -303,9 +303,21 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
+    /// A proof from its parts, for a decoder rebuilding one off the wire.
+    ///
+    /// Nothing is validated here, and nothing needs to be: a proof that does not describe a real
+    /// position simply fails to reproduce the root it is measured against. See [`root_from_proof`].
+    pub(crate) fn from_parts(siblings: Vec<[u8; 32]>, slot: Slot) -> Self {
+        Self { siblings, slot }
+    }
+
     /// How deep the proven position sits, and so how many hashes verifying costs.
     pub fn depth(&self) -> usize {
         self.siblings.len()
+    }
+
+    pub fn siblings(&self) -> &[[u8; 32]] {
+        &self.siblings
     }
 
     pub fn slot(&self) -> &Slot {

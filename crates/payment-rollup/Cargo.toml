@@ -14,4 +14,4 @@ license.workspace = true
 #
 # with the tag matching the SP1 version in use. Only SHA-256 is accelerated -- SHA-512/256 has no
 # precompile and runs its 64-bit arithmetic in software on a 32-bit VM, so it is not used anywhere.
-sha2 = "0.10.8"
+sha2 = { workspace = true }
