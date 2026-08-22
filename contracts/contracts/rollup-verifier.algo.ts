@@ -1103,7 +1103,7 @@ export class RollupVerifier extends Contract {
    * Settle a fully posted batch: check the proof against what the contract is holding, then advance
    * to what the proof landed on.
    *
-   * Five things have to line up, and each one is load-bearing:
+   * Six things have to line up, and each one is load-bearing:
    *
    * - `publicValues[0..32]` against `stateRoot` -- the proof has to start where the chain is, so a
    *   valid proof of some other transition cannot be replayed here.
@@ -1115,7 +1115,17 @@ export class RollupVerifier extends Contract {
    * - `publicValues[128..160]` against `sealedDepositChain` -- where they end. Pinning both ends
    *   rather than just the last is what stops a prover choosing an anchor that makes a fabricated
    *   fold land correctly; with both fixed, the deposits between them are determined.
-   * - the proof itself, over exactly those 160 bytes.
+   * - `publicValues[192..224]` and `publicValues[224..256]` against `settledRequestChain` and
+   *   `sealedRequestChain` -- the same two-ended pin on the request side, for the same reason one
+   *   end would not be enough.
+   * - the proof itself, over all 256 bytes.
+   *
+   * **All 256, not merely the words compared above.** `publicValues[160..192]` is the one word this
+   * method does not check, because there is nothing here to check it against: the withdrawal chain
+   * is a claim about what the batch authorized paying out, and it is tested later, one claim at a
+   * time, in `claimWithdrawal`. That makes the proof its only defence. A verifier bound to a prefix
+   * would leave it an ordinary argument, and an attacker-chosen tip is a queue that pays out
+   * withdrawals no batch ever contained. `PublicValues` is `bytes<256>` for exactly that reason.
    *
    * The two deposit checks are together what make the batch's deposits exactly L1's: inventing,
    * dropping, reordering or altering one diverges the fold and never recovers. Note this needs no
@@ -1125,7 +1135,8 @@ export class RollupVerifier extends Contract {
    *
    * **None of that binds yet.** The proof is not verified -- see the TODO below -- and
    * `publicValues` is an ordinary argument, so a dishonest sequencer can read `sealedDepositChain`
-   * straight out of global state and hand it back while the batch bytes say something else. The
+   * straight out of global state and hand it back while the batch bytes say something else -- and
+   * can put whatever it likes in the withdrawal word, which nothing here compares at all. The
    * chain is the right mechanism and becomes airtight the moment the verifier lands, with no
    * redesign; until then the sequencer is trusted here exactly as it is already trusted with
    * `stateRoot`. What does hold today is data availability: the accumulator forces the real bytes
