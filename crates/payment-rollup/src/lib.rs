@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use sha2::{Digest, Sha256};
 
@@ -92,7 +93,13 @@ pub struct Account {
 }
 
 impl Account {
-    fn new(nonce: u64, amount: u64, auth_address: Address) -> Self {
+    /// An account in an arbitrary state.
+    ///
+    /// Nothing here ties `auth_address` to the address the account will be stored at, so this can
+    /// build states no sequence of blocks could reach. That is what makes it useful for laying down
+    /// a genesis ledger or a test fixture, and why ordinary block replay never calls it -- see
+    /// [`Account::empty`], which is what [`verify_batch`] pins a created account to.
+    pub fn new(nonce: u64, amount: u64, auth_address: Address) -> Self {
         Self {
             nonce,
             amount,
@@ -192,6 +199,14 @@ pub struct Payment {
 }
 
 impl Payment {
+    pub fn new(sender: Address, receiver: Address, amount: u64) -> Self {
+        Self {
+            header: TransactionHeader { sender },
+            receiver,
+            amount,
+        }
+    }
+
     /// The bytes a sender signs to authorize this payment at `nonce`.
     ///
     /// `nonce` is not carried by the payment: it is whatever [`Account::bump_nonce`] produces for
@@ -257,6 +272,14 @@ pub struct Signature {
 }
 
 impl Signature {
+    pub fn new(scheme: Scheme, pub_key: Vec<u8>, sig: Vec<u8>) -> Self {
+        Self {
+            scheme,
+            pub_key,
+            sig,
+        }
+    }
+
     /// The address of the signer, which must match an account's `auth_address` to spend from it.
     pub fn address(&self) -> Address {
         address_from_public_key(self.scheme, &self.pub_key)
@@ -279,6 +302,12 @@ impl Signature {
 pub struct SignedTransaction {
     txn: Transaction,
     sig: Signature,
+}
+
+impl SignedTransaction {
+    pub fn new(txn: Transaction, sig: Signature) -> Self {
+        Self { txn, sig }
+    }
 }
 
 /// Everything a verifier needs to know about one leaf slot at the moment it is written.
@@ -601,6 +630,63 @@ pub fn public_values(
     buf[64..].copy_from_slice(&batch_commitment(batch_bytes));
 
     buf
+}
+
+/// Why a pair of encoded block halves does not produce a proof.
+///
+/// The two cases are the two boundaries a block crosses on its way into the guest: the bytes have
+/// to be a block at all, and the block has to replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionError {
+    Decode(DecodeError),
+    Verification(VerificationError),
+}
+
+impl From<DecodeError> for ExecutionError {
+    fn from(error: DecodeError) -> Self {
+        ExecutionError::Decode(error)
+    }
+}
+
+impl From<VerificationError> for ExecutionError {
+    fn from(error: VerificationError) -> Self {
+        ExecutionError::Verification(error)
+    }
+}
+
+impl fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutionError::Decode(error) => write!(f, "could not decode the block: {error}"),
+            ExecutionError::Verification(error) => {
+                write!(f, "the block does not verify: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecutionError {}
+
+/// The whole of what a proof asserts, computed from the same bytes the guest is handed.
+///
+/// This is the guest program with the zkVM taken out: decode both halves, replay from `old_root`,
+/// and lay out the public values. The guest is a wrapper that reads its three inputs, calls this,
+/// and commits what comes back -- so there is one implementation of "what this proof says", and a
+/// host can reach the committed values without proving anything.
+///
+/// Note there is still no expected root among the inputs. The replay reports where it landed, and
+/// the settlement contract is the only thing that decides whether that is the root it was holding.
+pub fn execute(
+    old_root: [u8; 32],
+    batch_bytes: &[u8],
+    sidecar_bytes: &[u8],
+) -> Result<[u8; PUBLIC_VALUES_SIZE], ExecutionError> {
+    let batch = Batch::decode(batch_bytes)?;
+    let sidecar = Sidecar::decode(sidecar_bytes, batch.len())?;
+
+    let new_root = verify_batch(old_root, &batch, &sidecar)?;
+
+    Ok(public_values(&old_root, &new_root, batch_bytes))
 }
 
 /// Replay a whole [`Block`] and check it reaches its own `new_root`.

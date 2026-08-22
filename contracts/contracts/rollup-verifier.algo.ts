@@ -4,7 +4,10 @@ import {
   bytes,
   Bytes,
   Contract,
+  Global,
   GlobalState,
+  TemplateVar,
+  Txn,
   uint64,
 } from "@algorandfoundation/algorand-typescript";
 import {
@@ -85,6 +88,37 @@ export class RollupVerifier extends Contract {
    */
   createApplication(): void {
     this.stateRoot.value = bzero(32);
+  }
+
+  /**
+   * Move the chain to `root` without proving how it got there. Test builds only.
+   *
+   * This exists because of a gap that has nothing to do with settlement: there is no deposit
+   * transaction yet, so the only block that replays from the empty ledger is an empty one. Without
+   * a way to put the contract at a funded root, no fixture that actually moves the state root can
+   * be run against it -- see `settlesFromGenesis` in the host's fixtures.
+   *
+   * Three things keep it out of a real deployment, in descending order of how much they matter:
+   *
+   * - `TMPL_ALLOW_ROOT_SEEDING` is substituted at compile time, so a production build has this
+   *   method asserting a constant `false`. The value is baked into the deployed program and cannot
+   *   be flipped afterwards, which is the only guarantee here that does not depend on who calls.
+   * - The creator check keeps a shared devnet deployment from having its root reset by anyone who
+   *   finds the app id.
+   * - Seeding is refused mid-batch, so it cannot be used to slip a root under a batch that is
+   *   already being posted.
+   *
+   * Delete this once deposits exist. Nothing else in the contract needs it.
+   */
+  seedStateRoot(root: bytes<32>): void {
+    assert(
+      TemplateVar<boolean>("ALLOW_ROOT_SEEDING"),
+      "this build does not allow seeding the state root",
+    );
+    assert(Txn.sender === Global.creatorAddress, "only the creator may seed");
+    assert(!this.batchLength.hasValue, "a batch is being posted");
+
+    this.stateRoot.value = root;
   }
 
   /**

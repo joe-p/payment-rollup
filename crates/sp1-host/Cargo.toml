@@ -1,0 +1,12 @@
+[package]
+name = "sp1-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+payment-rollup = { path = "../payment-rollup" }
+# Host-only, and deliberately so: nothing here is compiled into the guest, where every dependency
+# is paid for in cycles.
+serde_json = { workspace = true }

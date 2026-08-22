@@ -13,7 +13,7 @@
 
 sp1_zkvm::entrypoint!(main);
 
-use payment_rollup::{Batch, Sidecar, public_values, verify_batch};
+use payment_rollup::execute;
 
 pub fn main() {
     // The batch bytes are read exactly as the chain will record them and decoded with the same
@@ -25,10 +25,9 @@ pub fn main() {
     let batch_bytes = sp1_zkvm::io::read_vec();
     let sidecar_bytes = sp1_zkvm::io::read_vec();
 
-    let batch = Batch::decode(&batch_bytes).expect("batch must decode");
-    let sidecar = Sidecar::decode(&sidecar_bytes, batch.len()).expect("sidecar must decode");
+    // Everything the proof asserts lives in `execute`, so the host can compute these same 96 bytes
+    // without a zkVM. This is only the io.
+    let values = execute(old_root, &batch_bytes, &sidecar_bytes).expect("block must prove");
 
-    let new_root = verify_batch(old_root, &batch, &sidecar).expect("block must verify");
-
-    sp1_zkvm::io::commit_slice(&public_values(&old_root, &new_root, &batch_bytes));
+    sp1_zkvm::io::commit_slice(&values);
 }
