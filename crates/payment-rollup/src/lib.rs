@@ -474,8 +474,20 @@ pub fn verify_batch(
     Ok(root)
 }
 
-/// Largest fragment of a batch. Constrained by AVM stack limits
-pub const CHUNK_SIZE: usize = 4096;
+/// Longest application argument a settlement transaction can carry, as of go-algorand 5.0 (AVM
+/// v42).
+pub const MAX_APP_ARG: usize = 4096;
+
+/// Bytes an ABI `byte[]` argument spends on its own length prefix, and so bytes a chunk cannot use.
+const ABI_LENGTH_PREFIX: usize = 2;
+
+/// Largest fragment of a batch: as much as fits in one application argument once the ABI length
+/// prefix has taken its two bytes.
+///
+/// This is an argument-size limit, not the [`AVM_MAX_BYTE_SLICE`] limit on hashing -- a chunk has
+/// to both arrive in one transaction and be hashable in one step, and the delivery limit is the
+/// tighter of the two.
+pub const CHUNK_SIZE: usize = MAX_APP_ARG - ABI_LENGTH_PREFIX;
 
 /// How many chunks a batch of `batch_len` bytes is posted in.
 pub fn chunk_count(batch_len: usize) -> usize {
@@ -508,10 +520,10 @@ pub const AVM_MAX_BYTE_SLICE: usize = 4096;
 
 /// Commitment to one posted chunk, hashed on its own.
 ///
-/// Deliberately untagged. A full chunk is [`CHUNK_SIZE`] bytes, which is the entire budget the AVM
-/// allows in one value, so there is no room for a prefix -- and none is needed, because a chunk
-/// digest is only ever consumed inside the tagged preimage of [`accumulate_chunk`]. It can never
-/// be read as a seed or as an accumulator.
+/// Deliberately untagged. A full chunk is [`CHUNK_SIZE`] bytes, within two bytes of the entire
+/// budget the AVM allows in one value, so there is no room for a prefix -- and none is needed,
+/// because a chunk digest is only ever consumed inside the tagged preimage of
+/// [`accumulate_chunk`]. It can never be read as a seed or as an accumulator.
 pub fn chunk_digest(chunk: &[u8]) -> [u8; 32] {
     debug_assert!(
         chunk.len() <= CHUNK_SIZE,
@@ -932,13 +944,10 @@ mod tests {
 
     // The constraint that shapes the whole scheme: a settlement contract cannot hold more than
     // `AVM_MAX_BYTE_SLICE` bytes in one value, so no preimage in the commitment may exceed it. A
-    // single hash of `tag || accumulator || chunk` would need 4133 bytes and be unimplementable
+    // single hash of `tag || accumulator || chunk` would need 4131 bytes and be unimplementable
     // on-chain, which is why the fold digests the chunk first.
     #[test]
     fn every_preimage_a_contract_must_hash_fits_in_one_avm_value() {
-        // A chunk fills the budget exactly and on its own -- there is no room for a prefix.
-        assert_eq!(CHUNK_SIZE, AVM_MAX_BYTE_SLICE);
-
         let seed_preimage = b"BATCH".len() + size_of::<u64>();
         let digest_preimage = CHUNK_SIZE;
         let fold_preimage = b"CHUNK".len() + 32 + 32;
