@@ -1,4 +1,5 @@
 import {
+  abimethod,
   assert,
   bytes,
   Bytes,
@@ -6,7 +7,11 @@ import {
   GlobalState,
   uint64,
 } from "@algorandfoundation/algorand-typescript";
-import { itob, sha256 } from "@algorandfoundation/algorand-typescript/op";
+import {
+  bzero,
+  itob,
+  sha256,
+} from "@algorandfoundation/algorand-typescript/op";
 
 /**
  * Largest fragment of a batch: as much as fits in one application argument -- 4096 bytes as of
@@ -31,7 +36,24 @@ const CHUNK_SIZE = 4094;
  */
 export type Chunk = bytes;
 
+/**
+ * The 96 bytes the guest commits: `old_root || new_root || batch_commitment`.
+ *
+ * Mirrors `public_values`. Nothing else escapes the proof, which is why the batch itself has to
+ * arrive as chunks and be folded into a commitment the contract can compare against the last third.
+ */
+export type PublicValues = bytes<96>;
+
 export class RollupVerifier extends Contract {
+  /**
+   * The root the chain has settled on: the state every future batch must start from.
+   *
+   * This is the whole point of the contract. A proof carries the root it began at, and the only
+   * proof this contract will accept is one that began at the root recorded here -- which is what
+   * makes the sequence of batches a chain rather than a set of unrelated transitions.
+   */
+  stateRoot = GlobalState<bytes<32>>();
+
   /**
    * The fold over every chunk posted so far.
    *
@@ -55,6 +77,17 @@ export class RollupVerifier extends Contract {
   postedLength = GlobalState<uint64>();
 
   /**
+   * Genesis: the empty ledger.
+   *
+   * `EMPTY_SUBTREE` in the tree is 32 zero bytes and an empty sparse tree hashes to it, so a
+   * ledger with no accounts in it is the root below. Starting anywhere else would be claiming a
+   * state no batch had ever proved its way to.
+   */
+  createApplication(): void {
+    this.stateRoot.value = bzero(32);
+  }
+
+  /**
    * Start a batch, seeding the accumulator from the length its bytes are declared to have.
    *
    * Mirrors `chunk_accumulator_seed`.
@@ -64,7 +97,9 @@ export class RollupVerifier extends Contract {
     // a batch has to be finished before the next one begins.
     assert(!this.batchLength.hasValue, "a batch is already being posted");
 
-    this.chunkAccumulator.value = sha256(Bytes("BATCH").concat(itob(batchLength)));
+    this.chunkAccumulator.value = sha256(
+      Bytes("BATCH").concat(itob(batchLength)),
+    );
     this.batchLength.value = batchLength;
     this.postedLength.value = 0;
   }
@@ -87,7 +122,10 @@ export class RollupVerifier extends Contract {
     if (remaining < CHUNK_SIZE) {
       expected = remaining;
     }
-    assert(chunk.length === expected, "chunk is not the size its position allows");
+    assert(
+      chunk.length === expected,
+      "chunk is not the size its position allows",
+    );
 
     this.chunkAccumulator.value = sha256(
       Bytes("CHUNK").concat(this.chunkAccumulator.value).concat(sha256(chunk)),
@@ -96,29 +134,48 @@ export class RollupVerifier extends Contract {
   }
 
   /**
-   * Close a fully posted batch and hand back its commitment.
+   * Settle a fully posted batch: check the proof against the root being held, then advance to the
+   * root the proof landed on.
    *
-   * Refusing to return anything until the declared length has been posted in full is what makes
-   * the data available: stopping a chunk short leaves an accumulator that is not the commitment,
-   * and a sequencer that cannot produce the commitment cannot advance the root.
+   * Three things have to line up, and each one is load-bearing:
    *
-   * The commitment is only half of settlement -- the caller still has to check it against
-   * `publicValues[64..96]`, check `publicValues[0..32]` against the root it holds, verify the
-   * proof, and store `publicValues[32..64]`. None of that lives here yet.
+   * - `publicValues[0..32]` against `stateRoot` -- the proof has to start where the chain is, so a
+   *   valid proof of some other transition cannot be replayed here.
+   * - `publicValues[64..96]` against the accumulator -- the proof only names the batch by its
+   *   commitment, so this is what ties the transition to bytes the chain has actually recorded.
+   *   Refusing to settle until the declared length has been posted in full is what makes the data
+   *   available: stopping a chunk short leaves an accumulator that is not the commitment.
+   * - the proof itself, over exactly those 96 bytes.
+   *
+   * Only then does `publicValues[32..64]` become the new root. The batch state is cleared on the
+   * way out, so the next `openBatch` starts from nothing.
    */
-  finishBatch(): bytes<32> {
+  verifyBatch(publicValues: PublicValues): void {
     assert(this.batchLength.hasValue, "no batch is being posted");
     assert(
       this.postedLength.value === this.batchLength.value,
       "the batch is not fully posted",
     );
 
-    const commitment = this.chunkAccumulator.value;
+    const oldRoot = publicValues.slice(0, 32);
+    const newRoot = publicValues.slice(32, 64);
+    const batchCommitment = publicValues.slice(64, 96);
+
+    assert(
+      oldRoot === this.stateRoot.value,
+      "the proof does not start from the current root",
+    );
+    assert(
+      batchCommitment === this.chunkAccumulator.value,
+      "the proof is not for the batch that was posted",
+    );
+
+    this.stateRoot.value = newRoot.toFixed({ length: 32 });
+
+    // TODO: Actual ZK verification
 
     this.chunkAccumulator.delete();
     this.batchLength.delete();
     this.postedLength.delete();
-
-    return commitment;
   }
 }
