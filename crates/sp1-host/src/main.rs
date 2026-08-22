@@ -7,6 +7,7 @@
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
+use payment_rollup::{MIN_WITHDRAWAL, REQUEST_CHAIN_GENESIS, WITHDRAWAL_CHAIN_GENESIS};
 use sp1_host::{
     DEPOSIT_CHAIN_GENESIS, GENESIS_ROOT, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
 };
@@ -133,8 +134,11 @@ fn run() -> Result<(), String> {
         // agree rather than hard-coding them a third time.
         "chunkSize": sp1_host::CHUNK_SIZE,
         "publicValuesSize": PUBLIC_VALUES_SIZE,
+        "minWithdrawal": MIN_WITHDRAWAL,
         "genesisRoot": hex(&GENESIS_ROOT),
         "depositChainGenesis": hex(&DEPOSIT_CHAIN_GENESIS),
+        "withdrawalChainGenesis": hex(&WITHDRAWAL_CHAIN_GENESIS),
+        "requestChainGenesis": hex(&REQUEST_CHAIN_GENESIS),
         "scenarios": emitted,
     });
 
@@ -185,6 +189,21 @@ fn fixture(
         "batchCommitment": hex(&settlement.batch_commitment()),
         "depositChainFrom": hex(&settlement.deposit_chain_from()),
         "depositChainTo": hex(&settlement.deposit_chain_to()),
+        "withdrawalChain": hex(&settlement.withdrawal_chain()),
+        "requestChainFrom": hex(&settlement.request_chain_from()),
+        "requestChainTo": hex(&settlement.request_chain_to()),
+
+        // One `requestWithdrawal(address, recipient, ...)` call each, in this order, before the
+        // batch is opened. Like the deposits, the chain only reaches `requestChainTo` if L1 sees
+        // exactly these, exactly here -- which is what stops the sequencer settling around them.
+        "requests": settlement
+            .requests()
+            .iter()
+            .map(|(address, recipient)| json!({
+                "address": hex(address),
+                "recipient": hex(recipient),
+            }))
+            .collect::<Vec<_>>(),
 
         // One `deposit(payment, recipient)` call each, in this order, before the batch is opened.
         // The chain only reaches `depositChainTo` if L1 sees exactly these, exactly here.
@@ -193,6 +212,38 @@ fn fixture(
             .iter()
             .map(|(recipient, amount)| json!({ "recipient": hex(recipient), "amount": amount }))
             .collect::<Vec<_>>(),
+
+        // One `claimWithdrawal(recipient, amount, chainBefore)` call each, after the batch has
+        // settled -- in the *reverse* of this order, because the queue unwinds newest-first. The
+        // first entry's `chainBefore` is the genesis value, which is where the queue drains.
+        "withdrawals": settlement
+            .withdrawal_claims()
+            .iter()
+            .map(|(recipient, amount, chain_before)| json!({
+                "recipient": hex(recipient),
+                "amount": amount,
+                "chainBefore": hex(chain_before),
+            }))
+            .collect::<Vec<_>>(),
+
+        // One `forceExit(...)` call each, in any order, once the rollup has escaped. Empty for
+        // every scenario but the one built for it -- an exit proves against a frozen root, so it
+        // has nothing to do with settling and is emitted alongside rather than as part of it.
+        "exits": if scenario.name == "forced-exit" {
+            scenarios::forced_exit_proofs()
+                .iter()
+                .map(|exit| json!({
+                    "address": hex(&exit.address),
+                    "pubKey": hex(&exit.pub_key),
+                    "nonce": exit.nonce,
+                    "amount": exit.amount,
+                    "authAddress": hex(&exit.auth_address),
+                    "siblings": exit.siblings.iter().map(|s| hex(s)).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
 
         // `openBatch(batchLength)`, then one `accumulateChunk(chunk)` per entry, in this order.
         "batchLength": settlement.batch_length(),

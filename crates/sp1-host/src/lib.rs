@@ -1,17 +1,19 @@
 //! Everything a settlement transaction needs, produced without a zkVM.
 //!
 //! The guest is [`payment_rollup::execute`] wrapped in zkVM io, so running that function directly
-//! gives the exact 160 bytes a proof would commit -- the roots, the batch commitment, and the two
-//! ends of the deposit chain -- for the cost of replaying the block. What is missing is only the
-//! proof that the replay happened, which is precisely the part the settlement contract does not
-//! check yet.
+//! gives the exact 192 bytes a proof would commit -- the roots, the batch commitment, the two ends
+//! of the deposit chain, and the withdrawal chain -- for the cost of replaying the block. What is
+//! missing is only the proof that the replay happened, which is precisely the part the settlement
+//! contract does not check yet.
 //!
 //! So a [`Settlement`] is the whole of a settlement's argument list: the declared batch length to
-//! open with, the chunks to post, the deposits to replay onto L1 first, and the public values to
-//! settle against. See [`scenarios`] for the blocks these are built from.
+//! open with, the chunks to post, the deposits to replay onto L1 first, the withdrawals to claim
+//! afterwards, and the public values to settle against. See [`scenarios`] for the blocks these are
+//! built from.
 
 use payment_rollup::{
-    Address, Block, ExecutionError, Transaction, VerificationError, chunk_count, execute,
+    Address, Block, ExecutionError, L1Address, Transaction, VerificationError, accumulate_withdrawal,
+    chunk_count, execute,
 };
 
 pub mod scenarios;
@@ -39,7 +41,12 @@ pub struct Settlement {
     new_root: [u8; 32],
     old_deposit_chain: [u8; 32],
     new_deposit_chain: [u8; 32],
+    old_request_chain: [u8; 32],
+    new_request_chain: [u8; 32],
+    withdrawal_chain: [u8; 32],
     deposits: Vec<(Address, u64)>,
+    withdrawals: Vec<(L1Address, u64)>,
+    requests: Vec<(Address, L1Address)>,
     txn_count: usize,
     batch_bytes: Vec<u8>,
     sidecar_bytes: Vec<u8>,
@@ -59,30 +66,51 @@ impl Settlement {
         let public_values = execute(
             block.old_root(),
             block.old_deposit_chain(),
+            block.old_request_chain(),
             &batch_bytes,
             &sidecar_bytes,
         )?;
 
         // The guest is never told what root to expect, so the replay landing somewhere other than
         // the root this block claims is a real disagreement and not a redundant check. The same
-        // goes for the deposit chain.
+        // goes for every chain.
         if public_values[32..64] != block.new_root()
-            || public_values[128..] != block.new_deposit_chain()
+            || public_values[128..160] != block.new_deposit_chain()
+            || public_values[160..192] != block.withdrawal_chain()
+            || public_values[224..] != block.new_request_chain()
         {
             return Err(ExecutionError::Verification(
                 VerificationError::RootMismatch,
             ));
         }
 
-        // Read back off the wire rather than out of the in-memory block, so this is the list a
+        // Read back off the wire rather than out of the in-memory block, so these are the lists a
         // replaying node would reconstruct -- which is what the e2e has to feed L1 to reach the
-        // chain the batch folds to.
-        let deposits = payment_rollup::Batch::decode(&batch_bytes)?
+        // chain the batch folds to, and what anyone claiming a withdrawal has to unwind.
+        let txns = payment_rollup::Batch::decode(&batch_bytes)?;
+
+        let deposits = txns
             .txns()
             .iter()
             .filter_map(|txn| match txn {
-                Transaction::Deposit(_) => Some((txn.receiver(), txn.amount())),
-                Transaction::Payment(_) => None,
+                Transaction::Deposit(deposit) => Some((deposit.receiver(), deposit.amount())),
+                _ => None,
+            })
+            .collect();
+
+        // A forced withdrawal's payout is a function of the pre-state, not of the batch bytes, so
+        // the queue is read out of the batch and sidecar together rather than off the wire alone.
+        let sidecar = payment_rollup::Sidecar::decode(&sidecar_bytes, &txns)?;
+        let withdrawals = payment_rollup::withdrawal_payouts(&txns, &sidecar);
+
+        let requests = txns
+            .txns()
+            .iter()
+            .filter_map(|txn| match txn {
+                Transaction::ForcedWithdrawal(forced) => {
+                    Some((forced.address(), forced.recipient()))
+                }
+                _ => None,
             })
             .collect();
 
@@ -91,7 +119,12 @@ impl Settlement {
             new_root: block.new_root(),
             old_deposit_chain: block.old_deposit_chain(),
             new_deposit_chain: block.new_deposit_chain(),
+            old_request_chain: block.old_request_chain(),
+            new_request_chain: block.new_request_chain(),
+            withdrawal_chain: block.withdrawal_chain(),
             deposits,
+            withdrawals,
+            requests,
             txn_count: block.batch().len(),
             batch_bytes,
             sidecar_bytes,
@@ -119,6 +152,67 @@ impl Settlement {
         &self.deposits
     }
 
+    /// The chain this block's withdrawals fold to, which the contract stores as a payout queue.
+    ///
+    /// Equal to [`payment_rollup::WITHDRAWAL_CHAIN_GENESIS`] when the block withdraws nothing, and
+    /// that is how the contract knows not to open a queue at all.
+    pub fn withdrawal_chain(&self) -> [u8; 32] {
+        self.withdrawal_chain
+    }
+
+    /// The request chain the batch anchors to: what the contract must have settled last time.
+    pub fn request_chain_from(&self) -> [u8; 32] {
+        self.old_request_chain
+    }
+
+    /// The request chain the batch's forced withdrawals fold it to: what the contract must be
+    /// holding when it settles.
+    pub fn request_chain_to(&self) -> [u8; 32] {
+        self.new_request_chain
+    }
+
+    /// Every L1 withdrawal request the batch answers, in the order it answers them.
+    ///
+    /// These have to be filed on L1 -- one `requestWithdrawal` call each, in this order -- before
+    /// the batch can settle, for the same reason the deposits do: [`Self::request_chain_to`] is
+    /// only reachable by folding them in exactly this sequence.
+    pub fn requests(&self) -> &[(Address, L1Address)] {
+        &self.requests
+    }
+
+    /// Every withdrawal the batch makes, in the order it makes them.
+    ///
+    /// Claimed on L1 in the *reverse* of this order: the contract holds the tip of the chain and
+    /// each claim hands back the value before it, so the queue unwinds newest-first. See
+    /// [`payment_rollup::accumulate_withdrawal`].
+    pub fn withdrawals(&self) -> &[(L1Address, u64)] {
+        &self.withdrawals
+    }
+
+    /// Every withdrawal paired with the chain value standing immediately before it was folded in.
+    ///
+    /// That third value is the whole of what a claim needs beyond the recipient and the amount: the
+    /// contract holds the tip, and `claimWithdrawal` checks that folding the claim onto the value
+    /// supplied here reproduces it. Emitted in batch order; claims are made in the reverse, so the
+    /// last entry is the first claimable and the first entry's chain value is
+    /// [`payment_rollup::WITHDRAWAL_CHAIN_GENESIS`], where the queue drains.
+    ///
+    /// Recomputed by folding rather than captured during the replay, so it is derived the same way
+    /// anyone reading the batch bytes off L1 would derive it.
+    pub fn withdrawal_claims(&self) -> Vec<(L1Address, u64, [u8; 32])> {
+        let mut chain = payment_rollup::WITHDRAWAL_CHAIN_GENESIS;
+
+        self.withdrawals
+            .iter()
+            .map(|(recipient, amount)| {
+                let before = chain;
+                chain = accumulate_withdrawal(&chain, recipient, *amount);
+
+                (*recipient, *amount, before)
+            })
+            .collect()
+    }
+
     pub fn old_root(&self) -> [u8; 32] {
         self.old_root
     }
@@ -142,7 +236,7 @@ impl Settlement {
         &self.sidecar_bytes
     }
 
-    /// The 160 bytes a proof would commit, and the single argument `verifyBatch` takes.
+    /// The 192 bytes a proof would commit, and the single argument `verifyBatch` takes.
     pub fn public_values(&self) -> &[u8; PUBLIC_VALUES_SIZE] {
         &self.public_values
     }
@@ -216,8 +310,20 @@ mod tests {
                 &settlement.deposit_chain_from()
             );
             assert_eq!(
-                &settlement.public_values[128..],
+                &settlement.public_values[128..160],
                 &settlement.deposit_chain_to()
+            );
+            assert_eq!(
+                &settlement.public_values[160..192],
+                &settlement.withdrawal_chain()
+            );
+            assert_eq!(
+                &settlement.public_values[192..224],
+                &settlement.request_chain_from()
+            );
+            assert_eq!(
+                &settlement.public_values[224..],
+                &settlement.request_chain_to()
             );
             assert_eq!(
                 accumulate_as_the_contract_would(&settlement),

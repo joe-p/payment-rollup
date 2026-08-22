@@ -303,11 +303,12 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
-    /// A proof from its parts, for a decoder rebuilding one off the wire.
+    /// A proof from its parts, for a decoder rebuilding one off the wire -- or for anything else
+    /// reassembling one from the pieces that get published, such as a forced exit on L1.
     ///
     /// Nothing is validated here, and nothing needs to be: a proof that does not describe a real
     /// position simply fails to reproduce the root it is measured against. See [`root_from_proof`].
-    pub(crate) fn from_parts(siblings: Vec<[u8; 32]>, slot: Slot) -> Self {
+    pub fn from_parts(siblings: Vec<[u8; 32]>, slot: Slot) -> Self {
         Self { siblings, slot }
     }
 

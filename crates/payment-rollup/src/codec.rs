@@ -20,7 +20,8 @@ use std::fmt;
 use crate::{
     Account, Address, Batch, Deposit, DepositSidecar, ENCODED_ACCOUNT_SIZE, LeafWitness,
     MerkleProof, Payment, PaymentSidecar, SCHEME_SIZE, Scheme, Sidecar, Signature, Slot,
-    Transaction, TransactionHeader, TxnSidecar, merkle::DEPTH,
+    ForcedWithdrawal, ForcedWithdrawalSidecar, Transaction, TransactionHeader, TxnSidecar,
+    Withdrawal, WithdrawalSidecar, merkle::DEPTH,
 };
 
 const BATCH_VERSION: u8 = 0;
@@ -28,6 +29,8 @@ const SIDECAR_VERSION: u8 = 0;
 
 const KIND_PAYMENT: u8 = 0;
 const KIND_DEPOSIT: u8 = 1;
+const KIND_WITHDRAWAL: u8 = 2;
+const KIND_FORCED_WITHDRAWAL: u8 = 3;
 
 const ABSENT: u8 = 0;
 const PRESENT: u8 = 1;
@@ -300,6 +303,13 @@ impl Batch {
     ///   kind 1 (deposit)
     ///     receiver address reference
     ///     amount   varint
+    ///   kind 2 (withdrawal)
+    ///     sender    address reference
+    ///     recipient 32 literal bytes, an L1 address
+    ///     amount    varint
+    ///   kind 3 (forced withdrawal)
+    ///     address   address reference
+    ///     recipient 32 literal bytes, an L1 address
     ///
     /// address reference:
     ///   varint 0 -> 32 literal bytes follow, appended to the dictionary
@@ -313,6 +323,13 @@ impl Batch {
     ///
     /// Deposits share the address dictionary with payments, so a deposit and a later payment to the
     /// same account cost one reference between them.
+    ///
+    /// A withdrawal's recipient is written out in full every time and deliberately kept out of the
+    /// dictionary. It is an [`crate::L1Address`], not a position in this tree, and the dictionary is
+    /// a namespace of rollup addresses -- letting the two share it would mean a later payment could
+    /// address a rollup account by a reference that was created by an L1 address, silently
+    /// converting between the two. Withdrawing twice to the same L1 account is rare enough that the
+    /// 32 bytes are worth paying to keep the namespaces apart.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut dictionary = Dictionary::default();
@@ -332,6 +349,21 @@ impl Batch {
                     buf.push(KIND_DEPOSIT);
                     dictionary.put(&mut buf, &deposit.receiver);
                     put_varint(&mut buf, deposit.amount);
+                }
+                Transaction::Withdrawal(withdrawal) => {
+                    buf.push(KIND_WITHDRAWAL);
+                    dictionary.put(&mut buf, &withdrawal.header.sender);
+                    buf.extend_from_slice(&withdrawal.recipient());
+                    put_varint(&mut buf, withdrawal.amount);
+                }
+                // No amount: a forced withdrawal empties the account, and what that came to is
+                // read out of the pre-state during replay. The same move as the omitted nonce and
+                // the omitted deposit sender -- if a replaying node can derive it, the chain does
+                // not pay to record it.
+                Transaction::ForcedWithdrawal(forced) => {
+                    buf.push(KIND_FORCED_WITHDRAWAL);
+                    dictionary.put(&mut buf, &forced.header.sender);
+                    buf.extend_from_slice(&forced.recipient());
                 }
             }
         }
@@ -366,6 +398,26 @@ impl Batch {
                     let receiver = dictionary.take(&mut reader)?;
 
                     Transaction::Deposit(Deposit::new(receiver, reader.varint()?))
+                }
+                // The recipient is read literally rather than through the dictionary, so an L1
+                // address never enters it and can never be handed back as a rollup address.
+                KIND_WITHDRAWAL => {
+                    let sender = dictionary.take(&mut reader)?;
+                    let recipient = reader.array::<32>()?;
+
+                    Transaction::Withdrawal(Withdrawal::new(
+                        sender,
+                        recipient,
+                        reader.varint()?,
+                    ))
+                }
+                KIND_FORCED_WITHDRAWAL => {
+                    let address = dictionary.take(&mut reader)?;
+
+                    Transaction::ForcedWithdrawal(ForcedWithdrawal::new(
+                        address,
+                        reader.array::<32>()?,
+                    ))
                 }
                 kind => return Err(DecodeError::UnknownTransactionKind(kind)),
             });
@@ -407,6 +459,22 @@ fn take_optional_account(reader: &mut Reader) -> Result<Option<Account>, DecodeE
         PRESENT => Ok(Some(reader.account()?)),
         tag => Err(DecodeError::UnknownPresenceTag(tag)),
     }
+}
+
+/// The signature on an entry whose transaction is one somebody had to authorize.
+///
+/// Shared by the payment and withdrawal entries, which carry identical signature encodings and
+/// differ only in how many witnesses follow.
+fn take_signature(reader: &mut Reader) -> Result<Signature, DecodeError> {
+    let identifier = reader.array::<SCHEME_SIZE>()?;
+    let scheme =
+        Scheme::from_identifier(&identifier).ok_or(DecodeError::UnknownScheme(identifier))?;
+
+    Ok(Signature {
+        scheme,
+        pub_key: reader.bytes()?,
+        sig: reader.bytes()?,
+    })
 }
 
 fn take_witness(reader: &mut Reader) -> Result<LeafWitness, DecodeError> {
@@ -451,6 +519,13 @@ impl Sidecar {
     ///     receiver witness
     ///   deposit
     ///     receiver witness
+    ///   withdrawal
+    ///     scheme   3 bytes (Scheme::identifier)
+    ///     pub_key  varint length, then bytes
+    ///     sig      varint length, then bytes
+    ///     sender   witness
+    ///   forced withdrawal
+    ///     address  witness
     ///
     /// witness:
     ///   present  u8: 0 absent, 1 followed by a 48-byte account
@@ -484,6 +559,15 @@ impl Sidecar {
                 TxnSidecar::Deposit(entry) => {
                     put_witness(&mut buf, &entry.receiver_witness);
                 }
+                TxnSidecar::Withdrawal(entry) => {
+                    buf.extend_from_slice(&entry.sig.scheme.identifier());
+                    put_bytes(&mut buf, &entry.sig.pub_key);
+                    put_bytes(&mut buf, &entry.sig.sig);
+                    put_witness(&mut buf, &entry.sender_witness);
+                }
+                TxnSidecar::ForcedWithdrawal(entry) => {
+                    put_witness(&mut buf, &entry.sender_witness);
+                }
             }
         }
 
@@ -509,24 +593,23 @@ impl Sidecar {
         let mut entries = Vec::with_capacity(found);
         for txn in batch.txns() {
             entries.push(match txn {
-                Transaction::Payment(_) => {
-                    let identifier = reader.array::<SCHEME_SIZE>()?;
-                    let scheme = Scheme::from_identifier(&identifier)
-                        .ok_or(DecodeError::UnknownScheme(identifier))?;
-
-                    TxnSidecar::Payment(PaymentSidecar {
-                        sig: Signature {
-                            scheme,
-                            pub_key: reader.bytes()?,
-                            sig: reader.bytes()?,
-                        },
-                        sender_witness: take_witness(&mut reader)?,
-                        receiver_witness: take_witness(&mut reader)?,
-                    })
-                }
+                Transaction::Payment(_) => TxnSidecar::Payment(PaymentSidecar {
+                    sig: take_signature(&mut reader)?,
+                    sender_witness: take_witness(&mut reader)?,
+                    receiver_witness: take_witness(&mut reader)?,
+                }),
                 Transaction::Deposit(_) => TxnSidecar::Deposit(DepositSidecar {
                     receiver_witness: take_witness(&mut reader)?,
                 }),
+                Transaction::Withdrawal(_) => TxnSidecar::Withdrawal(WithdrawalSidecar {
+                    sig: take_signature(&mut reader)?,
+                    sender_witness: take_witness(&mut reader)?,
+                }),
+                Transaction::ForcedWithdrawal(_) => {
+                    TxnSidecar::ForcedWithdrawal(ForcedWithdrawalSidecar {
+                        sender_witness: take_witness(&mut reader)?,
+                    })
+                }
             });
         }
         reader.finish()?;
@@ -576,7 +659,7 @@ mod tests {
     fn payment_entry(sidecar: &mut Sidecar, index: usize) -> &mut PaymentSidecar {
         match &mut sidecar.entries[index] {
             TxnSidecar::Payment(entry) => entry,
-            TxnSidecar::Deposit(_) => panic!("entry {index} is a deposit, not a payment"),
+            other => panic!("entry {index} is {other:?}, not a payment"),
         }
     }
 
@@ -632,8 +715,19 @@ mod tests {
         let sidecar = Sidecar::decode(&sidecar_bytes, &batch).unwrap();
 
         assert_eq!(
-            verify_batch(block.old_root, block.old_deposit_chain, &batch, &sidecar),
-            Ok((block.new_root, block.new_deposit_chain))
+            verify_batch(
+                block.old_root,
+                block.old_deposit_chain,
+                block.old_request_chain,
+                &batch,
+                &sidecar
+            ),
+            Ok((
+                block.new_root,
+                block.new_deposit_chain,
+                block.withdrawal_chain,
+                block.new_request_chain
+            ))
         );
     }
 
@@ -694,7 +788,7 @@ mod tests {
 
         // The third payment is a self-payment encoded as two one-byte references to the same
         // dictionary entry, so a decoder that mishandled references would show up right here.
-        assert_eq!(batch.txns[2].sender(), batch.txns[2].receiver());
+        assert_eq!(Some(batch.txns[2].sender()), batch.txns[2].receiver());
         assert_eq!(batch.txns[2].sender(), batch.txns[0].sender());
     }
 
@@ -713,6 +807,7 @@ mod tests {
             verify_batch(
                 block.old_root,
                 block.old_deposit_chain,
+                block.old_request_chain,
                 &block.batch,
                 &sidecar
             ),
@@ -966,6 +1061,187 @@ mod tests {
         let bytes = block.batch.encode();
 
         assert_eq!(Batch::decode(&bytes), Ok(block.batch.clone()));
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+    }
+
+    fn withdrawal(key: &[u8], recipient: [u8; 32], amount: u64) -> SignedTransaction {
+        SignedTransaction::withdrawal(
+            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount),
+            Signature {
+                scheme: SCHEME,
+                pub_key: key.to_vec(),
+                sig: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_withdrawal_round_trips() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+        let block = ledger.get_block(vec![withdrawal(b"a key", [9u8; 32], 250_000)]);
+
+        assert_eq!(
+            Batch::decode(&block.batch.encode()),
+            Ok(block.batch.clone())
+        );
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+    }
+
+    #[test]
+    fn a_batch_of_every_kind_round_trips() {
+        let mut ledger = Ledger::new();
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        let block = ledger.get_block(vec![
+            deposit(b"a key", 10_000_000),
+            signed(b"a key", b, 1_000_000),
+            withdrawal(b"b key", [9u8; 32], 250_000),
+            deposit(b"b key", 7),
+        ]);
+
+        let batch = Batch::decode(&block.batch.encode()).unwrap();
+        assert_eq!(batch, block.batch);
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+
+        // The one thing a round-trip alone would not catch: a withdrawal has no receiver in this
+        // tree, and must not come back claiming one.
+        assert_eq!(batch.txns[2].receiver(), None);
+        assert_eq!(batch.txns[2].sender(), b);
+    }
+
+    // The recipient is written literally rather than through the dictionary, so an L1 address never
+    // becomes a reference a later *rollup* address could resolve to. Here the two are the same 32
+    // bytes, which is the case that would break if the namespaces were shared.
+    #[test]
+    fn an_l1_recipient_never_enters_the_address_dictionary() {
+        let mut ledger = Ledger::new();
+        let a = fund(&mut ledger, b"a key", 10_000_000);
+
+        // Withdraw to an L1 address whose bytes happen to equal a rollup address, then pay that
+        // rollup address. If the withdrawal had inserted a dictionary entry, the payment's
+        // reference numbering would shift and the receiver would decode to the wrong account.
+        let block = ledger.get_block(vec![
+            withdrawal(b"a key", a, 250_000),
+            signed(b"a key", address_from_public_key(SCHEME, b"b key"), 1_000),
+        ]);
+
+        let batch = Batch::decode(&block.batch.encode()).unwrap();
+        assert_eq!(batch, block.batch);
+        assert_eq!(
+            batch.txns[1].receiver(),
+            Some(address_from_public_key(SCHEME, b"b key"))
+        );
+    }
+
+    // A withdrawal is a kind tag, a sender reference, 32 literal recipient bytes, and an amount.
+    #[test]
+    fn a_withdrawal_costs_what_the_format_says_it_does() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+
+        // 1 version + 1 count + 1 kind + 33 fresh sender + 32 literal recipient + 3 amount varint
+        let cold = ledger.get_block(vec![withdrawal(b"a key", [9u8; 32], 250_000)]);
+        assert_eq!(cold.batch.encode().len(), 71);
+
+        // The sender reference warms up; the recipient never does, by design. So a second
+        // withdrawal to the same L1 account costs 37 bytes where a second deposit costs 4 -- the
+        // price of keeping the two address namespaces apart.
+        let warm = ledger.get_block(vec![
+            withdrawal(b"a key", [9u8; 32], 250_000),
+            withdrawal(b"a key", [9u8; 32], 250_000),
+        ]);
+        assert_eq!(warm.batch.encode().len(), 71 + 1 + 1 + 32 + 3);
+    }
+
+    fn forced(key: &[u8], recipient: [u8; 32]) -> SignedTransaction {
+        SignedTransaction::forced_withdrawal(ForcedWithdrawal::new(
+            address_from_public_key(SCHEME, key),
+            recipient,
+        ))
+    }
+
+    #[test]
+    fn a_forced_withdrawal_round_trips() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+        let block = ledger.get_block(vec![forced(b"a key", [9u8; 32])]);
+
+        let batch = Batch::decode(&block.batch.encode()).unwrap();
+        assert_eq!(batch, block.batch);
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+
+        // The amount is the one field the wire does not carry, so it is the one that could drift
+        // between the encoder and the decoder without a round-trip noticing.
+        assert_eq!(batch.txns[0].amount(), None);
+        assert_eq!(
+            batch.txns[0].sender(),
+            address_from_public_key(SCHEME, b"a key")
+        );
+    }
+
+    // A forced withdrawal is a kind tag, an address reference, and 32 literal recipient bytes --
+    // and no amount at all, which makes it cheaper on-chain than the withdrawal it replaces.
+    #[test]
+    fn a_forced_withdrawal_costs_what_the_format_says_it_does() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+
+        // 1 version + 1 count + 1 kind + 33 fresh address + 32 literal recipient
+        let cold = ledger.get_block(vec![forced(b"a key", [9u8; 32])]);
+        assert_eq!(cold.batch.encode().len(), 68);
+    }
+
+    #[test]
+    fn a_batch_of_all_four_kinds_round_trips() {
+        let mut ledger = Ledger::new();
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        let block = ledger.get_block(vec![
+            deposit(b"a key", 10_000_000),
+            signed(b"a key", b, 1_000_000),
+            withdrawal(b"b key", [9u8; 32], 250_000),
+            forced(b"a key", [8u8; 32]),
+        ]);
+
+        assert_eq!(
+            Batch::decode(&block.batch.encode()),
+            Ok(block.batch.clone())
+        );
+        assert_eq!(
+            Sidecar::decode(&block.sidecar.encode(), &block.batch),
+            Ok(block.sidecar)
+        );
+    }
+
+    // A forced withdrawal encodes to 34 bytes at its smallest, above the 3 a deposit needs, so it
+    // does not move the floor `Reader::count` screens with. This pins that the floor is still the
+    // minimum over every kind.
+    #[test]
+    fn a_forced_withdrawal_dense_batch_is_not_rejected_by_the_count_check() {
+        let mut ledger = Ledger::new();
+        let mut stxns = Vec::new();
+        for i in 0..32u8 {
+            stxns.push(deposit(&[b'k', i], 10_000_000));
+        }
+        for i in 0..32u8 {
+            stxns.push(forced(&[b'k', i], [i; 32]));
+        }
+
+        let block = ledger.get_block(stxns);
+        assert_eq!(Batch::decode(&block.batch.encode()), Ok(block.batch.clone()));
         assert_eq!(
             Sidecar::decode(&block.sidecar.encode(), &block.batch),
             Ok(block.sidecar)

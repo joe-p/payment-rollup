@@ -235,6 +235,9 @@ importers:
       tsx:
         specifier: ^4.23.12
         version: 4.23.12
+      tweetnacl:
+        specifier: ^1.0.3
+        version: 1.0.3
       vitest:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@26.2.0)(vite@8.2.2(@types/node@26.2.0)(esbuild@0.28.2)(tsx@4.23.12))

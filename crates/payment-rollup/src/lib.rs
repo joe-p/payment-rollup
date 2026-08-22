@@ -11,6 +11,27 @@ pub use merkle::{MerkleProof, Slot, SparseMerkleTree, verify_proof};
 
 pub type Address = [u8; 32];
 
+/// An account on the settlement chain, as the AVM holds one: the raw 32-byte public key, without
+/// the checksum and base32 armour a human-readable Algorand address carries.
+///
+/// A separate alias from [`Address`] because the two are the same width and mean opposite things --
+/// an [`Address`] is a position in this rollup's tree, an [`L1Address`] is somewhere outside it. The
+/// alias cannot stop a mix-up on its own, but it makes one visible at every signature that handles
+/// both. See the warning on [`Withdrawal`].
+pub type L1Address = [u8; 32];
+
+/// Smallest withdrawal the rollup will process, in microALGO.
+///
+/// Equal to the network's own minimum balance, and that is the whole reason for it. The settlement
+/// contract pays a withdrawal out with an inner transaction, and an inner payment below the minimum
+/// balance fails outright when its receiver does not yet exist. Withdrawals are claimed by unwinding
+/// a hash chain, so one payment that cannot be made would strand every withdrawal queued behind it.
+///
+/// Enforcing it here rather than on L1 is what makes that impossible rather than merely unlikely: a
+/// block containing an unpayable withdrawal does not verify, so the contract is never asked to make
+/// a payment it cannot complete.
+pub const MIN_WITHDRAWAL: u64 = 100_000;
+
 /// The sender of a [`Deposit`]: the one address no key can produce.
 ///
 /// Every real address is `sha256("ADDR" || scheme || pub_key)` (see [`address_from_public_key`]),
@@ -73,7 +94,51 @@ pub fn address_from_public_key(scheme: Scheme, pub_key: &[u8]) -> Address {
     hasher.finalize().into()
 }
 
-const ENCODED_TX_SIZE: usize = 32 + 8 + 32 + 8;
+/// What a signed transaction is, written into the bytes its sender signs.
+///
+/// Without these, a [`Payment`] and a [`Withdrawal`] over the same sender, nonce, 32-byte
+/// destination and amount produce byte-identical preimages -- so one signature would authorize
+/// either, and a signature meant to move funds inside the rollup would move them out of it. The tag
+/// is what makes the two unmistakable.
+const SIGN_TAG_PAYMENT: &[u8; 3] = b"PAY";
+const SIGN_TAG_WITHDRAWAL: &[u8; 3] = b"WDR";
+
+const SIGN_TAG_SIZE: usize = 3;
+
+const ENCODED_TX_SIZE: usize = SIGN_TAG_SIZE + 32 + 8 + 32 + 8;
+
+/// The bytes a sender signs to authorize moving `amount` to `destination` at `nonce`.
+///
+/// Shared by [`Payment::bytes_to_sign`] and [`Withdrawal::bytes_to_sign`], which differ only in the
+/// tag and in what the 32 bytes of `destination` mean. One layout, so the two can never drift into
+/// agreeing.
+fn bytes_to_sign(
+    tag: &[u8; SIGN_TAG_SIZE],
+    sender: &Address,
+    nonce: u64,
+    destination: &[u8; 32],
+    amount: u64,
+) -> [u8; ENCODED_TX_SIZE] {
+    let mut buf = [0u8; ENCODED_TX_SIZE];
+    let mut offset = 0;
+
+    buf[offset..offset + tag.len()].copy_from_slice(tag);
+    offset += tag.len();
+
+    buf[offset..offset + sender.len()].copy_from_slice(sender);
+    offset += sender.len();
+
+    let nonce_bytes = nonce.to_be_bytes();
+    buf[offset..offset + nonce_bytes.len()].copy_from_slice(&nonce_bytes);
+    offset += nonce_bytes.len();
+
+    buf[offset..offset + destination.len()].copy_from_slice(destination);
+    offset += destination.len();
+
+    buf[offset..offset + size_of::<u64>()].copy_from_slice(&amount.to_be_bytes());
+
+    buf
+}
 
 pub(crate) const ENCODED_ACCOUNT_SIZE: usize = 8 + 8 + 32;
 
@@ -86,6 +151,9 @@ pub enum VerificationError {
     UnknownSender,
     InsufficientFunds,
     AmountOverflow,
+    /// A withdrawal is for less than [`MIN_WITHDRAWAL`], so the settlement contract could not
+    /// reliably pay it out.
+    WithdrawalTooSmall,
     /// A witness proof is internally inconsistent; see [`MerkleProof`].
     MalformedProof,
     /// A witness does not describe the state at the point in the block where it is used.
@@ -233,23 +301,66 @@ impl Payment {
     /// the sender at the point the payment is replayed, so the signature commits to the payment's
     /// exact position in that account's history without a byte on the wire.
     pub fn bytes_to_sign(&self, nonce: u64) -> [u8; ENCODED_TX_SIZE] {
-        let mut buf = [0u8; ENCODED_TX_SIZE];
-        let mut offset = 0;
+        bytes_to_sign(
+            SIGN_TAG_PAYMENT,
+            &self.header.sender,
+            nonce,
+            &self.receiver,
+            self.amount,
+        )
+    }
+}
 
-        buf[offset..offset + self.header.sender.len()].copy_from_slice(&self.header.sender);
-        offset += self.header.sender.len();
+/// Value leaving the rollup for the settlement chain.
+///
+/// The mirror of a [`Deposit`]: a deposit writes one slot and credits it, a withdrawal writes one
+/// slot and debits it. Total balances fall, and the settlement contract makes the holder whole in
+/// real ALGO once the batch settles -- see [`accumulate_withdrawal`] for how it learns to.
+///
+/// **`recipient` is an Algorand address, not a rollup address.** Everywhere else in this crate a
+/// 32-byte destination is an [`Address`], meaning a position in the state tree; here it is the raw
+/// public key of an account on L1. Passing a rollup address pays out to an L1 account nobody holds
+/// the key to, and the funds are gone. The type alias is the only thing marking the difference, and
+/// it is advisory -- see [`L1Address`].
+///
+/// `amount` is at least [`MIN_WITHDRAWAL`], checked in [`verify_batch`] rather than here so that a
+/// hand-built withdrawal is representable and simply fails to prove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withdrawal {
+    header: TransactionHeader,
+    recipient: L1Address,
+    amount: u64,
+}
 
-        let nonce_bytes = nonce.to_be_bytes();
-        buf[offset..offset + nonce_bytes.len()].copy_from_slice(&nonce_bytes);
-        offset += nonce_bytes.len();
+impl Withdrawal {
+    pub fn new(sender: Address, recipient: L1Address, amount: u64) -> Self {
+        Self {
+            header: TransactionHeader { sender },
+            recipient,
+            amount,
+        }
+    }
 
-        buf[offset..offset + self.receiver.len()].copy_from_slice(&self.receiver);
-        offset += self.receiver.len();
+    pub fn recipient(&self) -> L1Address {
+        self.recipient
+    }
 
-        let amount_bytes = self.amount.to_be_bytes();
-        buf[offset..offset + amount_bytes.len()].copy_from_slice(&amount_bytes);
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
 
-        buf
+    /// The bytes a sender signs to authorize this withdrawal at `nonce`.
+    ///
+    /// Domain-separated from [`Payment::bytes_to_sign`], which is what stops a signature over a
+    /// payment from also authorizing a withdrawal of the same amount to the same 32 bytes.
+    pub fn bytes_to_sign(&self, nonce: u64) -> [u8; ENCODED_TX_SIZE] {
+        bytes_to_sign(
+            SIGN_TAG_WITHDRAWAL,
+            &self.header.sender,
+            nonce,
+            &self.recipient,
+            self.amount,
+        )
     }
 }
 
@@ -278,12 +389,64 @@ impl Deposit {
             amount,
         }
     }
+
+    pub fn receiver(&self) -> Address {
+        self.receiver
+    }
+
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
+}
+
+/// A withdrawal the settlement chain ordered, rather than one the sequencer was asked for.
+///
+/// The censorship-resistant counterpart to [`Withdrawal`]. An ordinary withdrawal is handed to the
+/// sequencer and can simply be dropped -- L1 never hears of it, so nothing notices. This one is
+/// filed on L1 first, folded into a chain there, and [`verify_batch`] cannot reach the value the
+/// contract is holding unless the batch consumes it. Ignoring one is therefore not censorship of a
+/// transaction, it is a refusal to settle at all, which is the failure the escape hatch already
+/// watches for.
+///
+/// **No amount.** The account is emptied. That is not a simplification but the property that makes
+/// forced inclusion safe: a request for a specific amount can be unaffordable when the batch
+/// reaches it, so a verifier would need a rule for what to do then -- and any such rule is a lever
+/// the sequencer can pull. A request for the whole balance is always satisfiable, so the only thing
+/// left for a verifier to decide is whether there is enough to be worth paying out at all. See the
+/// forced-withdrawal arm of [`verify_batch`].
+///
+/// Like a [`Deposit`], it carries no signature. Authorization happened on L1, where the settlement
+/// contract checked that the key presented derives the address being emptied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForcedWithdrawal {
+    header: TransactionHeader,
+    recipient: L1Address,
+}
+
+impl ForcedWithdrawal {
+    pub fn new(address: Address, recipient: L1Address) -> Self {
+        Self {
+            header: TransactionHeader { sender: address },
+            recipient,
+        }
+    }
+
+    /// The rollup account being emptied.
+    pub fn address(&self) -> Address {
+        self.header.sender
+    }
+
+    pub fn recipient(&self) -> L1Address {
+        self.recipient
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transaction {
     Payment(Payment),
     Deposit(Deposit),
+    Withdrawal(Withdrawal),
+    ForcedWithdrawal(ForcedWithdrawal),
 }
 
 impl Transaction {
@@ -296,20 +459,37 @@ impl Transaction {
         match self {
             Transaction::Payment(payment) => payment.header.sender,
             Transaction::Deposit(deposit) => deposit.header.sender,
+            Transaction::Withdrawal(withdrawal) => withdrawal.header.sender,
+            Transaction::ForcedWithdrawal(forced) => forced.header.sender,
         }
     }
 
-    pub fn receiver(&self) -> Address {
+    /// Which account in the tree the transaction credits, or `None` when it credits none.
+    ///
+    /// Optional where [`Transaction::sender`] is total, and the asymmetry is the point: a deposit
+    /// has no sender *account* but [`ZERO_ADDRESS`] stands in for one, whereas a withdrawal's
+    /// destination is an [`L1Address`] outside the tree entirely and no rollup address could stand
+    /// in for it. Returning it here would be handing a caller 32 bytes in the wrong namespace.
+    pub fn receiver(&self) -> Option<Address> {
         match self {
-            Transaction::Payment(payment) => payment.receiver,
-            Transaction::Deposit(deposit) => deposit.receiver,
+            Transaction::Payment(payment) => Some(payment.receiver),
+            Transaction::Deposit(deposit) => Some(deposit.receiver),
+            Transaction::Withdrawal(_) | Transaction::ForcedWithdrawal(_) => None,
         }
     }
 
-    pub fn amount(&self) -> u64 {
+    /// How much the transaction moves, or `None` when the wire does not say.
+    ///
+    /// Only a [`ForcedWithdrawal`] does not say: it moves the account's whole balance, which is
+    /// read out of the pre-state during replay rather than carried. Optional rather than zero
+    /// because "this transaction moves nothing" and "the amount is not written down here" are
+    /// different claims, and a caller totalling a batch has to be made to notice the difference.
+    pub fn amount(&self) -> Option<u64> {
         match self {
-            Transaction::Payment(payment) => payment.amount,
-            Transaction::Deposit(deposit) => deposit.amount,
+            Transaction::Payment(payment) => Some(payment.amount),
+            Transaction::Deposit(deposit) => Some(deposit.amount),
+            Transaction::Withdrawal(withdrawal) => Some(withdrawal.amount),
+            Transaction::ForcedWithdrawal(_) => None,
         }
     }
 }
@@ -354,8 +534,20 @@ impl Signature {
 /// A signed deposit is unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignedTransaction {
-    Payment { payment: Payment, sig: Signature },
-    Deposit { deposit: Deposit },
+    Payment {
+        payment: Payment,
+        sig: Signature,
+    },
+    Deposit {
+        deposit: Deposit,
+    },
+    Withdrawal {
+        withdrawal: Withdrawal,
+        sig: Signature,
+    },
+    ForcedWithdrawal {
+        forced: ForcedWithdrawal,
+    },
 }
 
 impl SignedTransaction {
@@ -369,6 +561,24 @@ impl SignedTransaction {
     /// deposits fold to the chain it built as the deposits arrived. See [`accumulate_deposit`].
     pub fn deposit(deposit: Deposit) -> Self {
         SignedTransaction::Deposit { deposit }
+    }
+
+    /// A withdrawal, which its sender signs like any other spend.
+    ///
+    /// The signature is what authorizes the debit; the chain the batch folds to is only what tells
+    /// L1 whom to pay. Both are needed, and they answer different questions -- see
+    /// [`accumulate_withdrawal`].
+    pub fn withdrawal(withdrawal: Withdrawal, sig: Signature) -> Self {
+        SignedTransaction::Withdrawal { withdrawal, sig }
+    }
+
+    /// A withdrawal L1 ordered, which nobody signs here.
+    ///
+    /// Like a deposit, it was authorized on L1 -- the settlement contract checked a signature
+    /// before it would accept the request. Unlike a deposit, the sequencer cannot decline to
+    /// sequence it and still settle anything. See [`accumulate_request`].
+    pub fn forced_withdrawal(forced: ForcedWithdrawal) -> Self {
+        SignedTransaction::ForcedWithdrawal { forced }
     }
 }
 
@@ -407,6 +617,8 @@ pub struct LeafWitness {
 pub enum TxnSidecar {
     Payment(PaymentSidecar),
     Deposit(DepositSidecar),
+    Withdrawal(WithdrawalSidecar),
+    ForcedWithdrawal(ForcedWithdrawalSidecar),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,6 +636,32 @@ pub struct PaymentSidecar {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DepositSidecar {
     receiver_witness: LeafWitness,
+}
+
+/// A withdrawal witnesses one slot too, and the opposite one.
+///
+/// The deposit's missing half is the sender; the withdrawal's is the receiver, because the
+/// recipient is an [`L1Address`] and has no slot in this tree to witness. The signature is present
+/// -- unlike a deposit, a withdrawal spends from an account and has to be authorized by its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WithdrawalSidecar {
+    sig: Signature,
+    sender_witness: LeafWitness,
+}
+
+/// A forced withdrawal witnesses one slot and carries no signature.
+///
+/// The witness is doing more work here than anywhere else. Everywhere else it pins a pre-state the
+/// transaction is about to change; here it also *decides what the transaction does*, because the
+/// amount withdrawn is the balance it reveals. That is safe for exactly the usual reason: the
+/// witness is checked against the running root before it is read, so a prover cannot understate a
+/// balance to suppress a payout, or overstate one to mint.
+///
+/// No signature, for the same reason a [`DepositSidecar`] has none -- the settlement contract
+/// checked the authorization when it accepted the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForcedWithdrawalSidecar {
+    sender_witness: LeafWitness,
 }
 
 /// The transactions of a block, exactly as the chain records them.
@@ -483,6 +721,9 @@ pub struct Block {
     new_root: [u8; 32],
     old_deposit_chain: [u8; 32],
     new_deposit_chain: [u8; 32],
+    old_request_chain: [u8; 32],
+    new_request_chain: [u8; 32],
+    withdrawal_chain: [u8; 32],
     batch: Batch,
     sidecar: Sidecar,
 }
@@ -505,6 +746,25 @@ impl Block {
     /// contains no deposits.
     pub fn new_deposit_chain(&self) -> [u8; 32] {
         self.new_deposit_chain
+    }
+
+    /// Request chain the block starts from; see [`accumulate_request`].
+    pub fn old_request_chain(&self) -> [u8; 32] {
+        self.old_request_chain
+    }
+
+    /// Request chain the block's forced withdrawals fold it to. Equal to `old_request_chain` when
+    /// the block answers no requests.
+    pub fn new_request_chain(&self) -> [u8; 32] {
+        self.new_request_chain
+    }
+
+    /// Chain this block's own withdrawals fold to, from [`WITHDRAWAL_CHAIN_GENESIS`].
+    ///
+    /// Equal to the genesis value when the block contains no withdrawals, which is how the
+    /// settlement contract knows there is no payout queue to open.
+    pub fn withdrawal_chain(&self) -> [u8; 32] {
+        self.withdrawal_chain
     }
 
     pub fn batch(&self) -> &Batch {
@@ -552,6 +812,82 @@ pub fn accumulate_deposit(chain: &[u8; 32], receiver: &Address, amount: u64) -> 
     hasher.finalize().into()
 }
 
+/// Where a block's withdrawal chain starts. Every block, not just the first.
+///
+/// This is the one place the withdrawal chain deliberately parts company with the deposit chain.
+/// The deposit chain is an anchor that runs across the whole history, because L1 builds it and the
+/// guest has to land on it. The withdrawal chain runs the other way -- the guest builds it and L1
+/// consumes it -- and L1 consumes it by *unwinding*, one claim at a time, back towards this value.
+/// A pointer that walks backwards cannot live on a chain that also grows forwards, so each block
+/// gets its own, and the settlement contract keeps them in one box per block.
+///
+/// Zero therefore means "every withdrawal in this block has been claimed", and it means that
+/// unambiguously: reaching it again would be a SHA-256 preimage of thirty-two zero bytes.
+pub const WITHDRAWAL_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
+
+/// Fold one withdrawal into a block's chain.
+///
+/// The mirror of [`accumulate_deposit`], and the same 79-byte preimage under a different tag, but
+/// pointed the other way. A deposit chain proves to the *guest's verifier* that a batch credited
+/// exactly what L1 accepted. A withdrawal chain proves to *L1* that a payout it is about to make
+/// was really authorized inside the batch it settled -- the contract stores the value the proof
+/// committed to and will only pay a claim that reproduces it.
+///
+/// Because each step consumes the last, the contract can verify a claim by being handed the
+/// preceding value: `sha256(tag || previous || recipient || amount)` has to equal the value it
+/// holds, and if it does, `previous` becomes the new tip. That is an O(1) check with no Merkle tree
+/// and no record of what has already been paid -- the tip *is* the record, so a withdrawal cannot
+/// be claimed twice. The cost is that a block's withdrawals are claimed newest-first.
+///
+/// Only `recipient` and `amount` are hashed, for the same reason [`accumulate_deposit`] hashes only
+/// two fields: everything in the preimage has to be reconstructible from the batch bytes, which are
+/// already on L1 by the time anyone claims. The sender is deliberately not here -- who was debited
+/// is the guest's business, and L1 only needs to know whom to pay.
+pub fn accumulate_withdrawal(chain: &[u8; 32], recipient: &L1Address, amount: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"WITHDRAW");
+    hasher.update(chain);
+    hasher.update(recipient);
+    hasher.update(amount.to_be_bytes());
+
+    hasher.finalize().into()
+}
+
+/// Where the request chain starts: no withdrawal has ever been demanded from L1.
+///
+/// An anchor spanning the whole history, like [`DEPOSIT_CHAIN_GENESIS`] and unlike
+/// [`WITHDRAWAL_CHAIN_GENESIS`] -- the settlement contract builds this one and the guest has to
+/// land on it, which is the same direction deposits run in.
+pub const REQUEST_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
+
+/// Fold one L1 withdrawal request into the running chain.
+///
+/// This is what closes the censorship hole that ordinary [`Withdrawal`]s leave open. A withdrawal
+/// handed to the sequencer can be dropped and nobody outside would know; a request folded in here
+/// cannot, because [`verify_batch`] will not reach the chain value the contract is holding unless
+/// the batch consumes every pending request in order. The sequencer's choices collapse to two:
+/// honour them, or settle nothing at all -- and settling nothing is what the escape hatch is
+/// already watching for.
+///
+/// Exactly the shape of [`accumulate_deposit`], and for the same reasons -- both ends pinned so a
+/// fabricated fold has nowhere to anchor, and only fields the guest can rebuild from the batch
+/// bytes in the preimage. There is no amount here because a request does not name one: it empties
+/// the account, and the balance is read from the state during replay. The 103-byte preimage is far
+/// inside [`AVM_MAX_BYTE_SLICE`].
+pub fn accumulate_request(
+    chain: &[u8; 32],
+    address: &Address,
+    recipient: &L1Address,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"REQUEST");
+    hasher.update(chain);
+    hasher.update(address);
+    hasher.update(recipient);
+
+    hasher.finalize().into()
+}
+
 /// The root implied by `account` sitting at `address`, or an error if `proof` is malformed.
 fn root_with(
     address: &Address,
@@ -580,6 +916,38 @@ fn expect_pre_state(
 /// [`Account::empty`], so a prover cannot choose the `auth_address` of an account it brings into
 /// existence -- which is also what lets a depositor spend immediately with the key their address
 /// was derived from.
+/// Debit `amount` from `sender_addr` against the running `root`, and return the root that produces.
+///
+/// The first half of a payment and the whole of a withdrawal. Unlike [`credit`] this refuses an
+/// empty slot outright: paying an address that holds nothing creates an account, but *spending*
+/// from one that holds nothing is [`VerificationError::UnknownSender`] however good the proof of
+/// its absence is.
+///
+/// On return the account's nonce has been bumped, and that bumped value is the only nonce a
+/// signature for this transaction could have been made over -- which is what lets the nonce stay
+/// off the wire entirely. See [`Account::bump_nonce`].
+fn debit(
+    sender_addr: &Address,
+    witness: &LeafWitness,
+    sig: &Signature,
+    amount: u64,
+    root: [u8; 32],
+) -> Result<[u8; 32], VerificationError> {
+    expect_pre_state(sender_addr, witness, root)?;
+
+    let mut sender = witness
+        .old_account
+        .ok_or(VerificationError::UnknownSender)?;
+    sig.verify_auth(&sender)?;
+    sender.amount = sender
+        .amount
+        .checked_sub(amount)
+        .ok_or(VerificationError::InsufficientFunds)?;
+    sender.bump_nonce()?;
+
+    root_with(sender_addr, Some(&sender), &witness.proof)
+}
+
 fn credit(
     receiver_addr: &Address,
     witness: &LeafWitness,
@@ -617,9 +985,14 @@ fn credit(
 /// deposits from inside the tree would only relocate the mint, since the reserve would have to be
 /// minted into as well, at the cost of a second write and witness on every deposit.
 ///
-/// Deposits and payments interleave freely. The chain constrains the order of deposits relative to
-/// each other and nothing more, which is what lets a payment spend a deposit credited earlier in
-/// the same batch.
+/// A withdrawal writes one slot too, and it is the other one. There is no receiver to credit, so
+/// total balances fall -- the burn is matched by the settlement contract paying out real ALGO, and
+/// what tells it whom to pay is the withdrawal chain: see [`accumulate_withdrawal`]. This is the
+/// exact inverse of a deposit, down to which half of the payment is missing.
+///
+/// Deposits, payments and withdrawals interleave freely. Each chain constrains the order of its own
+/// kind relative to itself and nothing more, which is what lets a payment spend a deposit credited
+/// earlier in the same batch, or a withdrawal spend what a payment just delivered.
 ///
 /// Nothing here trusts the sidecar. Addresses and amounts come from the batch, nonces are derived
 /// from the witnessed account, and post-states are computed rather than supplied, so a doctored
@@ -627,15 +1000,20 @@ fn credit(
 pub fn verify_batch(
     old_root: [u8; 32],
     deposit_anchor: [u8; 32],
+    request_anchor: [u8; 32],
     batch: &Batch,
     sidecar: &Sidecar,
-) -> Result<([u8; 32], [u8; 32]), VerificationError> {
+) -> Result<([u8; 32], [u8; 32], [u8; 32], [u8; 32]), VerificationError> {
     if batch.txns.len() != sidecar.entries.len() {
         return Err(VerificationError::SidecarLengthMismatch);
     }
 
     let mut root = old_root;
     let mut deposit_chain = deposit_anchor;
+    let mut request_chain = request_anchor;
+    // Per block, not anchored to anything the contract already holds -- see
+    // [`WITHDRAWAL_CHAIN_GENESIS`] for why this one chain starts over every time.
+    let mut withdrawal_chain = WITHDRAWAL_CHAIN_GENESIS;
 
     for (txn, entry) in batch.txns.iter().zip(&sidecar.entries) {
         match (txn, entry) {
@@ -643,21 +1021,9 @@ pub fn verify_batch(
                 let (sender_addr, receiver_addr, amt) =
                     (payment.header.sender, payment.receiver, payment.amount);
 
-                expect_pre_state(&sender_addr, &entry.sender_witness, root)?;
-                let mut sender = entry
-                    .sender_witness
-                    .old_account
-                    .ok_or(VerificationError::UnknownSender)?;
-                entry.sig.verify_auth(&sender)?;
-                sender.amount = sender
-                    .amount
-                    .checked_sub(amt)
-                    .ok_or(VerificationError::InsufficientFunds)?;
-                sender.bump_nonce()?;
-                // `sender.nonce` now holds the only nonce this transaction could carry, which is
-                // the value the signature must have been made over.
-                // TODO: crypto verification of `entry.sig` over `payment.bytes_to_sign(sender.nonce)`.
-                root = root_with(&sender_addr, Some(&sender), &entry.sender_witness.proof)?;
+                // TODO: crypto verification of `entry.sig` over `payment.bytes_to_sign(nonce)`,
+                // where `nonce` is what `debit` derived.
+                root = debit(&sender_addr, &entry.sender_witness, &entry.sig, amt, root)?;
 
                 // Read against the root the sender write just produced, so a self-payment sees the
                 // debited balance and the bumped nonce.
@@ -669,11 +1035,107 @@ pub fn verify_batch(
                 root = credit(&receiver_addr, &entry.receiver_witness, amt, root)?;
                 deposit_chain = accumulate_deposit(&deposit_chain, &receiver_addr, amt);
             }
+            (Transaction::Withdrawal(withdrawal), TxnSidecar::Withdrawal(entry)) => {
+                let (sender_addr, recipient, amt) = (
+                    withdrawal.header.sender,
+                    withdrawal.recipient,
+                    withdrawal.amount,
+                );
+
+                // Checked before the debit so that an unpayable withdrawal is rejected on its own
+                // terms, rather than incidentally by the sender happening to be short.
+                if amt < MIN_WITHDRAWAL {
+                    return Err(VerificationError::WithdrawalTooSmall);
+                }
+
+                // TODO: crypto verification of `entry.sig` over
+                // `withdrawal.bytes_to_sign(nonce)`, where `nonce` is what `debit` derived.
+                root = debit(&sender_addr, &entry.sender_witness, &entry.sig, amt, root)?;
+
+                withdrawal_chain = accumulate_withdrawal(&withdrawal_chain, &recipient, amt);
+            }
+            (Transaction::ForcedWithdrawal(forced), TxnSidecar::ForcedWithdrawal(entry)) => {
+                let (address, recipient) = (forced.header.sender, forced.recipient);
+
+                // Checked before the balance is read, and that is what makes the balance
+                // trustworthy: a witness that misreports it cannot reproduce the running root, so
+                // the amount paid out is as pinned as if it had been written on the wire.
+                expect_pre_state(&address, &entry.sender_witness, root)?;
+                let balance = entry
+                    .sender_witness
+                    .old_account
+                    .map_or(0, |account| account.amount);
+
+                // Below the minimum there is nothing L1 could pay out -- an inner payment that
+                // small fails against an account that does not yet exist -- so the request is
+                // consumed without effect. This is the one case a request does not move value, and
+                // it is determined by the witnessed pre-state rather than chosen by the prover.
+                // A request against an address holding no account at all lands here too, with a
+                // balance of zero.
+                if balance >= MIN_WITHDRAWAL {
+                    let mut account = entry
+                        .sender_witness
+                        .old_account
+                        .ok_or(VerificationError::UnknownSender)?;
+                    account.amount = 0;
+                    // Bumped even though nothing was signed for this transaction. The account
+                    // survives at zero rather than leaving the tree, and its nonce moves, so a
+                    // payment its owner signed earlier cannot be held back and replayed against a
+                    // balance somebody deposits later.
+                    account.bump_nonce()?;
+                    root = root_with(&address, Some(&account), &entry.sender_witness.proof)?;
+
+                    withdrawal_chain =
+                        accumulate_withdrawal(&withdrawal_chain, &recipient, balance);
+                }
+
+                // Folded either way. A request the batch could not pay is still a request the batch
+                // answered, and leaving it unconsumed would wedge the rollup on an account that can
+                // never be worth enough to empty.
+                request_chain = accumulate_request(&request_chain, &address, &recipient);
+            }
             _ => return Err(VerificationError::SidecarKindMismatch),
         }
     }
 
-    Ok((root, deposit_chain))
+    Ok((root, deposit_chain, withdrawal_chain, request_chain))
+}
+
+/// Every payout a batch queues on L1, in the order it queues them.
+///
+/// A reporting function, not a checking one: [`verify_batch`] has already decided what is valid, and
+/// this reads the same decisions back out for whoever has to act on them. A claimer needs it because
+/// the payout queue is a hash chain that can only be unwound if you know what went into it, and a
+/// [`ForcedWithdrawal`]'s amount is not on the wire -- it is the balance its witness reveals.
+///
+/// The `MIN_WITHDRAWAL` condition is repeated from the forced-withdrawal arm of [`verify_batch`],
+/// which is a duplication worth being uneasy about. What keeps the two honest is that folding
+/// [`accumulate_withdrawal`] over this list has to reproduce the chain that arm computed, and a test
+/// asserts exactly that for every scenario -- so a drift shows up as a queue nobody can drain rather
+/// than as a silent disagreement.
+///
+/// Garbage in, garbage out: pair a batch with a sidecar that never verified and the amounts are
+/// whatever that sidecar claimed.
+pub fn withdrawal_payouts(batch: &Batch, sidecar: &Sidecar) -> Vec<(L1Address, u64)> {
+    batch
+        .txns
+        .iter()
+        .zip(&sidecar.entries)
+        .filter_map(|(txn, entry)| match (txn, entry) {
+            (Transaction::Withdrawal(withdrawal), _) => {
+                Some((withdrawal.recipient, withdrawal.amount))
+            }
+            (Transaction::ForcedWithdrawal(forced), TxnSidecar::ForcedWithdrawal(entry)) => {
+                let balance = entry
+                    .sender_witness
+                    .old_account
+                    .map_or(0, |account| account.amount);
+
+                (balance >= MIN_WITHDRAWAL).then_some((forced.recipient, balance))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Longest application argument a settlement transaction can carry, as of go-algorand 5.0 (AVM
@@ -779,10 +1241,10 @@ pub fn batch_commitment(batch_bytes: &[u8]) -> [u8; 32] {
     accumulator
 }
 
-pub const PUBLIC_VALUES_SIZE: usize = 32 * 5;
+pub const PUBLIC_VALUES_SIZE: usize = 32 * 8;
 
-/// What a proof exposes: the two roots, which batch got between them, and the two ends of the
-/// deposit chain the batch consumed.
+/// What a proof exposes: the two roots, which batch got between them, the two ends of each chain the
+/// batch consumed, and the withdrawal chain it produced.
 ///
 /// ```text
 /// [  0.. 32)  old_root
@@ -790,24 +1252,42 @@ pub const PUBLIC_VALUES_SIZE: usize = 32 * 5;
 /// [ 64.. 96)  batch_commitment
 /// [ 96..128)  old_deposit_chain
 /// [128..160)  new_deposit_chain
+/// [160..192)  withdrawal_chain
+/// [192..224)  old_request_chain
+/// [224..256)  new_request_chain
 /// ```
 ///
-/// Laid out here so the guest and the settlement contract read the same 160 bytes the same way. The
+/// Laid out here so the guest and the settlement contract read the same 256 bytes the same way. The
 /// contract's side is: check `old_root` against the root it has stored, check the commitment
 /// against a hash of the batch bytes it was handed across the preceding transactions, check both
-/// deposit-chain ends against what it has recorded, verify the proof, then store `new_root`.
+/// deposit-chain ends and both request-chain ends against what it has recorded, verify the proof,
+/// store `new_root`, and open a payout queue at `withdrawal_chain` if it is not the genesis value.
+///
+/// The two pairs of chain ends are the same mechanism pointed at two different failures. The
+/// deposit pair makes a batch credit exactly what L1 accepted, so value cannot be minted. The
+/// request pair makes a batch answer exactly the withdrawals L1 was asked to force, so value cannot
+/// be trapped -- an ignored request leaves the fold short of the value the contract holds, and no
+/// batch settles again until it is consumed.
 ///
 /// The commitment check is what makes the data available: the bytes have to be presented to the
 /// contract, not merely promised, or the root advances with nothing to reconstruct state from. The
 /// two deposit-chain checks are what make the batch's deposits exactly L1's; see
 /// [`accumulate_deposit`]. Both ends are pinned rather than just the last, so a prover cannot pick
 /// an anchor that makes a fabricated fold land correctly.
+///
+/// The withdrawal chain has one end rather than two, and that asymmetry is the point: its anchor is
+/// [`WITHDRAWAL_CHAIN_GENESIS`] for every block, so there is nothing for a prover to choose. It is
+/// the value the contract *stores* rather than one it checks -- the checking happens later, one
+/// claim at a time, as the chain is unwound.
 pub fn public_values(
     old_root: &[u8; 32],
     new_root: &[u8; 32],
     batch_bytes: &[u8],
     old_deposit_chain: &[u8; 32],
     new_deposit_chain: &[u8; 32],
+    withdrawal_chain: &[u8; 32],
+    old_request_chain: &[u8; 32],
+    new_request_chain: &[u8; 32],
 ) -> [u8; PUBLIC_VALUES_SIZE] {
     let mut buf = [0u8; PUBLIC_VALUES_SIZE];
 
@@ -815,7 +1295,10 @@ pub fn public_values(
     buf[32..64].copy_from_slice(new_root);
     buf[64..96].copy_from_slice(&batch_commitment(batch_bytes));
     buf[96..128].copy_from_slice(old_deposit_chain);
-    buf[128..].copy_from_slice(new_deposit_chain);
+    buf[128..160].copy_from_slice(new_deposit_chain);
+    buf[160..192].copy_from_slice(withdrawal_chain);
+    buf[192..224].copy_from_slice(old_request_chain);
+    buf[224..].copy_from_slice(new_request_chain);
 
     buf
 }
@@ -868,13 +1351,15 @@ impl std::error::Error for ExecutionError {}
 pub fn execute(
     old_root: [u8; 32],
     deposit_anchor: [u8; 32],
+    request_anchor: [u8; 32],
     batch_bytes: &[u8],
     sidecar_bytes: &[u8],
 ) -> Result<[u8; PUBLIC_VALUES_SIZE], ExecutionError> {
     let batch = Batch::decode(batch_bytes)?;
     let sidecar = Sidecar::decode(sidecar_bytes, &batch)?;
 
-    let (new_root, new_deposit_chain) = verify_batch(old_root, deposit_anchor, &batch, &sidecar)?;
+    let (new_root, new_deposit_chain, withdrawal_chain, new_request_chain) =
+        verify_batch(old_root, deposit_anchor, request_anchor, &batch, &sidecar)?;
 
     Ok(public_values(
         &old_root,
@@ -882,6 +1367,9 @@ pub fn execute(
         batch_bytes,
         &deposit_anchor,
         &new_deposit_chain,
+        &withdrawal_chain,
+        &request_anchor,
+        &new_request_chain,
     ))
 }
 
@@ -891,14 +1379,19 @@ pub fn execute(
 /// values it claims, so this is the one place `RootMismatch` can come from. The guest calls
 /// [`verify_batch`] directly and lets the settlement contract make the comparison.
 pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
-    let (root, deposit_chain) = verify_batch(
+    let (root, deposit_chain, withdrawal_chain, request_chain) = verify_batch(
         block.old_root,
         block.old_deposit_chain,
+        block.old_request_chain,
         &block.batch,
         &block.sidecar,
     )?;
 
-    if root == block.new_root && deposit_chain == block.new_deposit_chain {
+    if root == block.new_root
+        && deposit_chain == block.new_deposit_chain
+        && withdrawal_chain == block.withdrawal_chain
+        && request_chain == block.new_request_chain
+    {
         Ok(())
     } else {
         Err(VerificationError::RootMismatch)
@@ -914,12 +1407,15 @@ pub struct Ledger {
     /// Fold over every deposit this ledger has applied, mirroring what the settlement contract
     /// holds. Never reset -- it is an anchor, not a per-block accumulator.
     deposit_chain: [u8; 32],
+    /// The same, for L1 withdrawal requests this ledger has answered.
+    request_chain: [u8; 32],
 }
 
 impl Ledger {
     pub fn new() -> Self {
         Self {
             deposit_chain: DEPOSIT_CHAIN_GENESIS,
+            request_chain: REQUEST_CHAIN_GENESIS,
             ..Self::default()
         }
     }
@@ -927,6 +1423,11 @@ impl Ledger {
     /// The deposit chain as it stands, which is what the next block will anchor to.
     pub fn deposit_chain(&self) -> [u8; 32] {
         self.deposit_chain
+    }
+
+    /// The request chain as it stands, which is what the next block will anchor to.
+    pub fn request_chain(&self) -> [u8; 32] {
+        self.request_chain
     }
 
     pub fn account(&self, address: &Address) -> Option<&Account> {
@@ -971,32 +1472,18 @@ impl Ledger {
     pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
         let old_root = self.state_root();
         let old_deposit_chain = self.deposit_chain;
+        let old_request_chain = self.request_chain;
+        let mut withdrawal_chain = WITHDRAWAL_CHAIN_GENESIS;
         let mut txns = Vec::with_capacity(stxns.len());
         let mut entries = Vec::with_capacity(stxns.len());
 
         for stxn in stxns {
             let txn = match stxn {
                 SignedTransaction::Payment { payment, sig } => {
-                    let sender_addr = payment.header.sender;
-
-                    let sender_witness = LeafWitness {
-                        old_account: self.accounts.get(&sender_addr).copied(),
-                        proof: self.tree.proof(&sender_addr),
-                    };
-
-                    let receiver_addr = payment.receiver;
-                    let amt = payment.amount;
-
-                    let sender = self.accounts.get_mut(&sender_addr).unwrap();
-                    sig.verify_auth(sender).unwrap();
-                    // TODO: crypto verification
-                    sender.amount = sender.amount.checked_sub(amt).unwrap();
-                    sender.bump_nonce().unwrap();
-                    let sender = *sender;
-                    self.tree.update(&sender_addr, Some(&sender));
+                    let sender_witness = self.debit(payment.header.sender, payment.amount, &sig);
 
                     // Captured after the sender write, so a self-payment witnesses the debited balance.
-                    let receiver_witness = self.credit(receiver_addr, amt);
+                    let receiver_witness = self.credit(payment.receiver, payment.amount);
 
                     entries.push(TxnSidecar::Payment(PaymentSidecar {
                         sig,
@@ -1016,6 +1503,66 @@ impl Ledger {
 
                     Transaction::Deposit(deposit)
                 }
+                SignedTransaction::Withdrawal { withdrawal, sig } => {
+                    assert!(
+                        withdrawal.amount >= MIN_WITHDRAWAL,
+                        "a withdrawal below MIN_WITHDRAWAL could not be paid out on L1",
+                    );
+
+                    let sender_witness =
+                        self.debit(withdrawal.header.sender, withdrawal.amount, &sig);
+
+                    withdrawal_chain = accumulate_withdrawal(
+                        &withdrawal_chain,
+                        &withdrawal.recipient,
+                        withdrawal.amount,
+                    );
+
+                    entries.push(TxnSidecar::Withdrawal(WithdrawalSidecar {
+                        sig,
+                        sender_witness,
+                    }));
+
+                    Transaction::Withdrawal(withdrawal)
+                }
+                SignedTransaction::ForcedWithdrawal { forced } => {
+                    let address = forced.header.sender;
+
+                    let sender_witness = LeafWitness {
+                        old_account: self.accounts.get(&address).copied(),
+                        proof: self.tree.proof(&address),
+                    };
+
+                    // Whatever is there, which is what the request asked for. Mirrors the
+                    // forced-withdrawal arm of `verify_batch`, including its one drop case.
+                    let balance = self
+                        .accounts
+                        .get(&address)
+                        .map_or(0, |account| account.amount());
+
+                    if balance >= MIN_WITHDRAWAL {
+                        let account = self.accounts.get_mut(&address).unwrap();
+                        account.amount = 0;
+                        account.bump_nonce().unwrap();
+                        let account = *account;
+                        self.tree.update(&address, Some(&account));
+
+                        withdrawal_chain = accumulate_withdrawal(
+                            &withdrawal_chain,
+                            &forced.recipient,
+                            balance,
+                        );
+                    }
+
+                    self.request_chain =
+                        accumulate_request(&self.request_chain, &address, &forced.recipient);
+
+                    entries.push(TxnSidecar::ForcedWithdrawal(ForcedWithdrawalSidecar {
+                        sender_witness,
+                    }));
+
+                    Transaction::ForcedWithdrawal(forced)
+                }
             };
 
             txns.push(txn);
@@ -1026,9 +1573,36 @@ impl Ledger {
             new_root: self.state_root(),
             old_deposit_chain,
             new_deposit_chain: self.deposit_chain,
+            old_request_chain,
+            new_request_chain: self.request_chain,
+            withdrawal_chain,
             batch: Batch { txns },
             sidecar: Sidecar { entries },
         }
+    }
+
+    /// Debit `amount` from `sender`, returning the witness for the slot as it stood beforehand.
+    ///
+    /// Mirrors the free-standing [`debit`] on the verifying side, and like [`Ledger::credit`]
+    /// captures the witness before the write and after everything preceding it.
+    ///
+    /// Panics rather than returning an error, as the rest of this path does: a sequencer is assumed
+    /// to only build blocks it has already decided are valid.
+    fn debit(&mut self, sender: Address, amount: u64, sig: &Signature) -> LeafWitness {
+        let witness = LeafWitness {
+            old_account: self.accounts.get(&sender).copied(),
+            proof: self.tree.proof(&sender),
+        };
+
+        let account = self.accounts.get_mut(&sender).unwrap();
+        sig.verify_auth(account).unwrap();
+        // TODO: crypto verification
+        account.amount = account.amount.checked_sub(amount).unwrap();
+        account.bump_nonce().unwrap();
+        let account = *account;
+        self.tree.update(&sender, Some(&account));
+
+        witness
     }
 
     /// Credit `amount` to `receiver`, returning the witness for the slot as it stood beforehand.
@@ -1122,8 +1696,21 @@ mod tests {
     fn payment_entry(block: &mut Block, index: usize) -> &mut PaymentSidecar {
         match &mut block.sidecar.entries[index] {
             TxnSidecar::Payment(entry) => entry,
-            TxnSidecar::Deposit(_) => panic!("entry {index} is a deposit, not a payment"),
+            other => panic!("entry {index} is {other:?}, not a payment"),
         }
+    }
+
+    /// A withdrawal of `amount` to `recipient` on L1, from the account for `key`, signed by `key`.
+    fn withdrawal(key: &[u8], recipient: L1Address, amount: u64) -> SignedTransaction {
+        SignedTransaction::withdrawal(
+            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount),
+            signature(key),
+        )
+    }
+
+    /// An L1 address, which is only ever 32 opaque bytes to this crate.
+    fn l1(seed: u8) -> L1Address {
+        [seed; 32]
     }
 
     /// A ledger holding `a key` and `b key`, and the address the `fresh key` account would live at
@@ -1237,6 +1824,7 @@ mod tests {
             verify_batch(
                 block.old_root,
                 block.old_deposit_chain,
+                block.old_request_chain,
                 &block.batch,
                 &block.sidecar
             ),
@@ -1257,6 +1845,9 @@ mod tests {
             &batch_bytes,
             &block.old_deposit_chain(),
             &block.new_deposit_chain(),
+            &block.withdrawal_chain(),
+            &block.old_request_chain(),
+            &block.new_request_chain(),
         );
 
         assert_eq!(values.len(), PUBLIC_VALUES_SIZE);
@@ -1264,7 +1855,10 @@ mod tests {
         assert_eq!(&values[32..64], &block.new_root());
         assert_eq!(&values[64..96], &batch_commitment(&batch_bytes));
         assert_eq!(&values[96..128], &block.old_deposit_chain());
-        assert_eq!(&values[128..], &block.new_deposit_chain());
+        assert_eq!(&values[128..160], &block.new_deposit_chain());
+        assert_eq!(&values[160..192], &block.withdrawal_chain());
+        assert_eq!(&values[192..224], &block.old_request_chain());
+        assert_eq!(&values[224..], &block.new_request_chain());
 
         // The commitment is domain-separated and covers every byte, so a batch that differs
         // anywhere cannot be presented against this proof.
@@ -1456,6 +2050,7 @@ mod tests {
             verify_batch(
                 block.old_root,
                 block.old_deposit_chain,
+                block.old_request_chain,
                 &block.batch,
                 &block.sidecar
             ),
@@ -1464,17 +2059,431 @@ mod tests {
     }
 
     #[test]
+    fn a_withdrawal_debits_the_sender_and_credits_nobody() {
+        let mut ledger = Ledger::new();
+        let a = fund(&mut ledger, b"a key", 1_000_000);
+
+        let block = ledger.get_block(vec![withdrawal(b"a key", l1(7), 400_000)]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(ledger.account(&a).unwrap().amount(), 600_000);
+        // The debit is authorized by a signature, so it bumps the nonce like any other spend.
+        assert_eq!(ledger.account(&a).unwrap().nonce(), 1);
+        // Nothing in the tree received the funds: the recipient is an L1 address and has no slot.
+        assert_eq!(block.batch().txns()[0].receiver(), None);
+    }
+
+    #[test]
+    fn a_withdrawal_below_the_minimum_does_not_verify() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 1_000_000);
+
+        // Built by hand: `get_block` refuses to sequence one at all, so this is the shape only a
+        // hostile sequencer could produce.
+        let mut block = ledger.get_block(vec![withdrawal(b"a key", l1(7), MIN_WITHDRAWAL)]);
+        let Transaction::Withdrawal(w) = &mut block.batch.txns[0] else {
+            panic!("the fixture block is a single withdrawal")
+        };
+        w.amount = MIN_WITHDRAWAL - 1;
+
+        assert_eq!(
+            verify_batch(
+                block.old_root,
+                block.old_deposit_chain,
+                block.old_request_chain,
+                &block.batch,
+                &block.sidecar
+            ),
+            Err(VerificationError::WithdrawalTooSmall)
+        );
+    }
+
+    #[test]
+    fn a_withdrawal_cannot_spend_more_than_the_account_holds() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 1_000_000);
+        let mut block = ledger.get_block(vec![withdrawal(b"a key", l1(7), 100_000)]);
+
+        let Transaction::Withdrawal(w) = &mut block.batch.txns[0] else {
+            panic!("the fixture block is a single withdrawal")
+        };
+        w.amount = 2_000_000;
+
+        assert_eq!(
+            verify_block(&block),
+            Err(VerificationError::InsufficientFunds)
+        );
+    }
+
+    // A withdrawal is the inverse of a deposit, and the ledger has to balance either way: what a
+    // block mints must equal what L1 accepted, and what it burns must equal what L1 will pay out.
+    #[test]
+    fn a_block_can_deposit_pay_and_withdraw_at_once() {
+        let mut ledger = Ledger::new();
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        let block = ledger.get_block(vec![
+            deposit(b"a key", 1_000_000),
+            stxn(b"a key", b, 400_000),
+            withdrawal(b"b key", l1(9), 250_000),
+        ]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(
+            ledger
+                .account(&address_from_public_key(SCHEME, b"a key"))
+                .unwrap()
+                .amount(),
+            600_000
+        );
+        assert_eq!(ledger.account(&b).unwrap().amount(), 150_000);
+
+        // Both chains moved, and neither is the other's.
+        assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_ne!(block.withdrawal_chain(), WITHDRAWAL_CHAIN_GENESIS);
+        assert_ne!(block.withdrawal_chain(), block.new_deposit_chain());
+    }
+
+    // The chain restarts every block, unlike the deposit chain. This is what lets L1 keep one
+    // unwindable queue per block instead of one pointer walking backwards through all history.
+    #[test]
+    fn the_withdrawal_chain_starts_over_each_block() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+
+        let first = ledger.get_block(vec![withdrawal(b"a key", l1(1), 100_000)]);
+        let second = ledger.get_block(vec![withdrawal(b"a key", l1(1), 100_000)]);
+
+        // Identical withdrawals in different blocks fold to the same value, because both started
+        // from genesis. Two blocks' queues are independent, which is precisely the intent.
+        assert_eq!(first.withdrawal_chain(), second.withdrawal_chain());
+        assert_eq!(
+            first.withdrawal_chain(),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000)
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_withdrawals_leaves_the_chain_at_genesis() {
+        let block = Ledger::new().get_block(vec![deposit(b"a key", 1_000)]);
+
+        assert_eq!(block.withdrawal_chain(), WITHDRAWAL_CHAIN_GENESIS);
+        assert_eq!(verify_block(&block), Ok(()));
+    }
+
+    // What the settlement contract does when a claim arrives: it holds the tip, is handed the value
+    // before it, and checks the fold. Unwinding to genesis is what "the queue is drained" means.
+    #[test]
+    fn the_withdrawal_chain_unwinds_newest_first() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+
+        let payouts = [(l1(1), 100_000u64), (l1(2), 250_000), (l1(3), 999_999)];
+        let block = ledger.get_block(
+            payouts
+                .iter()
+                .map(|(to, amount)| withdrawal(b"a key", *to, *amount))
+                .collect(),
+        );
+
+        // Rebuild the chain the way the guest did, keeping every intermediate value -- those are
+        // exactly the `previousChain` arguments a claimer supplies, in reverse.
+        let mut tips = vec![WITHDRAWAL_CHAIN_GENESIS];
+        for (to, amount) in &payouts {
+            tips.push(accumulate_withdrawal(tips.last().unwrap(), to, *amount));
+        }
+        assert_eq!(*tips.last().unwrap(), block.withdrawal_chain());
+
+        let mut tip = block.withdrawal_chain();
+        for (index, (to, amount)) in payouts.iter().enumerate().rev() {
+            let previous = tips[index];
+            assert_eq!(
+                accumulate_withdrawal(&previous, to, *amount),
+                tip,
+                "claim {index} must reproduce the tip it is presented against"
+            );
+            tip = previous;
+        }
+        assert_eq!(tip, WITHDRAWAL_CHAIN_GENESIS);
+    }
+
+    // The tip *is* the record of what has been paid, so replaying a claim against the drained queue
+    // has to fail. There is no separate nullifier to forget to check.
+    #[test]
+    fn a_claim_cannot_be_replayed_against_the_unwound_chain() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 10_000_000);
+        let block = ledger.get_block(vec![withdrawal(b"a key", l1(1), 100_000)]);
+
+        assert_eq!(
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000),
+            block.withdrawal_chain()
+        );
+        // After the one claim the tip is genesis, and the same claim no longer reproduces it.
+        assert_ne!(
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000),
+            WITHDRAWAL_CHAIN_GENESIS
+        );
+    }
+
+    #[test]
+    fn the_withdrawal_chain_pins_recipient_amount_and_order() {
+        let ab = accumulate_withdrawal(
+            &accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000),
+            &l1(2),
+            200_000,
+        );
+        let ba = accumulate_withdrawal(
+            &accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(2), 200_000),
+            &l1(1),
+            100_000,
+        );
+
+        assert_ne!(ab, ba, "order must be committed to");
+        assert_ne!(
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_001),
+            "amount must be committed to"
+        );
+        assert_ne!(
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(1), 100_000),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(2), 100_000),
+            "recipient must be committed to"
+        );
+    }
+
+    // The two chains must never collide: a value that could be read as either would let a deposit
+    // credit be presented as a payout authorization or the reverse. The domain tags are what stop
+    // it, and this pins that they are actually doing the work.
+    #[test]
+    fn the_deposit_and_withdrawal_folds_are_domain_separated() {
+        let same = [7u8; 32];
+
+        assert_ne!(
+            accumulate_deposit(&WITHDRAWAL_CHAIN_GENESIS, &same, 100_000),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &same, 100_000),
+        );
+    }
+
+    // Without the tags a payment and a withdrawal of the same amount, from the same sender at the
+    // same nonce, to the same 32 bytes, would produce identical preimages -- so one signature would
+    // authorize either, and a payment could be replayed as a withdrawal out of the rollup.
+    #[test]
+    fn a_payment_and_a_withdrawal_never_sign_the_same_bytes() {
+        let sender = address_from_public_key(SCHEME, b"a key");
+        let destination = [9u8; 32];
+
+        let payment = Payment::new(sender, destination, 100_000);
+        let withdrawal = Withdrawal::new(sender, destination, 100_000);
+
+        assert_ne!(payment.bytes_to_sign(3), withdrawal.bytes_to_sign(3));
+        // And the nonce still separates two otherwise identical transactions of the same kind.
+        assert_ne!(withdrawal.bytes_to_sign(3), withdrawal.bytes_to_sign(4));
+    }
+
+    /// A withdrawal L1 ordered, emptying the account for `key` to `recipient`.
+    fn forced(key: &[u8], recipient: L1Address) -> SignedTransaction {
+        SignedTransaction::forced_withdrawal(ForcedWithdrawal::new(
+            address_from_public_key(SCHEME, key),
+            recipient,
+        ))
+    }
+
+    #[test]
+    fn a_forced_withdrawal_empties_the_account() {
+        let mut ledger = Ledger::new();
+        let a = fund(&mut ledger, b"a key", 1_000_000);
+
+        let block = ledger.get_block(vec![forced(b"a key", l1(7))]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(ledger.account(&a).unwrap().amount(), 0);
+        // The account stays in the tree with its nonce advanced, so a payment its owner signed
+        // earlier cannot be held back and replayed against a balance somebody deposits later.
+        assert_eq!(ledger.account(&a).unwrap().nonce(), 1);
+        // The payout is queued for the whole balance, without the amount ever being on the wire.
+        assert_eq!(block.batch().txns()[0].amount(), None);
+        assert_eq!(
+            block.withdrawal_chain(),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(7), 1_000_000)
+        );
+    }
+
+    // The property the whole mechanism exists for. An ordinary withdrawal can be dropped by the
+    // sequencer and nothing outside would know; a forced one leaves the chain short of what L1 is
+    // holding, so no batch settles again until it is answered.
+    #[test]
+    fn a_batch_that_ignores_a_request_lands_short_of_the_chain() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 1_000_000);
+
+        // What L1 holds once it has accepted one request.
+        let demanded = accumulate_request(
+            &REQUEST_CHAIN_GENESIS,
+            &address_from_public_key(SCHEME, b"a key"),
+            &l1(7),
+        );
+
+        // A batch that quietly does something else instead.
+        let evasive = ledger.get_block(vec![stxn(b"a key", l1(3), 500_000)]);
+
+        assert_eq!(verify_block(&evasive), Ok(()));
+        assert_eq!(evasive.new_request_chain(), REQUEST_CHAIN_GENESIS);
+        assert_ne!(evasive.new_request_chain(), demanded);
+    }
+
+    #[test]
+    fn the_request_chain_pins_account_recipient_and_order() {
+        let (a, b) = (
+            address_from_public_key(SCHEME, b"a key"),
+            address_from_public_key(SCHEME, b"b key"),
+        );
+
+        let ab = accumulate_request(&accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)), &b, &l1(2));
+        let ba = accumulate_request(&accumulate_request(&REQUEST_CHAIN_GENESIS, &b, &l1(2)), &a, &l1(1));
+
+        assert_ne!(ab, ba, "order must be committed to");
+        assert_ne!(
+            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)),
+            accumulate_request(&REQUEST_CHAIN_GENESIS, &b, &l1(1)),
+            "the account must be committed to"
+        );
+        assert_ne!(
+            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)),
+            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(2)),
+            "the recipient must be committed to"
+        );
+    }
+
+    // The one case a request does not move value, and the reason it still has to be consumed:
+    // leaving it pending would wedge the rollup on an account that can never be worth emptying.
+    #[test]
+    fn a_request_against_a_dust_balance_is_consumed_without_a_payout() {
+        let mut ledger = Ledger::new();
+        let a = fund(&mut ledger, b"a key", MIN_WITHDRAWAL - 1);
+
+        let block = ledger.get_block(vec![forced(b"a key", l1(7))]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(block.withdrawal_chain(), WITHDRAWAL_CHAIN_GENESIS);
+        assert_ne!(block.new_request_chain(), block.old_request_chain());
+        // Untouched, including the nonce -- nothing happened to it.
+        assert_eq!(ledger.account(&a).unwrap().amount(), MIN_WITHDRAWAL - 1);
+        assert_eq!(ledger.account(&a).unwrap().nonce(), 0);
+    }
+
+    #[test]
+    fn a_request_against_an_account_that_does_not_exist_is_consumed() {
+        let mut ledger = Ledger::new();
+        let block = ledger.get_block(vec![forced(b"never funded", l1(7))]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(block.old_root(), block.new_root());
+        assert_eq!(block.withdrawal_chain(), WITHDRAWAL_CHAIN_GENESIS);
+        assert_ne!(block.new_request_chain(), block.old_request_chain());
+    }
+
+    // The witness decides the payout here, which is a job it does nowhere else. It is safe for the
+    // usual reason -- it is pinned to the running root before it is read -- and this is the test
+    // that says so.
+    #[test]
+    fn a_forced_withdrawal_cannot_understate_the_balance_it_pays_out() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 1_000_000);
+        let mut block = ledger.get_block(vec![forced(b"a key", l1(7))]);
+
+        // Claim the account held dust, so the payout would be suppressed and the balance left
+        // behind for the sequencer to keep custody of.
+        let TxnSidecar::ForcedWithdrawal(entry) = &mut block.sidecar.entries[0] else {
+            panic!("the fixture block is a single forced withdrawal")
+        };
+        entry.sender_witness.old_account = Some(account_at(b"a key", 0, 1).1);
+
+        assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
+    }
+
+    #[test]
+    fn a_forced_withdrawal_cannot_overstate_the_balance_it_pays_out() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"a key", 1_000_000);
+        let mut block = ledger.get_block(vec![forced(b"a key", l1(7))]);
+
+        let TxnSidecar::ForcedWithdrawal(entry) = &mut block.sidecar.entries[0] else {
+            panic!("the fixture block is a single forced withdrawal")
+        };
+        entry.sender_witness.old_account = Some(account_at(b"a key", 0, 9_000_000).1);
+
+        assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
+    }
+
+    // Deposits and requests are the two directions the same mechanism runs in, and a batch has to
+    // satisfy both at once.
+    #[test]
+    fn deposits_and_requests_are_independent_chains() {
+        let mut ledger = Ledger::new();
+        let block = ledger.get_block(vec![
+            deposit(b"a key", 1_000_000),
+            forced(b"a key", l1(7)),
+        ]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_ne!(block.new_request_chain(), block.old_request_chain());
+        assert_ne!(block.new_deposit_chain(), block.new_request_chain());
+        // Deposited and emptied in the same batch, so the payout is the whole deposit.
+        assert_eq!(
+            block.withdrawal_chain(),
+            accumulate_withdrawal(&WITHDRAWAL_CHAIN_GENESIS, &l1(7), 1_000_000)
+        );
+    }
+
+    // `withdrawal_payouts` repeats the drop rule from `verify_batch`, so the two have to be held
+    // together by something. This is that something: the payouts a claimer would unwind have to
+    // fold to the chain the replay committed.
+    #[test]
+    fn the_reported_payouts_fold_to_the_committed_chain() {
+        let mut ledger = Ledger::new();
+        fund(&mut ledger, b"rich", 5_000_000);
+        fund(&mut ledger, b"dust", MIN_WITHDRAWAL - 1);
+        let b = address_from_public_key(SCHEME, b"b key");
+
+        // The forced withdrawal of `rich` comes last, because it leaves nothing behind to spend.
+        let block = ledger.get_block(vec![
+            withdrawal(b"rich", l1(1), 250_000),
+            forced(b"dust", l1(2)),
+            stxn(b"rich", b, 1),
+            forced(b"rich", l1(3)),
+        ]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+
+        let payouts = withdrawal_payouts(block.batch(), block.sidecar());
+        // The dust request queued nothing, so only two of the three withdrawals are payable.
+        assert_eq!(payouts.len(), 2);
+
+        let mut chain = WITHDRAWAL_CHAIN_GENESIS;
+        for (recipient, amount) in &payouts {
+            chain = accumulate_withdrawal(&chain, recipient, *amount);
+        }
+        assert_eq!(chain, block.withdrawal_chain());
+    }
+
+    #[test]
     fn every_preimage_a_contract_must_hash_fits_in_one_avm_value() {
         let seed_preimage = b"BATCH".len() + size_of::<u64>();
         let digest_preimage = CHUNK_SIZE;
         let fold_preimage = b"CHUNK".len() + 32 + 32;
         let deposit_preimage = b"DEPOSIT".len() + 32 + 32 + size_of::<u64>();
+        let withdrawal_preimage = b"WITHDRAW".len() + 32 + 32 + size_of::<u64>();
+        let request_preimage = b"REQUEST".len() + 32 + 32 + 32;
 
         for (name, len) in [
             ("seed", seed_preimage),
             ("chunk digest", digest_preimage),
             ("fold step", fold_preimage),
             ("deposit fold", deposit_preimage),
+            ("withdrawal fold", withdrawal_preimage),
+            ("request fold", request_preimage),
         ] {
             assert!(
                 len <= AVM_MAX_BYTE_SLICE,

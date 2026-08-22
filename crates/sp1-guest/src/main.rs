@@ -27,13 +27,22 @@ pub fn main() {
     let deposit_anchor: [u8; 32] = sp1_zkvm::io::read_vec()
         .try_into()
         .expect("deposit_anchor must be 32 bytes");
+    let request_anchor: [u8; 32] = sp1_zkvm::io::read_vec()
+        .try_into()
+        .expect("request_anchor must be 32 bytes");
     let batch_bytes = sp1_zkvm::io::read_vec();
     let sidecar_bytes = sp1_zkvm::io::read_vec();
 
-    // Everything the proof asserts lives in `execute`, so the host can compute these same 160 bytes
+    // Everything the proof asserts lives in `execute`, so the host can compute these same 256 bytes
     // without a zkVM. This is only the io.
-    let values =
-        execute(old_root, deposit_anchor, &batch_bytes, &sidecar_bytes).expect("block must prove");
+    let values = execute(
+        old_root,
+        deposit_anchor,
+        request_anchor,
+        &batch_bytes,
+        &sidecar_bytes,
+    )
+    .expect("block must prove");
 
     sp1_zkvm::io::commit_slice(&values);
 }
