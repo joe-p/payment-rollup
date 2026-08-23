@@ -8,14 +8,13 @@
 //!
 //! Compiled only under the `prove` feature. See this crate's `Cargo.toml` for why.
 
-use std::time::Instant;
-
 use sp1_sdk::{
     Elf, HashableKey, ProvingKey, SP1ProvingKey, SP1Stdin,
     blocking::{NetworkProver, ProveRequest, Prover, ProverClient},
     include_elf,
     network::NetworkMode,
 };
+use std::time::Instant;
 
 use crate::{ProofFixture, Settlement};
 
@@ -43,6 +42,7 @@ impl Groth16Prover {
     /// (equivalently `hosted`).
     pub fn new(network: &str) -> Result<Self, String> {
         let mode: NetworkMode = network.parse()?;
+        dotenvy::dotenv().ok();
 
         // Checked here only to fail cleanly. The SDK reads the variable itself, and panics rather
         // than returns when it is missing -- a panic out of a CLI reads as a bug in the tool

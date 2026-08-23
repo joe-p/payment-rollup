@@ -15,7 +15,7 @@ license.workspace = true
 #
 # -- and neither is needed to emit fixtures, which is the common case. `contracts`' `build:fixtures`
 # runs this binary with no features at all.
-prove = ["dep:sp1-sdk", "dep:sp1-build"]
+prove = ["dep:sp1-sdk", "dep:sp1-build", "dep:dotenvy"]
 
 [dependencies]
 payment-rollup = { path = "../payment-rollup" }
@@ -34,6 +34,7 @@ sp1-sdk = { version = "6.4.0", default-features = false, features = [
     "blocking",
     "network",
 ], optional = true }
+dotenvy = { version = "0.15.7", optional = true }
 
 [build-dependencies]
 # Compiles `sp1-guest` to a zkVM ELF and hands its path to `include_elf!`. Optional alongside the

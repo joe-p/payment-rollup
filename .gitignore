@@ -3,3 +3,4 @@ node_modules/
 contracts/contracts/out/
 contracts/contracts/clients/
 contracts/fixtures/
+.env
