@@ -715,16 +715,14 @@ mod tests {
                 &block.domain,
                 &batch_bytes,
                 block.old_root,
-                block.old_deposit_chain,
-                block.old_request_chain,
+                block.old_inbox_chain,
                 &batch,
                 &sidecar
             ),
             Ok((
                 block.new_root,
-                block.new_deposit_chain,
+                block.new_inbox_chain,
                 block.withdrawal_root,
-                block.new_request_chain,
                 block.withdrawal_count
             ))
         );
@@ -807,8 +805,7 @@ mod tests {
                 &block.domain,
                 &block.batch.encode(),
                 block.old_root,
-                block.old_deposit_chain,
-                block.old_request_chain,
+                block.old_inbox_chain,
                 &block.batch,
                 &sidecar
             ),

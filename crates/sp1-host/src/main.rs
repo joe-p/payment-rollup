@@ -6,10 +6,10 @@
 
 use std::process::ExitCode;
 
-use payment_rollup::{MIN_WITHDRAWAL, REQUEST_CHAIN_GENESIS, deployment_domain};
+use payment_rollup::{MIN_WITHDRAWAL, deployment_domain};
 use serde_json::{Value, json};
 use sp1_host::{
-    DEPOSIT_CHAIN_GENESIS, GENESIS_ROOT, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
+    GENESIS_ROOT, INBOX_CHAIN_GENESIS, InboxItem, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
 };
 
 const USAGE: &str = "\
@@ -170,8 +170,7 @@ fn run() -> Result<(), String> {
         "genesisHash": hex(&args.genesis_hash),
         "appId": args.app_id,
         "genesisRoot": hex(&GENESIS_ROOT),
-        "depositChainGenesis": hex(&DEPOSIT_CHAIN_GENESIS),
-        "requestChainGenesis": hex(&REQUEST_CHAIN_GENESIS),
+        "inboxChainGenesis": hex(&INBOX_CHAIN_GENESIS),
         "scenarios": emitted,
     });
 
@@ -221,16 +220,11 @@ fn fixture(
         "newRoot": hex(&settlement.new_root()),
         "batchCommitment": hex(&settlement.batch_commitment()),
         "deploymentDomain": hex(&settlement.domain()),
-        "depositChainFrom": hex(&settlement.deposit_chain_from()),
-        "depositChainTo": hex(&settlement.deposit_chain_to()),
+        "inboxChainFrom": hex(&settlement.inbox_chain_from()),
+        "inboxChainTo": hex(&settlement.inbox_chain_to()),
         "withdrawalRoot": hex(&settlement.withdrawal_root()),
         "withdrawalCount": settlement.withdrawal_count(),
-        "requestChainFrom": hex(&settlement.request_chain_from()),
-        "requestChainTo": hex(&settlement.request_chain_to()),
-
-        // One `requestWithdrawal(address, recipient, ...)` call each, in this order, before the
-        // batch is opened. Like the deposits, the chain only reaches `requestChainTo` if L1 sees
-        // exactly these, exactly here -- which is what stops the sequencer settling around them.
+        // Convenience views only. `inbox` below is authoritative for cross-kind L1 order.
         "requests": settlement
             .requests()
             .iter()
@@ -240,12 +234,28 @@ fn fixture(
             }))
             .collect::<Vec<_>>(),
 
-        // One `deposit(payment, recipient)` call each, in this order, before the batch is opened.
-        // The chain only reaches `depositChainTo` if L1 sees exactly these, exactly here.
         "deposits": settlement
             .deposits()
             .iter()
             .map(|(recipient, amount)| json!({ "recipient": hex(recipient), "amount": amount }))
+            .collect::<Vec<_>>(),
+
+        // Call `deposit` or `requestWithdrawal` for each tagged entry in this exact order.
+        "inbox": settlement
+            .inbox()
+            .iter()
+            .map(|item| match item {
+                InboxItem::Deposit { recipient, amount } => json!({
+                    "kind": "deposit",
+                    "recipient": hex(recipient),
+                    "amount": amount,
+                }),
+                InboxItem::ForcedWithdrawal { address, recipient } => json!({
+                    "kind": "forcedWithdrawal",
+                    "address": hex(address),
+                    "recipient": hex(recipient),
+                }),
+            })
             .collect::<Vec<_>>(),
 
         // One ordered-Merkle claim per payout after the batch has settled.

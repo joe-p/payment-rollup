@@ -35,13 +35,13 @@ pub fn all() -> &'static [Scenario] {
             description: "An empty batch replayed from the empty ledger. It starts and ends at the \
                           genesis root and carries no deposits, so it drives openBatch, one \
                           accumulateChunk and verifyBatch while leaving both the state root and the \
-                          deposit chain where they were.",
+                          inbox chain where they were.",
             build: genesis_empty_batch,
         },
         Scenario {
             name: "deposits-only",
             description: "Nothing but deposits, from the empty ledger. The cleanest test of the \
-                          deposit chain: with no payments in the way, a mismatch between what the \
+                          inbox deposit fold: with no payments in the way, a mismatch between what the \
                           contract folded as the deposits arrived and what the guest folded out of \
                           the batch can only be a disagreement about the fold itself.",
             build: deposits_only,
@@ -91,9 +91,16 @@ pub fn all() -> &'static [Scenario] {
             build: forced_inclusion,
         },
         Scenario {
+            name: "inbox-ordering",
+            description: "A deposit, forced withdrawal, and another deposit in one batch. The \
+                          ordered inbox requires L1 to call deposit, requestWithdrawal, deposit \
+                          exactly in that cross-kind order.",
+            build: inbox_ordering,
+        },
+        Scenario {
             name: "round-trip",
-            description: "Every kind in one batch: value deposited, moved by payment, and withdrawn \
-                          again. Covers the two chains moving in the same block and a withdrawal \
+            description: "Value deposited, moved by payment, and withdrawn again in one batch. \
+                          Covers the inbox and withdrawal commitments moving together and a withdrawal \
                           spending what a payment delivered earlier in that same block.",
             build: round_trip,
         },
@@ -216,7 +223,7 @@ fn duplicate_withdrawals(domain: DeploymentDomain) -> Block {
 /// Value in, value across, value out -- in one batch.
 ///
 /// The withdrawal spends from `b key`, which holds nothing until the payment two lines above
-/// delivers it. That is the interleaving that matters: the deposit chain and withdrawal commitment
+/// delivers it. That is the interleaving that matters: the inbox chain and withdrawal commitment
 /// both move, and the withdrawal is only affordable because the replay applies the transactions in
 /// order against a running root.
 fn round_trip(domain: DeploymentDomain) -> Block {
@@ -337,6 +344,17 @@ fn forced_inclusion(domain: DeploymentDomain) -> Block {
     ledger.get_block(stxns)
 }
 
+fn inbox_ordering(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
+    let address = address_from_public_key(Scheme::Ed25519, &EXIT_KEYS[0]);
+
+    ledger.get_block(vec![
+        SignedTransaction::deposit(Deposit::new(address, 1_000_000)),
+        SignedTransaction::forced_withdrawal(ForcedWithdrawal::new(address, l1_account(10))),
+        SignedTransaction::deposit(Deposit::new(address, 500_000)),
+    ])
+}
+
 /// Proofs for every account the forced-exit scenario leaves in the tree.
 ///
 /// Only inclusion proofs are emitted, and the assertion below is the reason: `forceExit` accepts
@@ -428,8 +446,8 @@ mod tests {
 
         assert_eq!(block.old_root(), crate::GENESIS_ROOT);
         assert_eq!(block.new_root(), crate::GENESIS_ROOT);
-        assert_eq!(block.old_deposit_chain(), crate::DEPOSIT_CHAIN_GENESIS);
-        assert_eq!(block.new_deposit_chain(), crate::DEPOSIT_CHAIN_GENESIS);
+        assert_eq!(block.old_inbox_chain(), crate::INBOX_CHAIN_GENESIS);
+        assert_eq!(block.new_inbox_chain(), crate::INBOX_CHAIN_GENESIS);
     }
 
     // No scenario fabricates a balance any more, so none of them needs a contract put into position
@@ -441,8 +459,8 @@ mod tests {
 
             assert_eq!(block.old_root(), crate::GENESIS_ROOT, "{}", scenario.name);
             assert_eq!(
-                block.old_deposit_chain(),
-                crate::DEPOSIT_CHAIN_GENESIS,
+                block.old_inbox_chain(),
+                crate::INBOX_CHAIN_GENESIS,
                 "{}",
                 scenario.name
             );
@@ -456,7 +474,7 @@ mod tests {
     fn the_deposits_only_scenario_repeats_a_deposit() {
         let block = deposits_only(DOMAIN);
 
-        assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
         assert_eq!(
             block.batch().len(),
             3,
@@ -479,6 +497,24 @@ mod tests {
         reversed.reverse();
 
         assert_ne!(deposits, reversed);
+    }
+
+    #[test]
+    fn the_inbox_ordering_scenario_interleaves_kinds() {
+        let settlement = Settlement::for_block(&inbox_ordering(DOMAIN)).unwrap();
+
+        assert!(matches!(
+            settlement.inbox()[0],
+            crate::InboxItem::Deposit { .. }
+        ));
+        assert!(matches!(
+            settlement.inbox()[1],
+            crate::InboxItem::ForcedWithdrawal { .. }
+        ));
+        assert!(matches!(
+            settlement.inbox()[2],
+            crate::InboxItem::Deposit { .. }
+        ));
     }
 
     // The e2e claims this queue one payout at a time and asserts each lands where it was addressed.

@@ -740,10 +740,8 @@ pub struct Block {
     domain: DeploymentDomain,
     old_root: [u8; 32],
     new_root: [u8; 32],
-    old_deposit_chain: [u8; 32],
-    new_deposit_chain: [u8; 32],
-    old_request_chain: [u8; 32],
-    new_request_chain: [u8; 32],
+    old_inbox_chain: [u8; 32],
+    new_inbox_chain: [u8; 32],
     withdrawal_root: [u8; 32],
     withdrawal_count: u64,
     batch: Batch,
@@ -763,26 +761,14 @@ impl Block {
         self.new_root
     }
 
-    /// Deposit chain the block starts from; see [`accumulate_deposit`].
-    pub fn old_deposit_chain(&self) -> [u8; 32] {
-        self.old_deposit_chain
+    /// Inbox chain the block starts from.
+    pub fn old_inbox_chain(&self) -> [u8; 32] {
+        self.old_inbox_chain
     }
 
-    /// Deposit chain the block's deposits fold it to. Equal to `old_deposit_chain` when the block
-    /// contains no deposits.
-    pub fn new_deposit_chain(&self) -> [u8; 32] {
-        self.new_deposit_chain
-    }
-
-    /// Request chain the block starts from; see [`accumulate_request`].
-    pub fn old_request_chain(&self) -> [u8; 32] {
-        self.old_request_chain
-    }
-
-    /// Request chain the block's forced withdrawals fold it to. Equal to `old_request_chain` when
-    /// the block answers no requests.
-    pub fn new_request_chain(&self) -> [u8; 32] {
-        self.new_request_chain
+    /// Inbox chain after deposits and forced withdrawals are folded in transaction order.
+    pub fn new_inbox_chain(&self) -> [u8; 32] {
+        self.new_inbox_chain
     }
 
     pub fn withdrawal_root(&self) -> [u8; 32] {
@@ -802,13 +788,13 @@ impl Block {
     }
 }
 
-/// Where the deposit chain starts: no deposit has ever been accepted.
+/// Where the L1 inbox chain starts: no deposit or forced withdrawal has been accepted.
 ///
 /// Thirty-two zero bytes, matching the genesis state root, and for the same reason -- a chain over
 /// nothing should be the value a fresh contract holds without having to be told.
-pub const DEPOSIT_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
+pub const INBOX_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
 
-/// Fold one deposit into the running chain.
+/// Fold one deposit into the running L1 inbox chain.
 ///
 /// This is how the settlement contract knows a batch credited exactly the deposits L1 accepted, and
 /// no others. The contract extends the chain as each deposit arrives; the guest folds the same hash
@@ -826,11 +812,11 @@ pub const DEPOSIT_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
 /// or the L1 payer's address would not be, so committing to either would mean carrying it on the
 /// wire forever to buy something the chaining already provides.
 ///
-/// The preimage is 79 bytes, far inside [`AVM_MAX_BYTE_SLICE`]. The domain tag keeps a chain value
+/// The preimage is 78 bytes, far inside [`AVM_MAX_BYTE_SLICE`]. The domain tag keeps a chain value
 /// from ever being mistakable for a state root, a chunk digest, or a chunk accumulator.
 pub fn accumulate_deposit(chain: &[u8; 32], receiver: &Address, amount: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"DEPOSIT");
+    hasher.update(b"INBOXD");
     hasher.update(chain);
     hasher.update(receiver);
     hasher.update(amount.to_be_bytes());
@@ -961,14 +947,7 @@ pub fn withdrawal_claims(
         .collect())
 }
 
-/// Where the request chain starts: no withdrawal has ever been demanded from L1.
-///
-/// An anchor spanning the whole history, like [`DEPOSIT_CHAIN_GENESIS`] and unlike
-/// the empty withdrawal root -- the settlement contract builds this one and the guest has to land
-/// on it, which is the same direction deposits run in.
-pub const REQUEST_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
-
-/// Fold one L1 withdrawal request into the running chain.
+/// Fold one L1 withdrawal request into the running L1 inbox chain.
 ///
 /// This is what closes the censorship hole that ordinary [`Withdrawal`]s leave open. A withdrawal
 /// handed to the sequencer can be dropped and nobody outside would know; a request folded in here
@@ -980,11 +959,11 @@ pub const REQUEST_CHAIN_GENESIS: [u8; 32] = [0u8; 32];
 /// Exactly the shape of [`accumulate_deposit`], and for the same reasons -- both ends pinned so a
 /// fabricated fold has nowhere to anchor, and only fields the guest can rebuild from the batch
 /// bytes in the preimage. There is no amount here because a request does not name one: it empties
-/// the account, and the balance is read from the state during replay. The 103-byte preimage is far
+/// the account, and the balance is read from the state during replay. The 102-byte preimage is far
 /// inside [`AVM_MAX_BYTE_SLICE`].
 pub fn accumulate_request(chain: &[u8; 32], address: &Address, recipient: &L1Address) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"REQUEST");
+    hasher.update(b"INBOXW");
     hasher.update(chain);
     hasher.update(address);
     hasher.update(recipient);
@@ -1071,8 +1050,7 @@ fn credit(
     root_with(receiver_addr, Some(&receiver), &witness.proof)
 }
 
-/// Replay `batch` against `sidecar`, from `old_root` and `deposit_anchor`, and return the root and
-/// deposit chain it lands on.
+/// Replay `batch` against `sidecar`, from `old_root` and `inbox_anchor`.
 ///
 /// This is the guest's entry point, and it is deliberately not told what to expect for either: the
 /// settlement contract compares both returned values against what it has stored, so there is no
@@ -1085,7 +1063,7 @@ fn credit(
 ///
 /// A deposit writes one. There is no sender to debit, so total balances rise -- the mint is backed
 /// by the settlement contract's own ALGO rather than by conservation inside the tree, and what
-/// authorizes it is the deposit chain: see [`accumulate_deposit`]. A reserve account funding
+/// authorizes it is the inbox chain: see [`accumulate_deposit`]. A reserve account funding
 /// deposits from inside the tree would only relocate the mint, since the reserve would have to be
 /// minted into as well, at the cost of a second write and witness on every deposit.
 ///
@@ -1105,19 +1083,17 @@ pub fn verify_batch(
     domain: &DeploymentDomain,
     batch_bytes: &[u8],
     old_root: [u8; 32],
-    deposit_anchor: [u8; 32],
-    request_anchor: [u8; 32],
+    inbox_anchor: [u8; 32],
     batch: &Batch,
     sidecar: &Sidecar,
-) -> Result<([u8; 32], [u8; 32], [u8; 32], [u8; 32], u64), VerificationError> {
+) -> Result<([u8; 32], [u8; 32], [u8; 32], u64), VerificationError> {
     if batch.txns.len() != sidecar.entries.len() {
         return Err(VerificationError::SidecarLengthMismatch);
     }
 
     let mut root = old_root;
     let batch_commitment = batch_commitment(domain, batch_bytes);
-    let mut deposit_chain = deposit_anchor;
-    let mut request_chain = request_anchor;
+    let mut inbox_chain = inbox_anchor;
     let mut payouts = Vec::new();
 
     for (txn, entry) in batch.txns.iter().zip(&sidecar.entries) {
@@ -1138,7 +1114,7 @@ pub fn verify_batch(
                 let (receiver_addr, amt) = (deposit.receiver, deposit.amount);
 
                 root = credit(&receiver_addr, &entry.receiver_witness, amt, root)?;
-                deposit_chain = accumulate_deposit(&deposit_chain, &receiver_addr, amt);
+                inbox_chain = accumulate_deposit(&inbox_chain, &receiver_addr, amt);
             }
             (Transaction::Withdrawal(withdrawal), TxnSidecar::Withdrawal(entry)) => {
                 let (sender_addr, recipient, amt) = (
@@ -1202,7 +1178,7 @@ pub fn verify_batch(
                 // Folded either way. A request the batch could not pay is still a request the batch
                 // answered, and leaving it unconsumed would wedge the rollup on an account that can
                 // never be worth enough to empty.
-                request_chain = accumulate_request(&request_chain, &address, &recipient);
+                inbox_chain = accumulate_request(&inbox_chain, &address, &recipient);
             }
             _ => return Err(VerificationError::SidecarKindMismatch),
         }
@@ -1210,9 +1186,8 @@ pub fn verify_batch(
 
     Ok((
         root,
-        deposit_chain,
+        inbox_chain,
         withdrawal_root(&batch_commitment, &payouts)?,
-        request_chain,
         payouts.len() as u64,
     ))
 }
@@ -1357,38 +1332,33 @@ pub fn batch_commitment(domain: &DeploymentDomain, batch_bytes: &[u8]) -> [u8; 3
     accumulator
 }
 
-pub const PUBLIC_VALUES_SIZE: usize = 32 * 8 + 8;
+pub const PUBLIC_VALUES_SIZE: usize = 32 * 6 + 8;
 
-/// What a proof exposes: the two roots, which batch got between them, the two ends of each chain the
-/// batch consumed, and the withdrawal root and count it produced.
+/// What a proof exposes: the two roots, batch commitment, unified inbox endpoints, and the
+/// withdrawal root and count.
 ///
 /// ```text
 /// [  0.. 32)  old_root
 /// [ 32.. 64)  new_root
 /// [ 64.. 96)  batch_commitment
-/// [ 96..128)  old_deposit_chain
-/// [128..160)  new_deposit_chain
+/// [ 96..128)  old_inbox_chain
+/// [128..160)  new_inbox_chain
 /// [160..192)  withdrawal_root
-/// [192..224)  old_request_chain
-/// [224..256)  new_request_chain
-/// [256..264)  withdrawal_count (u64, big-endian)
+/// [192..200)  withdrawal_count (u64, big-endian)
 /// ```
 ///
-/// Laid out here so the guest and the settlement contract read the same 264 bytes the same way. The
+/// Laid out here so the guest and the settlement contract read the same 200 bytes the same way. The
 /// contract's side is: check `old_root` against the root it has stored, check the commitment
 /// against a hash of the batch bytes it was handed across the preceding transactions, check both
-/// deposit-chain ends and both request-chain ends against what it has recorded, verify the proof,
+/// inbox-chain ends against what it has recorded, verify the proof,
 /// store `new_root`, and store the withdrawal root when its count is nonzero.
 ///
-/// The two pairs of chain ends are the same mechanism pointed at two different failures. The
-/// deposit pair makes a batch credit exactly what L1 accepted, so value cannot be minted. The
-/// request pair makes a batch answer exactly the withdrawals L1 was asked to force, so value cannot
-/// be trapped -- an ignored request leaves the fold short of the value the contract holds, and no
-/// batch settles again until it is consumed.
+/// One chain preserves the global L1 order between deposits and forced withdrawals. It makes a
+/// batch credit exactly what L1 accepted and answer every forced withdrawal in that same order.
 ///
 /// The commitment check is what makes the data available: the bytes have to be presented to the
 /// contract, not merely promised, or the root advances with nothing to reconstruct state from. The
-/// two deposit-chain checks are what make the batch's deposits exactly L1's; see
+/// two inbox-chain checks are what make the batch's L1 items exactly L1's; see
 /// [`accumulate_deposit`]. Both ends are pinned rather than just the last, so a prover cannot pick
 /// an anchor that makes a fabricated fold land correctly.
 ///
@@ -1400,11 +1370,9 @@ pub fn public_values(
     old_root: &[u8; 32],
     new_root: &[u8; 32],
     batch_bytes: &[u8],
-    old_deposit_chain: &[u8; 32],
-    new_deposit_chain: &[u8; 32],
+    old_inbox_chain: &[u8; 32],
+    new_inbox_chain: &[u8; 32],
     withdrawal_root: &[u8; 32],
-    old_request_chain: &[u8; 32],
-    new_request_chain: &[u8; 32],
     withdrawal_count: u64,
 ) -> [u8; PUBLIC_VALUES_SIZE] {
     let mut buf = [0u8; PUBLIC_VALUES_SIZE];
@@ -1412,12 +1380,10 @@ pub fn public_values(
     buf[..32].copy_from_slice(old_root);
     buf[32..64].copy_from_slice(new_root);
     buf[64..96].copy_from_slice(&batch_commitment(domain, batch_bytes));
-    buf[96..128].copy_from_slice(old_deposit_chain);
-    buf[128..160].copy_from_slice(new_deposit_chain);
+    buf[96..128].copy_from_slice(old_inbox_chain);
+    buf[128..160].copy_from_slice(new_inbox_chain);
     buf[160..192].copy_from_slice(withdrawal_root);
-    buf[192..224].copy_from_slice(old_request_chain);
-    buf[224..256].copy_from_slice(new_request_chain);
-    buf[256..264].copy_from_slice(&withdrawal_count.to_be_bytes());
+    buf[192..200].copy_from_slice(&withdrawal_count.to_be_bytes());
 
     buf
 }
@@ -1460,71 +1426,64 @@ impl std::error::Error for ExecutionError {}
 /// The whole of what a proof asserts, computed from the same bytes the guest is handed.
 ///
 /// This is the guest program with the zkVM taken out: decode both halves, replay from `old_root`
-/// and `deposit_anchor`, and lay out the public values. The guest is a wrapper that reads its six
+/// and `inbox_anchor`, and lay out the public values. The guest is a wrapper that reads its five
 /// inputs, calls this, and commits what comes back -- so there is one implementation of "what this
 /// proof says", and a host can reach the committed values without proving anything.
 ///
 /// Note there is still no expected root among the inputs, and for the same reason no expected
-/// deposit chain. The replay reports where it landed on both, and the settlement contract is the
+/// inbox chain. The replay reports where it landed on both, and the settlement contract is the
 /// only thing that decides whether those are the values it was holding.
 pub fn execute(
     domain: DeploymentDomain,
     old_root: [u8; 32],
-    deposit_anchor: [u8; 32],
-    request_anchor: [u8; 32],
+    inbox_anchor: [u8; 32],
     batch_bytes: &[u8],
     sidecar_bytes: &[u8],
 ) -> Result<[u8; PUBLIC_VALUES_SIZE], ExecutionError> {
     let batch = Batch::decode(batch_bytes)?;
     let sidecar = Sidecar::decode(sidecar_bytes, &batch)?;
 
-    let (new_root, new_deposit_chain, withdrawal_root, new_request_chain, withdrawal_count) =
-        verify_batch(
-            &domain,
-            batch_bytes,
-            old_root,
-            deposit_anchor,
-            request_anchor,
-            &batch,
-            &sidecar,
-        )?;
+    let (new_root, new_inbox_chain, withdrawal_root, withdrawal_count) = verify_batch(
+        &domain,
+        batch_bytes,
+        old_root,
+        inbox_anchor,
+        &batch,
+        &sidecar,
+    )?;
 
     Ok(public_values(
         &domain,
         &old_root,
         &new_root,
         batch_bytes,
-        &deposit_anchor,
-        &new_deposit_chain,
+        &inbox_anchor,
+        &new_inbox_chain,
         &withdrawal_root,
-        &request_anchor,
-        &new_request_chain,
         withdrawal_count,
     ))
 }
 
-/// Replay a whole [`Block`] and check it reaches its own `new_root` and `new_deposit_chain`.
+/// Replay a whole [`Block`] and check it reaches its claimed roots and inbox chain.
 ///
 /// The sequencer-side convenience wrapper around [`verify_batch`]: a block already carries the
 /// values it claims, so this is the one place `RootMismatch` can come from. The guest calls
 /// [`verify_batch`] directly and lets the settlement contract make the comparison.
 pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
     let batch_bytes = block.batch.encode();
-    let (root, deposit_chain, withdrawal_root, request_chain, withdrawal_count) = verify_batch(
+    let (root, inbox_chain, withdrawal_root, withdrawal_count) = verify_batch(
         &block.domain,
         &batch_bytes,
         block.old_root,
-        block.old_deposit_chain,
-        block.old_request_chain,
+        block.old_inbox_chain,
         &block.batch,
         &block.sidecar,
     )?;
 
     if root == block.new_root
-        && deposit_chain == block.new_deposit_chain
+        && inbox_chain == block.new_inbox_chain
         && withdrawal_root == block.withdrawal_root
         && withdrawal_count == block.withdrawal_count
-        && request_chain == block.new_request_chain
     {
         Ok(())
     } else {
@@ -1538,11 +1497,8 @@ pub struct Ledger {
     /// Commitment to `accounts`, kept in step with every write so [`Ledger::state_root`] is always
     /// current.
     tree: SparseMerkleTree,
-    /// Fold over every deposit this ledger has applied, mirroring what the settlement contract
-    /// holds. Never reset -- it is an anchor, not a per-block accumulator.
-    deposit_chain: [u8; 32],
-    /// The same, for L1 withdrawal requests this ledger has answered.
-    request_chain: [u8; 32],
+    /// Fold over every L1 inbox item this ledger has applied. Never reset across blocks.
+    inbox_chain: [u8; 32],
 }
 
 impl Default for Ledger {
@@ -1563,8 +1519,7 @@ impl Ledger {
             domain,
             accounts: HashMap::new(),
             tree: SparseMerkleTree::new(),
-            deposit_chain: DEPOSIT_CHAIN_GENESIS,
-            request_chain: REQUEST_CHAIN_GENESIS,
+            inbox_chain: INBOX_CHAIN_GENESIS,
         }
     }
 
@@ -1572,14 +1527,9 @@ impl Ledger {
         self.domain
     }
 
-    /// The deposit chain as it stands, which is what the next block will anchor to.
-    pub fn deposit_chain(&self) -> [u8; 32] {
-        self.deposit_chain
-    }
-
-    /// The request chain as it stands, which is what the next block will anchor to.
-    pub fn request_chain(&self) -> [u8; 32] {
-        self.request_chain
+    /// The inbox chain as it stands, which is what the next block will anchor to.
+    pub fn inbox_chain(&self) -> [u8; 32] {
+        self.inbox_chain
     }
 
     pub fn account(&self, address: &Address) -> Option<&Account> {
@@ -1623,8 +1573,7 @@ impl Ledger {
     /// is what fixes which nonce each signature has to cover.
     pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
         let old_root = self.state_root();
-        let old_deposit_chain = self.deposit_chain;
-        let old_request_chain = self.request_chain;
+        let old_inbox_chain = self.inbox_chain;
         let mut payouts = Vec::new();
         let mut txns = Vec::with_capacity(stxns.len());
         let mut entries = Vec::with_capacity(stxns.len());
@@ -1648,8 +1597,8 @@ impl Ledger {
                 SignedTransaction::Deposit { deposit } => {
                     let receiver_witness = self.credit(deposit.receiver, deposit.amount);
 
-                    self.deposit_chain =
-                        accumulate_deposit(&self.deposit_chain, &deposit.receiver, deposit.amount);
+                    self.inbox_chain =
+                        accumulate_deposit(&self.inbox_chain, &deposit.receiver, deposit.amount);
 
                     entries.push(TxnSidecar::Deposit(DepositSidecar { receiver_witness }));
 
@@ -1706,8 +1655,8 @@ impl Ledger {
                         );
                     }
 
-                    self.request_chain =
-                        accumulate_request(&self.request_chain, &address, &forced.recipient);
+                    self.inbox_chain =
+                        accumulate_request(&self.inbox_chain, &address, &forced.recipient);
 
                     entries.push(TxnSidecar::ForcedWithdrawal(ForcedWithdrawalSidecar {
                         sender_witness,
@@ -1728,10 +1677,8 @@ impl Ledger {
             domain: self.domain,
             old_root,
             new_root: self.state_root(),
-            old_deposit_chain,
-            new_deposit_chain: self.deposit_chain,
-            old_request_chain,
-            new_request_chain: self.request_chain,
+            old_inbox_chain,
+            new_inbox_chain: self.inbox_chain,
             withdrawal_root,
             withdrawal_count: payouts.len() as u64,
             batch,
@@ -1984,8 +1931,7 @@ mod tests {
                 &block.domain,
                 &block.batch.encode(),
                 block.old_root,
-                block.old_deposit_chain,
-                block.old_request_chain,
+                block.old_inbox_chain,
                 &block.batch,
                 &block.sidecar
             ),
@@ -1993,7 +1939,7 @@ mod tests {
         );
     }
 
-    // The settlement contract reads these 264 bytes by offset, so the layout is as load-bearing as
+    // The settlement contract reads these 200 bytes by offset, so the layout is as load-bearing as
     // the roots themselves.
     #[test]
     fn public_values_lay_out_the_transition_and_the_batch_commitment() {
@@ -2005,11 +1951,9 @@ mod tests {
             &block.old_root(),
             &block.new_root(),
             &batch_bytes,
-            &block.old_deposit_chain(),
-            &block.new_deposit_chain(),
+            &block.old_inbox_chain(),
+            &block.new_inbox_chain(),
             &block.withdrawal_root(),
-            &block.old_request_chain(),
-            &block.new_request_chain(),
             block.withdrawal_count(),
         );
 
@@ -2020,12 +1964,10 @@ mod tests {
             &values[64..96],
             &batch_commitment(&block.domain(), &batch_bytes)
         );
-        assert_eq!(&values[96..128], &block.old_deposit_chain());
-        assert_eq!(&values[128..160], &block.new_deposit_chain());
+        assert_eq!(&values[96..128], &block.old_inbox_chain());
+        assert_eq!(&values[128..160], &block.new_inbox_chain());
         assert_eq!(&values[160..192], &block.withdrawal_root());
-        assert_eq!(&values[192..224], &block.old_request_chain());
-        assert_eq!(&values[224..256], &block.new_request_chain());
-        assert_eq!(&values[256..264], &block.withdrawal_count().to_be_bytes());
+        assert_eq!(&values[192..200], &block.withdrawal_count().to_be_bytes());
 
         // The commitment is domain-separated and covers every byte, so a batch that differs
         // anywhere cannot be presented against this proof.
@@ -2102,11 +2044,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_batch_leaves_the_deposit_chain_unchanged() {
+    fn an_empty_batch_leaves_the_inbox_chain_unchanged() {
         let block = Ledger::new().get_block(vec![]);
 
-        assert_eq!(block.old_deposit_chain(), DEPOSIT_CHAIN_GENESIS);
-        assert_eq!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_eq!(block.old_inbox_chain(), INBOX_CHAIN_GENESIS);
+        assert_eq!(block.new_inbox_chain(), block.old_inbox_chain());
         assert_eq!(verify_block(&block), Ok(()));
     }
 
@@ -2120,34 +2062,34 @@ mod tests {
 
         // What L1 would hold after accepting two deposits, only one of which the batch credits.
         let contract_chain = accumulate_deposit(
-            &posted.new_deposit_chain(),
+            &posted.new_inbox_chain(),
             &address_from_public_key(SCHEME, b"b key"),
             500,
         );
 
-        assert_ne!(posted.new_deposit_chain(), contract_chain);
+        assert_ne!(posted.new_inbox_chain(), contract_chain);
     }
 
     #[test]
-    fn the_deposit_chain_pins_order() {
+    fn the_inbox_chain_pins_deposit_order() {
         let ab = Ledger::new()
             .get_block(vec![deposit(b"a key", 1_000), deposit(b"b key", 500)])
-            .new_deposit_chain();
+            .new_inbox_chain();
         let ba = Ledger::new()
             .get_block(vec![deposit(b"b key", 500), deposit(b"a key", 1_000)])
-            .new_deposit_chain();
+            .new_inbox_chain();
 
         assert_ne!(ab, ba);
     }
 
     #[test]
-    fn the_deposit_chain_pins_count() {
+    fn the_inbox_chain_pins_deposit_count() {
         let one = Ledger::new()
             .get_block(vec![deposit(b"a key", 1_000)])
-            .new_deposit_chain();
+            .new_inbox_chain();
         let two = Ledger::new()
             .get_block(vec![deposit(b"a key", 1_000), deposit(b"a key", 1_000)])
-            .new_deposit_chain();
+            .new_inbox_chain();
 
         assert_ne!(one, two);
     }
@@ -2161,12 +2103,12 @@ mod tests {
         let block = ledger.get_block(vec![deposit(b"a key", 1_000), deposit(b"a key", 1_000)]);
 
         let first = accumulate_deposit(
-            &DEPOSIT_CHAIN_GENESIS,
+            &INBOX_CHAIN_GENESIS,
             &address_from_public_key(SCHEME, b"a key"),
             1_000,
         );
 
-        assert_ne!(first, block.new_deposit_chain());
+        assert_ne!(first, block.new_inbox_chain());
         assert_eq!(
             ledger
                 .account(&address_from_public_key(SCHEME, b"a key"))
@@ -2194,7 +2136,7 @@ mod tests {
         assert_eq!(verify_block(&forged), Ok(()));
 
         // It is detectable against L1's chain, which is the only copy that counts.
-        assert_ne!(forged.new_deposit_chain(), real.new_deposit_chain());
+        assert_ne!(forged.new_inbox_chain(), real.new_inbox_chain());
     }
 
     #[test]
@@ -2221,8 +2163,7 @@ mod tests {
                 &block.domain,
                 &block.batch.encode(),
                 block.old_root,
-                block.old_deposit_chain,
-                block.old_request_chain,
+                block.old_inbox_chain,
                 &block.batch,
                 &block.sidecar
             ),
@@ -2263,8 +2204,7 @@ mod tests {
                 &block.domain,
                 &block.batch.encode(),
                 block.old_root,
-                block.old_deposit_chain,
-                block.old_request_chain,
+                block.old_inbox_chain,
                 &block.batch,
                 &block.sidecar
             ),
@@ -2313,9 +2253,9 @@ mod tests {
         assert_eq!(ledger.account(&b).unwrap().amount(), 150_000);
 
         // Both commitments moved, and neither is the other's.
-        assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
+        assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
         assert_ne!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
-        assert_ne!(block.withdrawal_root(), block.new_deposit_chain());
+        assert_ne!(block.withdrawal_root(), block.new_inbox_chain());
         assert_eq!(block.withdrawal_count(), 1);
     }
 
@@ -2538,7 +2478,9 @@ mod tests {
         assert_eq!(first.withdrawal_count(), MAX_WITHDRAWALS as u64);
         assert_eq!(second.withdrawal_count(), 1);
         assert_eq!(second.old_root(), first.new_root());
-        assert_eq!(second.old_request_chain(), first.new_request_chain());
+        assert_eq!(first.old_inbox_chain(), INBOX_CHAIN_GENESIS);
+        assert_ne!(first.new_inbox_chain(), first.old_inbox_chain());
+        assert_eq!(second.old_inbox_chain(), first.new_inbox_chain());
         assert_eq!(verify_block(&first), Ok(()));
         assert_eq!(verify_block(&second), Ok(()));
     }
@@ -2553,7 +2495,7 @@ mod tests {
 
         // What L1 holds once it has accepted one request.
         let demanded = accumulate_request(
-            &REQUEST_CHAIN_GENESIS,
+            &INBOX_CHAIN_GENESIS,
             &address_from_public_key(SCHEME, b"a key"),
             &l1(7),
         );
@@ -2562,37 +2504,37 @@ mod tests {
         let evasive = ledger.get_block(vec![stxn(b"a key", l1(3), 500_000)]);
 
         assert_eq!(verify_block(&evasive), Ok(()));
-        assert_eq!(evasive.new_request_chain(), REQUEST_CHAIN_GENESIS);
-        assert_ne!(evasive.new_request_chain(), demanded);
+        assert_eq!(evasive.new_inbox_chain(), INBOX_CHAIN_GENESIS);
+        assert_ne!(evasive.new_inbox_chain(), demanded);
     }
 
     #[test]
-    fn the_request_chain_pins_account_recipient_and_order() {
+    fn the_inbox_chain_pins_request_account_recipient_and_order() {
         let (a, b) = (
             address_from_public_key(SCHEME, b"a key"),
             address_from_public_key(SCHEME, b"b key"),
         );
 
         let ab = accumulate_request(
-            &accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)),
+            &accumulate_request(&INBOX_CHAIN_GENESIS, &a, &l1(1)),
             &b,
             &l1(2),
         );
         let ba = accumulate_request(
-            &accumulate_request(&REQUEST_CHAIN_GENESIS, &b, &l1(2)),
+            &accumulate_request(&INBOX_CHAIN_GENESIS, &b, &l1(2)),
             &a,
             &l1(1),
         );
 
         assert_ne!(ab, ba, "order must be committed to");
         assert_ne!(
-            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)),
-            accumulate_request(&REQUEST_CHAIN_GENESIS, &b, &l1(1)),
+            accumulate_request(&INBOX_CHAIN_GENESIS, &a, &l1(1)),
+            accumulate_request(&INBOX_CHAIN_GENESIS, &b, &l1(1)),
             "the account must be committed to"
         );
         assert_ne!(
-            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(1)),
-            accumulate_request(&REQUEST_CHAIN_GENESIS, &a, &l1(2)),
+            accumulate_request(&INBOX_CHAIN_GENESIS, &a, &l1(1)),
+            accumulate_request(&INBOX_CHAIN_GENESIS, &a, &l1(2)),
             "the recipient must be committed to"
         );
     }
@@ -2609,7 +2551,7 @@ mod tests {
         assert_eq!(verify_block(&block), Ok(()));
         assert_eq!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
         assert_eq!(block.withdrawal_count(), 0);
-        assert_ne!(block.new_request_chain(), block.old_request_chain());
+        assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
         // Untouched, including the nonce -- nothing happened to it.
         assert_eq!(ledger.account(&a).unwrap().amount(), MIN_WITHDRAWAL - 1);
         assert_eq!(ledger.account(&a).unwrap().nonce(), 0);
@@ -2624,7 +2566,7 @@ mod tests {
         assert_eq!(block.old_root(), block.new_root());
         assert_eq!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
         assert_eq!(block.withdrawal_count(), 0);
-        assert_ne!(block.new_request_chain(), block.old_request_chain());
+        assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
     }
 
     // The witness decides the payout here, which is a job it does nowhere else. It is safe for the
@@ -2660,17 +2602,27 @@ mod tests {
         assert_eq!(verify_block(&block), Err(VerificationError::StaleWitness));
     }
 
-    // Deposits and requests are the two directions the same mechanism runs in, and a batch has to
-    // satisfy both at once.
+    // Deposits and requests share one L1-ordered chain, so swapping their kinds must change it.
     #[test]
-    fn deposits_and_requests_are_independent_chains() {
+    fn cross_kind_order_changes_the_inbox_chain() {
+        let address = address_from_public_key(SCHEME, b"a key");
+        let deposit_then_request = accumulate_request(
+            &accumulate_deposit(&INBOX_CHAIN_GENESIS, &address, 1_000_000),
+            &address,
+            &l1(7),
+        );
+        let request_then_deposit = accumulate_deposit(
+            &accumulate_request(&INBOX_CHAIN_GENESIS, &address, &l1(7)),
+            &address,
+            1_000_000,
+        );
+
+        assert_ne!(deposit_then_request, request_then_deposit);
+
         let mut ledger = Ledger::new();
         let block = ledger.get_block(vec![deposit(b"a key", 1_000_000), forced(b"a key", l1(7))]);
-
         assert_eq!(verify_block(&block), Ok(()));
-        assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
-        assert_ne!(block.new_request_chain(), block.old_request_chain());
-        assert_ne!(block.new_deposit_chain(), block.new_request_chain());
+        assert_eq!(block.new_inbox_chain(), deposit_then_request);
         // Deposited and emptied in the same batch, so the payout is the whole deposit.
         assert_eq!(
             block.withdrawal_root(),
@@ -2719,10 +2671,10 @@ mod tests {
         let seed_preimage = b"BATCH".len() + 32 + size_of::<u64>();
         let digest_preimage = CHUNK_SIZE;
         let fold_preimage = b"CHUNK".len() + 32 + 32;
-        let deposit_preimage = b"DEPOSIT".len() + 32 + 32 + size_of::<u64>();
+        let deposit_preimage = b"INBOXD".len() + 32 + 32 + size_of::<u64>();
         let withdrawal_leaf_preimage = b"WLEAF".len() + 32 + 8 + 32 + size_of::<u64>();
         let withdrawal_node_preimage = b"WNODE".len() + 32 + 32;
-        let request_preimage = b"REQUEST".len() + 32 + 32 + 32;
+        let request_preimage = b"INBOXW".len() + 32 + 32 + 32;
 
         for (name, len) in [
             ("seed", seed_preimage),

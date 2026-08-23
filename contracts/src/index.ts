@@ -14,11 +14,8 @@ import { AlgorandClient, microAlgo } from "@algorandfoundation/algokit-utils";
  */
 export const CHUNK_SIZE = 4094;
 
-/**
- * Minimum balance one deposit box costs, which the depositor advances and `pruneDeposit` returns.
- * Mirrors `DEPOSIT_BOX_MBR` in the contract.
- */
-export const DEPOSIT_BOX_MBR = 38_100n;
+/** Minimum balance one inbox box costs. Mirrors `INBOX_BOX_MBR` in the contract. */
+export const INBOX_BOX_MBR = 64_100n;
 
 /**
  * Minimum balance one withdrawal queue box costs, advanced by whoever settles the batch and
@@ -44,12 +41,6 @@ export const MIN_WITHDRAWAL = 100_000n;
  * the payout or a frozen state root would keep authorizing the same one.
  */
 export const EXIT_BOX_MBR = 18_900n;
-
-/**
- * Minimum balance one pending withdrawal request costs, advanced by the requester and returned by
- * {@link RollupVerifier.pruneRequest}. Mirrors `REQUEST_BOX_MBR` in the contract.
- */
-export const REQUEST_BOX_MBR = 60_500n;
 
 /** Largest group the network will accept, and so the most chunks one send can carry. */
 const MAX_GROUP_SIZE = 16;
@@ -153,14 +144,11 @@ function boxName(prefix: string, key: bigint): Uint8Array {
   return name;
 }
 
-/** The box a deposit is filed in. */
-const depositBoxName = (nonce: bigint) => boxName("d", nonce);
+/** The box a deposit or forced withdrawal request is filed in. */
+const inboxBoxName = (index: bigint) => boxName("i", index);
 
 /** The box a settled batch's unclaimed withdrawals are queued in. */
 const withdrawalBoxName = (batchNumber: bigint) => boxName("w", batchNumber);
-
-/** The box a pending L1 withdrawal request is filed in. */
-const requestBoxName = (nonce: bigint) => boxName("r", nonce);
 
 /**
  * The bytes a holder signs to demand that their account be let out.
@@ -289,37 +277,42 @@ export class RollupVerifier {
     return verifier;
   }
 
-  /** Nonce the next deposit will take, which `openBatch` has to be told to expect. */
-  async depositCursor(): Promise<bigint> {
-    return (await this.appClient.state.global.depositCursor()) ?? 0n;
+  /** Index the next deposit or forced withdrawal request will take. */
+  async inboxCursor(): Promise<bigint> {
+    return (await this.appClient.state.global.inboxCursor()) ?? 0n;
+  }
+
+  /** First inbox entry not yet consumed by a settled batch. */
+  async settledInboxCursor(): Promise<bigint> {
+    return (await this.appClient.state.global.settledInboxCursor()) ?? 0n;
   }
 
   /**
    * Move `amount` microALGO into the rollup, credited to the L2 address `recipient`.
    *
-   * The payment carries the box's minimum balance on top of `amount`, so the depositor advances it
+   * The payment carries the inbox box's minimum balance on top of `amount`, so the depositor advances it
    * and gets it back from {@link pruneDeposit} once the deposit has settled.
    *
-   * @returns The nonce the deposit was filed under.
+   * @returns The unified inbox index the deposit was filed under.
    */
   async deposit(
     sender: algosdk.AddressWithTransactionSigner,
     recipient: Uint8Array,
     amount: bigint,
   ): Promise<bigint> {
-    const nonce = await this.depositCursor();
+    const index = await this.inboxCursor();
 
     const payment = await this.appClient.algorand.createTransaction.payment({
       sender: sender.address,
       receiver: this.appClient.appAddress,
-      amount: microAlgo(amount + DEPOSIT_BOX_MBR),
+      amount: microAlgo(amount + INBOX_BOX_MBR),
     });
 
     const result = await this.appClient.send.deposit({
       sender: sender.address,
       signer: sender.txnSigner,
       args: { payment, recipient },
-      boxReferences: [depositBoxName(nonce)],
+      boxReferences: [inboxBoxName(index)],
     });
 
     return result.return!;
@@ -328,40 +321,35 @@ export class RollupVerifier {
   /** Reclaim a settled deposit's box, refunding its minimum balance to the account that paid it. */
   async pruneDeposit(
     sender: algosdk.AddressWithTransactionSigner,
-    nonce: bigint,
+    index: bigint,
   ): Promise<void> {
     await this.appClient.send.pruneDeposit({
       sender: sender.address,
       signer: sender.txnSigner,
-      args: { nonce },
-      boxReferences: [depositBoxName(nonce)],
+      args: { index },
+      boxReferences: [inboxBoxName(index)],
       // Covers the refund's inner transaction, whose own fee the contract sets to zero.
       extraFee: microAlgo(1_000),
     });
   }
 
-  /** Nonce the next withdrawal request will take. */
+  /** Signature nonce the next withdrawal request will take. */
   async requestCursor(): Promise<bigint> {
     return (await this.appClient.state.global.requestCursor()) ?? 0n;
-  }
-
-  /** First forced-withdrawal request not yet answered by a settled batch. */
-  async settledRequestCursor(): Promise<bigint> {
-    return (await this.appClient.state.global.settledRequestCursor()) ?? 0n;
   }
 
   /**
    * Demand from L1 that an account be emptied to `recipient`, whether the sequencer likes it or not.
    *
-   * The whole balance leaves; no amount is named. Once filed, no batch can settle until it is
-   * answered, so a sequencer that wants to keep censoring has to stop settling entirely -- which
-   * starts the escape clock.
+   * The whole balance leaves; no amount is named. The request takes a strict FIFO position in the
+   * shared inbox. Earlier prefixes may settle first, but once the request becomes stale the escape
+   * watchdog requires full-prefix progress to keep extending its deadline.
    *
    * `secretKey` is the 64-byte Ed25519 secret for the key `address` derives from; it never leaves
    * this process. Padded with `opUp` fillers because verifying the signature costs more opcodes than
    * one application call is given.
    *
-   * @returns The nonce the request was filed under.
+   * @returns The unified inbox index the request was filed under.
    */
   async requestWithdrawal(
     sender: algosdk.AddressWithTransactionSigner,
@@ -370,7 +358,10 @@ export class RollupVerifier {
     recipient: string,
     secretKey: Uint8Array,
   ): Promise<bigint> {
-    const nonce = await this.requestCursor();
+    const [nonce, index] = await Promise.all([
+      this.requestCursor(),
+      this.inboxCursor(),
+    ]);
     const signature = nacl.sign.detached(
       withdrawalRequestMessage(
         await this.deploymentDomain(),
@@ -384,7 +375,7 @@ export class RollupVerifier {
     const payment = await this.appClient.algorand.createTransaction.payment({
       sender: sender.address,
       receiver: this.appClient.appAddress,
-      amount: microAlgo(REQUEST_BOX_MBR),
+      amount: microAlgo(INBOX_BOX_MBR),
     });
 
     const senderSigner = { sender: sender.address, signer: sender.txnSigner };
@@ -406,7 +397,7 @@ export class RollupVerifier {
           pubKey,
           signature,
         },
-        boxReferences: [requestBoxName(nonce)],
+        boxReferences: [inboxBoxName(index)],
       })
       .send();
 
@@ -416,13 +407,13 @@ export class RollupVerifier {
   /** Reclaim an answered request's box, refunding its minimum balance to whoever filed it. */
   async pruneRequest(
     sender: algosdk.AddressWithTransactionSigner,
-    nonce: bigint,
+    index: bigint,
   ): Promise<void> {
     await this.appClient.send.pruneRequest({
       sender: sender.address,
       signer: sender.txnSigner,
-      args: { nonce },
-      boxReferences: [requestBoxName(nonce)],
+      args: { index },
+      boxReferences: [inboxBoxName(index)],
       extraFee: microAlgo(1_000),
     });
   }
@@ -431,50 +422,48 @@ export class RollupVerifier {
    * Refund a deposit the rollup will never credit, in full, to the account that paid it.
    *
    * Only after {@link executeEscape}. The counterpart to {@link pruneDeposit}: below
-   * `settledDepositCursor` a batch consumed the deposit and only the box minimum balance is owed,
+   * `settledInboxCursor` a batch consumed the deposit and only the box minimum balance is owed,
    * at or above it the whole payment is.
    */
   async reclaimDeposit(
     sender: algosdk.AddressWithTransactionSigner,
-    nonce: bigint,
+    index: bigint,
   ): Promise<void> {
     await this.appClient.send.reclaimDeposit({
       sender: sender.address,
       signer: sender.txnSigner,
-      args: { nonce },
-      boxReferences: [depositBoxName(nonce)],
+      args: { index },
+      boxReferences: [inboxBoxName(index)],
       // Covers the refund's inner transaction, whose own fee the contract sets to zero.
       extraFee: microAlgo(1_000),
     });
   }
 
   /**
-   * Accuse the sequencer of having stopped, by pointing at the head of each pending queue.
+   * Accuse the sequencer of having stopped, by pointing at the oldest pending inbox entry.
    *
-   * Permissionless. Both heads are referenced because either can be the stale one: a deposit left
-   * uncredited, or a withdrawal request left unanswered. The contract reads their rounds and
-   * snapshots the live cursors as fixed targets. Full 256-request FIFO advances may extend the
-   * deadline, but later arrivals never move the target.
+   * Permissionless. The contract reads the entry's round and snapshots the live cursor as a fixed
+   * target. Full 256-item FIFO advances may extend the deadline, but later arrivals never move it.
    */
   async signalEscape(
     sender: algosdk.AddressWithTransactionSigner,
   ): Promise<void> {
-    const deposits =
-      (await this.appClient.state.global.settledDepositCursor()) ?? 0n;
-    const requests =
-      (await this.appClient.state.global.settledRequestCursor()) ?? 0n;
+    const [settled, live] = await Promise.all([
+      this.settledInboxCursor(),
+      this.inboxCursor(),
+    ]);
 
     await this.appClient.send.signalEscape({
       sender: sender.address,
       signer: sender.txnSigner,
       args: {},
-      boxReferences: [depositBoxName(deposits), requestBoxName(requests)],
+      boxReferences: settled < live ? [inboxBoxName(settled)] : [],
     });
   }
 
   /**
-   * Pull the escape hatch once the deadline, including any earned request-progress extensions, has
-   * run out.
+   * Pull the escape hatch once the deadline, including any earned FIFO-progress extensions, has run
+   * out.
    *
    * Permissionless and terminal: afterwards no deposit is accepted, no batch settles, the state
    * root is final, and every pending deposit is refundable through {@link reclaimDeposit}.
@@ -615,39 +604,37 @@ export class RollupVerifier {
   /**
    * Post a batch and settle it: open, accumulate every chunk, then verify.
    *
-   * The deposits the batch credits must already have been made -- `verifyBatch` compares the chain
-   * they folded on L1 against the one the batch folds to, so a missing or out-of-order deposit
-   * fails at the very end, after every chunk has been paid for.
+   * The inbox entries the batch consumes must already have been filed. `verifyBatch` compares the
+   * L1 inbox chain against the batch's fold, so a missing or out-of-order entry fails at the end.
    *
    * A nonzero withdrawal count in the public values makes the settling call fund and reference the
    * batch's claim-bitmap box.
    *
-   * `targetRequestCursor` selects the exclusive end of the forced-request prefix this batch
-   * answers. It defaults to the current live cursor, preserving the all-pending behavior, but may
-   * stop earlier so a large forced-request backlog can be settled across several batches.
+   * An optional cursor target selects the exclusive end of the unified inbox prefix this batch
+   * processes. It defaults to the live cursor and may stop earlier to split a backlog across batches.
    */
   async verifyBatch(
     sender: algosdk.AddressWithTransactionSigner,
     batch: Uint8Array,
     publicValues: Uint8Array,
-    targetRequestCursor?: bigint,
+    targets: { inboxCursor?: bigint } = {},
   ): Promise<void> {
     const batchLength = batch.byteLength;
     const senderSigner = { sender: sender.address, signer: sender.txnSigner };
-    const settledRequestCursor = await this.settledRequestCursor();
-    const requestTarget = targetRequestCursor ?? (await this.requestCursor());
+    const settledInboxCursor = await this.settledInboxCursor();
+    const targetInboxCursor = targets.inboxCursor ?? (await this.inboxCursor());
+    const checkpointBoxes =
+      targetInboxCursor > settledInboxCursor
+        ? [inboxBoxName(targetInboxCursor - 1n)]
+        : [];
 
     await this.appClient.send.openBatch({
       ...senderSigner,
       args: {
         batchLength,
-        expectedDepositCursor: await this.depositCursor(),
-        targetRequestCursor: requestTarget,
+        targetInboxCursor,
       },
-      boxReferences:
-        requestTarget > settledRequestCursor
-          ? [requestBoxName(requestTarget - 1n)]
-          : [],
+      boxReferences: checkpointBoxes,
     });
 
     const chunks = [];
@@ -674,12 +661,12 @@ export class RollupVerifier {
 
     await composer.send();
 
-    if (publicValues.byteLength !== 264) {
-      throw new Error("public values must be exactly 264 bytes");
+    if (publicValues.byteLength !== 200) {
+      throw new Error("public values must be exactly 200 bytes");
     }
     const withdrawalCount = new DataView(
       publicValues.buffer,
-      publicValues.byteOffset + 256,
+      publicValues.byteOffset + 192,
       8,
     ).getBigUint64(0);
 

@@ -49,64 +49,65 @@ const CHUNK_SIZE = 4094;
 export type Chunk = bytes;
 
 /**
- * The 264 bytes the guest commits:
+ * The 200 bytes the guest commits:
  *
  * ```text
  * [  0.. 32)  old_root
  * [ 32.. 64)  new_root
  * [ 64.. 96)  batch_commitment
- * [ 96..128)  old_deposit_chain
- * [128..160)  new_deposit_chain
+ * [ 96..128)  old_inbox_chain
+ * [128..160)  new_inbox_chain
  * [160..192)  withdrawal_root
- * [192..224)  old_request_chain
- * [224..256)  new_request_chain
- * [256..264)  withdrawal_count
+ * [192..200)  withdrawal_count
  * ```
  *
  * Mirrors `public_values`. Nothing else escapes the proof, which is why the batch itself has to
  * arrive as chunks and be folded into a commitment the contract can compare against the third
  * word.
  *
- * The two pairs of chain ends are one mechanism aimed at two opposite failures. The deposit pair
- * makes a batch credit exactly what L1 accepted, so value cannot be minted. The request pair makes a
- * batch answer exactly the withdrawals L1 was told to force, so value cannot be trapped.
+ * The inbox-chain pair binds the batch to one FIFO prefix containing both deposits and forced
+ * withdrawals. It therefore prevents both minting value L1 never received and skipping an exit L1
+ * was told to force.
  *
  * The withdrawal root and count are the odd pair out: the contract stores rather than compares
  * them. They claim what the batch authorized paying out and are checked later through independent
  * Merkle claims. See `claimWithdrawal`.
  */
-export type PublicValues = bytes<264>;
+export type PublicValues = bytes<200>;
 
 /**
- * Minimum balance the network charges for one deposit box: `2500 + 400 * (key + value)`, over a
- * 9-byte key (`"d"` and an 8-byte nonce) and an 80-byte value.
+ * Minimum balance the network charges for one inbox box: `2500 + 400 * (key + value)`, over a
+ * 9-byte key (`"i"` and an 8-byte index) and a 145-byte value.
  *
  * The depositor funds it as part of their payment and gets it back from `pruneDeposit` once the
  * deposit has settled, so a deposit costs nothing but fees in the end and the app never subsidises
  * one. Spam is paid for by the spammer for as long as it sits in the queue.
  */
-const DEPOSIT_BOX_MBR = 38_100;
+const INBOX_BOX_MBR = 64_100;
 
 /**
  * Minimum balance for one withdrawal queue box: `2500 + 400 * (key + value)`, over a 9-byte key
  * (`"w"` and an 8-byte batch number) and a 112-byte value.
  *
  * Advanced by whoever settles the batch and returned to them when the queue drains, so the app is
- * never out of pocket for holding a queue -- the same arrangement `DEPOSIT_BOX_MBR` makes for the
- * deposit side.
+ * never out of pocket for holding a queue -- the same arrangement `INBOX_BOX_MBR` makes for the
+ * inbox.
  */
 const WITHDRAWAL_BOX_MBR = 50_900;
 
 /** Maximum payable withdrawals one batch may commit, and therefore bits in its claim bitmap. */
 const MAX_WITHDRAWALS = 256;
 
+/** FIFO cursor progress required to earn one escape grace extension. */
+const ESCAPE_PROGRESS_TRANCHE = 256;
+
 /**
  * Minimum balance for one exit record: `2500 + 400 * (key + value)`, over a 33-byte key (`"e"` and
  * a 32-byte rollup address) and an 8-byte value.
  *
- * Unlike the other two, this one is never returned. The box is a permanent record that an account
- * has been paid out, and it has to outlive the exit or the same account could be exited twice
- * against a state root that is frozen and will keep proving it.
+ * Unlike the refundable queues, this one is never returned. The box is a permanent record that an
+ * account has been paid out, and it has to outlive the exit or the same account could be exited
+ * twice against a state root that is frozen and will keep proving it.
  *
  * It is funded by withholding it from the exit itself rather than by a separate payment, which is
  * what makes the accounting close: the app pays out `amount - EXIT_BOX_MBR` and its own minimum
@@ -114,15 +115,6 @@ const MAX_WITHDRAWALS = 256;
  * required to hold and not a microALGO more.
  */
 const EXIT_BOX_MBR = 18_900;
-
-/**
- * Minimum balance for one pending withdrawal request: `2500 + 400 * (key + value)`, over a 9-byte
- * key (`"r"` and an 8-byte nonce) and a 136-byte value.
- *
- * Advanced by the requester and returned by `pruneRequest` once the request has been answered, so
- * demanding an exit costs nothing but fees in the end.
- */
-const REQUEST_BOX_MBR = 60_500;
 
 /**
  * The one signature scheme a forced exit can check.
@@ -136,36 +128,30 @@ const REQUEST_BOX_MBR = 60_500;
 const SCHEME_ED25519 = "edd";
 
 /**
- * One pending deposit, exactly as much of it as anyone needs later.
+ * One unified L1 inbox entry, exactly as much of it as anyone needs later.
  *
- * `recipient` and `amount` are the two fields the deposit chain commits to, and are what the
- * sequencer reads back to build a batch that folds to the same value. The other two carry the
- * escape hatch: `payer` is where a refund goes and `round` is the clock `signalEscape` reads.
+ * `kind` distinguishes a deposit (`"d"`) from a forced withdrawal (`"w"`). `address` is the L2
+ * deposit recipient or withdrawal account; `recipient` is zero for a deposit; and `amount` is zero
+ * for a request. `payer` receives the refundable box minimum balance, while `round` is the escape
+ * clock.
  *
- * Fixed-width throughout, so the box is exactly 80 bytes and `DEPOSIT_BOX_MBR` is a constant rather
- * than something to compute per deposit.
+ * `chainAfter` checkpoints the append-only inbox chain so `openBatch` can select a bounded FIFO
+ * prefix. Fixed-width throughout, so the box is exactly 145 bytes.
  */
-type DepositRecord = {
-  /** The L2 address to credit. Not an Algorand address -- see the warning on `deposit`. */
-  recipient: bytes<32>;
-  /** microALGO to credit on L2, which is the payment less the box's own minimum balance. */
+type InboxRecord = {
+  kind: bytes<1>;
+  /** The L2 address to credit or empty. Not an Algorand address. */
+  address: bytes<32>;
+  /** The withdrawal's L1 recipient, or zero for a deposit. */
+  recipient: Account;
+  /** Deposit amount, or zero for a withdrawal request. */
   amount: uint64;
-  /**
-   * The L1 account that sent the funds.
-   *
-   * Load-bearing and not obvious: `recipient` is an L2 address and can never receive an L1
-   * payment, so a refund of any kind -- the minimum balance on `pruneDeposit`, the whole deposit on
-   * `reclaimDeposit` -- has nowhere else to go.
-   */
+  /** The L1 account that funded the box and receives its refund. */
   payer: Account;
-  /**
-   * Round the deposit was accepted in.
-   *
-   * Read by `signalEscape`, and only ever for the oldest pending deposit. Nonces are handed out in
-   * order and a round never goes backwards, so the head of the queue is the oldest thing waiting
-   * and its age is the age of the censorship.
-   */
+  /** Round the entry was accepted. */
   round: uint64;
+  /** Inbox-chain value immediately after this entry was appended. */
+  chainAfter: bytes<32>;
 };
 
 /**
@@ -191,36 +177,6 @@ function deploymentDomain(): bytes<32> {
       .concat(itob(Global.currentApplicationId.id)),
   );
 }
-
-/**
- * One withdrawal the settlement chain has been asked to force, and has not yet seen answered.
- *
- * Filed here rather than handed to the sequencer, which is the entire point: a withdrawal the
- * sequencer is merely *asked* for can be dropped without anyone outside noticing, because L1 never
- * heard of it. One of these is folded into `requestChain`, and `verifyBatch` will not settle a batch
- * that has not consumed it -- so ignoring it is not censorship of one transaction, it is a refusal
- * to settle at all, which `signalEscape` already watches for.
- *
- * No amount, because a request does not name one: it empties the account. That is what makes forced
- * inclusion safe. A request for a specific sum can be unaffordable by the time the batch reaches it,
- * so a verifier would need a rule for what to do then -- and every such rule is a lever the
- * sequencer can pull. A request for the whole balance is always satisfiable.
- *
- * `chainAfter` is a checkpoint that lets `openBatch` seal any pending prefix instead of forcing all
- * requests into one batch. Fixed-width throughout, so the box is exactly 136 bytes.
- */
-type RequestRecord = {
-  /** The rollup account to empty. Not an Algorand address. */
-  address: bytes<32>;
-  /** The L1 account to pay. This one *is* an Algorand address. */
-  recipient: Account;
-  /** Who advanced `REQUEST_BOX_MBR`, and gets it back from `pruneRequest`. */
-  requester: Account;
-  /** Round the request was accepted in, and the second clock `signalEscape` reads. */
-  round: uint64;
-  /** Request-chain value immediately after this request was appended. */
-  chainAfter: bytes<32>;
-};
 
 export class RollupVerifier extends Contract {
   /**
@@ -254,94 +210,25 @@ export class RollupVerifier extends Contract {
   /** How many of those bytes have been posted. The batch is complete when it reaches the length. */
   postedLength = GlobalState<uint64>();
 
-  /**
-   * The fold over every deposit this contract has ever accepted, in the order it accepted them.
-   *
-   * Mirrors `accumulate_deposit`. This is what makes a batch's deposits provably L1's: a batch
-   * settles only if the guest, folding the same hash over the deposits it decoded, walks from the
-   * value settled last time to the value standing here. With both ends pinned the folds between
-   * them are determined, so a batch cannot invent, drop, reorder or alter a deposit.
-   *
-   * Never reset. A batch consumes a segment of the chain, not the whole of it, which is what lets
-   * deposits keep arriving while a batch is being posted and what makes `abandonBatch` possible.
-   */
-  depositChain = GlobalState<bytes<32>>();
+  /** Append-only fold over every deposit and forced withdrawal, in their exact L1 arrival order. */
+  inboxChain = GlobalState<bytes<32>>();
 
-  /** Nonce the next deposit will be filed under. Never reset; deposits are strictly append-only. */
-  depositCursor = GlobalState<uint64>();
+  /** Index assigned to the next inbox entry. */
+  inboxCursor = GlobalState<uint64>();
 
-  /** `depositChain` as of the last settled batch: the value the next batch has to anchor to. */
-  settledDepositChain = GlobalState<bytes<32>>();
+  /** Inbox-chain anchor and exclusive cursor reached by the last settled batch. */
+  settledInboxChain = GlobalState<bytes<32>>();
+  settledInboxCursor = GlobalState<uint64>();
 
-  /** First nonce not yet settled. Everything below it is safe to prune. */
-  settledDepositCursor = GlobalState<uint64>();
+  /** Inbox-chain checkpoint and exclusive cursor selected for the open batch. */
+  sealedInboxChain = GlobalState<bytes<32>>();
+  sealedInboxCursor = GlobalState<uint64>();
 
-  /**
-   * `depositChain` at the moment the open batch was opened, and the value it has to fold to.
-   *
-   * Copied rather than moved, so deposits that arrive while the batch is in flight extend the live
-   * chain past this point without disturbing it. They belong to the next batch.
-   */
-  sealedDepositChain = GlobalState<bytes<32>>();
-
-  /** `depositCursor` at the same moment, and what `settledDepositCursor` becomes on settlement. */
-  sealedDepositCursor = GlobalState<uint64>();
-
-  /**
-   * The fold over every withdrawal this contract has been asked to force, in the order it accepted
-   * them.
-   *
-   * The deposit chain's mirror image, and the same mechanism pointed at the opposite failure. The
-   * deposit chain stops a batch crediting value L1 never received; this one stops a batch *not*
-   * paying out value L1 was told to release. Both work because the contract holds both ends and the
-   * folds between two fixed points are determined.
-   *
-   * Without it, an ordinary withdrawal is a request the sequencer can silently decline forever
-   * while settling everything else, and nothing on L1 would ever know.
-   */
-  requestChain = GlobalState<bytes<32>>();
-
-  /** Nonce the next request will be filed under. Never reset; requests are strictly append-only. */
+  /** Signature replay nonce for forced withdrawals; inbox position is tracked separately. */
   requestCursor = GlobalState<uint64>();
 
-  /** `requestChain` as of the last settled batch: the value the next batch has to anchor to. */
-  settledRequestChain = GlobalState<bytes<32>>();
-
-  /** First request nonce not yet answered. Everything below it is safe to prune. */
-  settledRequestCursor = GlobalState<uint64>();
-
-  /**
-   * Request-chain checkpoint selected for the open batch. It may stop before the live chain so a
-   * large forced-request backlog can be answered over several batches.
-   */
-  sealedRequestChain = GlobalState<bytes<32>>();
-
-  /** Exclusive request endpoint selected for this batch. */
-  sealedRequestCursor = GlobalState<uint64>();
-
-  /**
-   * The pending queue, one box per request, keyed by nonce.
-   *
-   * A sequencer needs the ordered pending list to build a batch, and `chainAfter` gives `openBatch`
-   * a checkpoint for the selected endpoint. Opening reads at most the one record immediately before
-   * that endpoint; chunk posting and settlement still read no request boxes.
-   */
-  requests = BoxMap<uint64, RequestRecord>({ keyPrefix: "r" });
-
-  /**
-   * The pending queue, one box per deposit, keyed by nonce.
-   *
-   * Deliberately not part of the inclusion mechanism -- `openBatch`, `accumulateChunk` and
-   * `verifyBatch` read **no** boxes, and that has to stay true. It is what keeps the cost of
-   * settling independent of how many deposits are queued, and what keeps the settlement path inside
-   * the eight box references a transaction is allowed.
-   *
-   * What they are for is discovery. A hash chain cannot be run backwards, so a sequencer coming up
-   * cold, or anyone auditing one, needs the ordered pending list from somewhere; without these it
-   * would have to be reconstructed from transaction history, and an ordering mistake shows up only
-   * as a `verifyBatch` that fails after the whole batch has been paid for.
-   */
-  deposits = BoxMap<uint64, DepositRecord>({ keyPrefix: "d" });
+  /** Unified FIFO inbox, keyed by the global inbox index. */
+  inbox = BoxMap<uint64, InboxRecord>({ keyPrefix: "i" });
 
   /**
    * How many batches have settled, and so the number the next one takes.
@@ -354,13 +241,10 @@ export class RollupVerifier extends Contract {
   /**
    * Unclaimed payouts, one box per settled batch that had any.
    *
-   * Per batch rather than one queue for the whole rollup, and that follows from the chain being
-   * unwound: a pointer walking backwards cannot live on a value that settlement keeps pushing
-   * forwards. Giving each batch its own chain -- anchored at zero every time, unlike the deposit
-   * chain -- makes the queues independent, so a claim against one batch neither blocks nor is
-   * blocked by another.
+   * Each batch has its own Merkle root and claim bitmap. A claim against one batch therefore neither
+   * blocks nor is blocked by another, and the box can be deleted as soon as its own bitmap drains.
    *
-   * Like `deposits`, deliberately outside the settlement path in the sense that matters: settling
+   * Like `inbox`, deliberately outside the settlement path in the sense that matters: settling
    * touches at most this one box, whatever the batch withdrew, so the cost of settling still does
    * not depend on how much is queued.
    */
@@ -384,14 +268,14 @@ export class RollupVerifier extends Contract {
    * The escape hatch has been pulled. Set once and never cleared.
    *
    * Everything that moves the rollup forward -- `deposit`, `openBatch`, `verifyBatch` -- refuses
-   * from here on, so `stateRoot` is final and the deposit queue can never be consumed by a batch.
+   * from here on, so `stateRoot` is final and the inbox can never be consumed by a batch.
    * That is what makes the pending suffix safe to refund in `reclaimDeposit`, and it is the
    * precondition a forced exit against the frozen root will need.
    *
    * One-way deliberately. A recoverable flush would have to distinguish a nonce voided by an
    * escape from one consumed by a batch, and with the sequencer free to resume between escapes
    * those ranges interleave -- there is no cursor comparison that separates them. Terminal means
-   * there is only ever one voided range, and `nonce >= settledDepositCursor` names it exactly.
+   * there is only ever one voided range, and `index >= settledInboxCursor` names it exactly.
    */
   escaped = GlobalState<boolean>();
 
@@ -400,18 +284,15 @@ export class RollupVerifier extends Contract {
    *
    * `hasValue` doubles as "an escape has been signalled", the same idiom `batchLength` uses for "a
    * batch is being posted". Deleted by `executeEscape`, or once settlement reaches every recorded
-   * target. Full FIFO request tranches may extend it without moving those targets.
+   * target. Full FIFO tranches may extend it without moving that target.
    */
   escapeDeadline = GlobalState<uint64>();
 
-  /** Deposit frontier a pending escape signal requires settlement to reach. */
-  escapeDepositTarget = GlobalState<uint64>();
-
-  /** Withdrawal-request frontier a pending escape signal requires settlement to reach. */
-  escapeRequestTarget = GlobalState<uint64>();
+  /** Inbox frontier a pending escape signal requires settlement to reach. */
+  escapeInboxTarget = GlobalState<uint64>();
 
   /**
-   * Rounds the oldest pending deposit may age before it counts as evidence the sequencer has
+   * Rounds the oldest pending inbox entry may age before it counts as evidence the sequencer has
    * stopped.
    *
    * Set at creation rather than compiled in, for two reasons. There is no `UpdateApplication`
@@ -425,8 +306,8 @@ export class RollupVerifier extends Contract {
    * Rounds between `signalEscape` and `executeEscape`.
    *
    * The grace period is what stops a signal from voiding a nearly-complete batch the instant the
-   * timeout ticks over. Each full request tranche earns one additional window, while smaller
-   * advances earn none and cannot postpone escape indefinitely.
+   * timeout ticks over. Each full inbox tranche earns one additional window, while a final partial
+   * advance clears the signal only by reaching the fixed target.
    */
   escapeGrace = GlobalState<uint64>();
 
@@ -444,15 +325,11 @@ export class RollupVerifier extends Contract {
    */
   createApplication(depositTimeout: uint64, escapeGrace: uint64): void {
     this.stateRoot.value = bzero(32);
-    this.depositChain.value = bzero(32);
-    this.settledDepositChain.value = bzero(32);
-    this.depositCursor.value = 0;
-    this.settledDepositCursor.value = 0;
-
-    this.requestChain.value = bzero(32);
-    this.settledRequestChain.value = bzero(32);
+    this.inboxChain.value = bzero(32);
+    this.settledInboxChain.value = bzero(32);
+    this.inboxCursor.value = 0;
+    this.settledInboxCursor.value = 0;
     this.requestCursor.value = 0;
-    this.settledRequestCursor.value = 0;
 
     this.escaped.value = false;
     this.depositTimeout.value = depositTimeout;
@@ -476,7 +353,7 @@ export class RollupVerifier extends Contract {
    * the chain is copied at `openBatch` rather than reset -- so one arriving mid-batch simply
    * belongs to the next one. Refusing them would mean a stuck batch could block deposits forever.
    *
-   * The payment must exceed `DEPOSIT_BOX_MBR`, and the excess is what gets credited. `rekeyTo` and
+   * The payment must exceed `INBOX_BOX_MBR`, and the excess is what gets credited. `rekeyTo` and
    * `closeRemainderTo` are pinned to zero because either would hand the app away or drain it.
    *
    * **`recipient` is an L2 address, not an Algorand address.** It is `sha256("ADDR" || scheme ||
@@ -495,7 +372,7 @@ export class RollupVerifier extends Contract {
    * Refused once the escape has been executed. New money must not enter a rollup whose root can
    * never advance again.
    *
-   * @returns The nonce the deposit was filed under, which is also its position in the chain.
+   * @returns The unified inbox index assigned to the deposit.
    */
   deposit(payment: gtxn.PaymentTxn, recipient: bytes<32>): uint64 {
     assert(!this.escaped.value, "the rollup has escaped");
@@ -506,33 +383,35 @@ export class RollupVerifier extends Contract {
         receiver: Global.currentApplicationAddress,
         closeRemainderTo: Global.zeroAddress,
         rekeyTo: Global.zeroAddress,
-        amount: { greaterThan: DEPOSIT_BOX_MBR },
+        amount: { greaterThan: INBOX_BOX_MBR },
       },
       "the deposit must pay this app more than the box minimum balance",
     );
 
-    const amount: uint64 = payment.amount - DEPOSIT_BOX_MBR;
-    const nonce = this.depositCursor.value;
+    const amount: uint64 = payment.amount - INBOX_BOX_MBR;
+    const index = this.inboxCursor.value;
 
-    this.deposits(nonce).value = {
-      recipient: recipient,
-      amount: amount,
-      payer: payment.sender,
-      round: Global.round,
-    };
-
-    // Mirrors `accumulate_deposit`. Only the two fields the guest can reconstruct from the batch
-    // bytes are hashed: an L1 nonce or `payer` would have to be carried on the wire forever to buy
-    // something the chaining already provides.
-    this.depositChain.value = sha256(
-      Bytes("DEPOSIT")
-        .concat(this.depositChain.value)
+    const chainAfter = sha256(
+      Bytes("INBOXD")
+        .concat(this.inboxChain.value)
         .concat(recipient)
         .concat(itob(amount)),
     );
-    this.depositCursor.value = nonce + 1;
 
-    return nonce;
+    this.inbox(index).value = {
+      kind: Bytes("d").toFixed({ length: 1 }),
+      address: recipient,
+      recipient: Global.zeroAddress,
+      amount: amount,
+      payer: payment.sender,
+      round: Global.round,
+      chainAfter: chainAfter,
+    };
+
+    this.inboxChain.value = chainAfter;
+    this.inboxCursor.value = index + 1;
+
+    return index;
   }
 
   /**
@@ -541,9 +420,9 @@ export class RollupVerifier extends Contract {
    * This is what makes withdrawals censorship-resistant. An ordinary `Withdrawal` is an L2
    * transaction handed to the sequencer, and a sequencer that simply never includes it is
    * indistinguishable from a busy one -- L1 never heard of it, so nothing on L1 can notice. Filing
-   * it here folds it into `requestChain`, and `verifyBatch` cannot reach the value this contract
-   * holds unless the batch consumed it. From that point the sequencer has two options, honour it or
-   * settle nothing at all, and settling nothing is what `signalEscape` is already watching for.
+   * it here gives it a strict FIFO position in `inboxChain`. Earlier prefixes may settle first, but
+   * no later inbox item can pass it. If it becomes stale, the fixed-target watchdog permits only
+   * full-tranche progress to postpone escape.
    *
    * **The whole balance leaves.** No amount is named. A request for a specific sum can be
    * unaffordable by the time a batch reaches it, and then a verifier needs a rule for what to do --
@@ -563,7 +442,8 @@ export class RollupVerifier extends Contract {
    * replays of it. It is asserted here for the same reason `openBatch` asserts its cursor: a request
    * that landed first should fail cheaply rather than produce a confusing signature error.
    *
-   * @returns The nonce the request was filed under, which is also its position in the chain.
+   * @returns The unified inbox index assigned to the request. `expectedNonce` remains only the
+   * signature replay nonce and is not the returned inbox position.
    */
   requestWithdrawal(
     payment: gtxn.PaymentTxn,
@@ -581,7 +461,7 @@ export class RollupVerifier extends Contract {
         receiver: Global.currentApplicationAddress,
         closeRemainderTo: Global.zeroAddress,
         rekeyTo: Global.zeroAddress,
-        amount: REQUEST_BOX_MBR,
+        amount: INBOX_BOX_MBR,
       },
       "the request must cover its box minimum balance exactly",
     );
@@ -607,84 +487,87 @@ export class RollupVerifier extends Contract {
       "the request is not signed by the account's key",
     );
 
+    const index = this.inboxCursor.value;
     const chainAfter = sha256(
-      Bytes("REQUEST")
-        .concat(this.requestChain.value)
+      Bytes("INBOXW")
+        .concat(this.inboxChain.value)
         .concat(address)
         .concat(recipient.bytes),
     );
 
-    this.requests(nonce).value = {
+    this.inbox(index).value = {
+      kind: Bytes("w").toFixed({ length: 1 }),
       address: address,
       recipient: recipient,
-      requester: payment.sender,
+      amount: 0,
+      payer: payment.sender,
       round: Global.round,
       chainAfter: chainAfter,
     };
 
-    // Mirrors `accumulate_request`. No amount, for the reason above; no requester and no round, for
-    // the reason `accumulate_deposit` omits its own -- the guest has to be able to rebuild every
-    // field of this preimage from the batch bytes alone.
-    this.requestChain.value = chainAfter;
+    this.inboxChain.value = chainAfter;
+    this.inboxCursor.value = index + 1;
     this.requestCursor.value = nonce + 1;
 
-    return nonce;
+    return index;
   }
 
   /**
    * Delete an answered request's box and return its minimum balance to whoever paid it.
    *
    * Permissionless, like `pruneDeposit`, and for the same reasons: only a request the chain has
-   * already accounted for can be pruned, and the refund goes to the recorded `requester` rather than
+   * already accounted for can be pruned, and the refund goes to the recorded `payer` rather than
    * the caller.
    *
    * Also allowed once the rollup has escaped, whatever the cursor says. An unanswered request is
    * exactly what an escape means -- the account is still on L2 and comes out through `forceExit`
    * instead -- so there is nothing left for the box to be waiting for.
    */
-  pruneRequest(nonce: uint64): void {
+  pruneRequest(index: uint64): void {
+    const record = clone(this.inbox(index).value);
+    assert(record.kind === Bytes("w"), "the inbox entry is not a request");
     assert(
-      nonce < this.settledRequestCursor.value || this.escaped.value,
+      index < this.settledInboxCursor.value || this.escaped.value,
       "a request cannot be pruned before the batch that answered it has settled",
     );
 
-    const requester = this.requests(nonce).value.requester;
-    this.requests(nonce).delete();
+    this.inbox(index).delete();
 
     itxn
-      .payment({ receiver: requester, amount: REQUEST_BOX_MBR, fee: 0 })
+      .payment({ receiver: record.payer, amount: INBOX_BOX_MBR, fee: 0 })
       .submit();
   }
 
   /**
    * Delete a settled deposit's box and return its minimum balance to whoever paid it.
    *
-   * Permissionless, because there is nothing to abuse: the nonce must be below
-   * `settledDepositCursor`, so only a deposit the chain has already accounted for can be pruned,
+   * Permissionless, because there is nothing to abuse: the index must be below
+   * `settledInboxCursor`, so only a deposit the chain has already accounted for can be pruned,
    * and the refund goes to the recorded `payer` rather than the caller. Deleting the box drops the
    * app's own minimum balance by exactly the amount being sent, so the two cancel and the app
    * neither gains nor loses. The caller covers the inner transaction's fee.
    *
-   * Still callable after an escape: a deposit below `settledDepositCursor` was consumed by a batch
+   * Still callable after an escape: a deposit below `settledInboxCursor` was consumed by a batch
    * that settled, so its box is stale bookkeeping either way.
    *
-   * `DEPOSIT_BOX_MBR` is below the network's own minimum balance, so this fails if `payer` has
+   * `INBOX_BOX_MBR` is below the network's own minimum balance, so this fails if `payer` has
    * since closed their account. Self-healing rather than fatal -- the payer refunds their account
    * and anyone can then prune -- and it costs the app nothing to leave the box sitting there.
    */
-  pruneDeposit(nonce: uint64): void {
+  pruneDeposit(index: uint64): void {
+    const record = clone(this.inbox(index).value);
+    assert(record.kind === Bytes("d"), "the inbox entry is not a deposit");
     assert(
-      nonce < this.settledDepositCursor.value,
+      index < this.settledInboxCursor.value,
       "a deposit cannot be pruned before the batch that consumed it has settled",
     );
 
-    const payer = this.deposits(nonce).value.payer;
-    this.deposits(nonce).delete();
+    this.inbox(index).delete();
 
     itxn
       .payment({
-        receiver: payer,
-        amount: DEPOSIT_BOX_MBR,
+        receiver: record.payer,
+        amount: INBOX_BOX_MBR,
         fee: 0,
       })
       .submit();
@@ -694,15 +577,15 @@ export class RollupVerifier extends Contract {
    * Refund a deposit the rollup will now never credit, once the escape has been executed.
    *
    * The counterpart to `pruneDeposit`, and the two together partition the queue: below
-   * `settledDepositCursor` a deposit was consumed by a settled batch and only its box minimum
+   * `settledInboxCursor` a deposit was consumed by a settled batch and only its box minimum
    * balance is owed, at or above it the deposit was never credited on L2 and the whole payment is.
-   * The boundary is exact because a batch settles every deposit pending when it was opened, so the
-   * unsettled deposits are always a contiguous suffix.
+   * The boundary is exact because every batch consumes a FIFO inbox prefix, so all unsettled entries
+   * form one contiguous suffix.
    *
    * That suffix is the only thing `escaped` has to be terminal for. While the sequencer can still
    * settle, "not yet credited" is a statement about right now; once it can't, it is permanent, and
    * a bare cursor comparison is enough to decide who is owed what. Nothing is written to the
-   * deposit chain here and nothing needs to be -- with `verifyBatch` refusing forever, the chain is
+   * inbox chain here and nothing needs to be -- with `verifyBatch` refusing forever, the chain is
    * dead state, and rewinding it would only be a second thing to keep consistent.
    *
    * Permissionless and in any order, like `pruneDeposit`: the refund goes to the recorded `payer`,
@@ -710,25 +593,25 @@ export class RollupVerifier extends Contract {
    * the box minimum balance together, and deleting the box drops the app's own minimum balance by
    * that second part, so the app is left holding exactly the L2 balances it still owes.
    */
-  reclaimDeposit(nonce: uint64): void {
+  reclaimDeposit(index: uint64): void {
     assert(
       this.escaped.value,
       "deposits can only be reclaimed after an escape",
     );
     assert(
-      nonce >= this.settledDepositCursor.value,
+      index >= this.settledInboxCursor.value,
       "this deposit was credited by a batch that settled",
     );
-    assert(nonce < this.depositCursor.value, "no such deposit");
+    assert(index < this.inboxCursor.value, "no such inbox entry");
 
-    const payer = this.deposits(nonce).value.payer;
-    const amount = this.deposits(nonce).value.amount;
-    this.deposits(nonce).delete();
+    const record = clone(this.inbox(index).value);
+    assert(record.kind === Bytes("d"), "the inbox entry is not a deposit");
+    this.inbox(index).delete();
 
     itxn
       .payment({
-        receiver: payer,
-        amount: amount + DEPOSIT_BOX_MBR,
+        receiver: record.payer,
+        amount: record.amount + INBOX_BOX_MBR,
         fee: 0,
       })
       .submit();
@@ -942,22 +825,17 @@ export class RollupVerifier extends Contract {
   /**
    * Accuse the sequencer of having stopped, by pointing at something it has left sitting.
    *
-   * Two queues can accuse it, and they catch different failures. A stale **deposit** means value is
-   * stuck outside the rollup. A stale **withdrawal request** means value is stuck inside it -- and
-   * that is the one a selective censor would otherwise walk straight through, because a sequencer
-   * that keeps crediting deposits while quietly declining to let anyone out keeps the deposit queue
-   * spotless forever.
+   * The oldest pending unified inbox entry can accuse it. A stale deposit means value is stuck
+   * outside the rollup; a stale withdrawal request means value is stuck inside it.
    *
-   * Either queue's head is enough, and the head is the right thing to read: nonces are handed out
-   * in round order, so nothing pending is older, and the head box is always present -- pruning only
-   * reaches nonces below the settled cursor. Both share `depositTimeout`, because both mean the same
-   * thing about the sequencer.
+   * The head is the right and only thing to read: indices are handed out in round order, so nothing
+   * pending is older, and pruning only reaches indices below the settled cursor.
    *
-   * `signalEscape` reads at most the two queue heads. `openBatch` separately reads one request
-   * checkpoint when selecting a non-empty prefix; neither cost depends on how much is queued.
+   * `signalEscape` reads one queue head. `openBatch` reads one checkpoint for a selected non-empty
+   * prefix; neither cost depends on how much is queued.
    *
    * Permissionless, because the accusation is checkable. Settlement either reaches the recorded
-   * targets or proves meaningful FIFO progress in full request tranches.
+   * target or proves meaningful FIFO progress in a full inbox tranche.
    */
   signalEscape(): void {
     assert(!this.escaped.value, "the rollup has already escaped");
@@ -966,33 +844,18 @@ export class RollupVerifier extends Contract {
       "an escape has already been signalled",
     );
 
-    const depositsPending =
-      this.settledDepositCursor.value < this.depositCursor.value;
-    const requestsPending =
-      this.settledRequestCursor.value < this.requestCursor.value;
-    assert(depositsPending || requestsPending, "nothing is pending");
-
-    let staleDeposit = false;
-    if (depositsPending) {
-      const head = this.deposits(this.settledDepositCursor.value).value.round;
-      staleDeposit = Global.round > head + this.depositTimeout.value;
-    }
-    let staleRequest = false;
-    if (requestsPending) {
-      const head = this.requests(this.settledRequestCursor.value).value.round;
-      staleRequest = Global.round > head + this.depositTimeout.value;
-    }
     assert(
-      staleDeposit || staleRequest,
+      this.settledInboxCursor.value < this.inboxCursor.value,
+      "nothing is pending",
+    );
+
+    const head = this.inbox(this.settledInboxCursor.value).value.round;
+    assert(
+      Global.round > head + this.depositTimeout.value,
       "nothing has been waiting long enough",
     );
 
-    if (staleDeposit) {
-      this.escapeDepositTarget.value = this.depositCursor.value;
-    }
-    if (staleRequest) {
-      this.escapeRequestTarget.value = this.requestCursor.value;
-    }
+    this.escapeInboxTarget.value = this.inboxCursor.value;
 
     this.escapeDeadline.value = Global.round + this.escapeGrace.value;
   }
@@ -1003,13 +866,13 @@ export class RollupVerifier extends Contract {
    * From here `deposit`, `openBatch` and `verifyBatch` refuse permanently, `stateRoot` is final,
    * and every pending deposit is refundable through `reclaimDeposit`.
    *
-   * Any open batch is discarded on the way, the same seven keys `abandonBatch` deletes. Doing it
+   * Any open batch is discarded on the way, the same five keys `abandonBatch` deletes. Doing it
    * here rather than requiring the creator to go first matters: the whole premise is that the
    * sequencer is gone, so a path that needs the sequencer's cooperation is not an escape hatch.
    *
    * Permissionless. There is nothing left to gate -- the deadline is the authorization, and it can
    * only have been set by pending work that exceeded `depositTimeout`, plus any grace extensions
-   * earned by full request tranches.
+   * earned by full FIFO tranches.
    */
   executeEscape(): void {
     assert(!this.escaped.value, "the rollup has already escaped");
@@ -1021,17 +884,14 @@ export class RollupVerifier extends Contract {
 
     this.escaped.value = true;
     this.escapeDeadline.delete();
-    this.escapeDepositTarget.delete();
-    this.escapeRequestTarget.delete();
+    this.escapeInboxTarget.delete();
 
     if (this.batchLength.hasValue) {
       this.chunkAccumulator.delete();
       this.batchLength.delete();
       this.postedLength.delete();
-      this.sealedDepositChain.delete();
-      this.sealedDepositCursor.delete();
-      this.sealedRequestChain.delete();
-      this.sealedRequestCursor.delete();
+      this.sealedInboxChain.delete();
+      this.sealedInboxCursor.delete();
     }
   }
 
@@ -1040,12 +900,11 @@ export class RollupVerifier extends Contract {
    *
    * `openBatch` refuses while a batch is in flight and only `verifyBatch` clears that, so without
    * this a batch that can never settle -- a mis-cut chunk, public values that do not line up --
-   * wedges the contract permanently. Deposits make that materially likelier, since there is now a
-   * second thing for a batch to disagree with.
+   * wedges the contract permanently. The inbox adds another value for a batch to disagree with.
    *
    * This is only possible because nothing was destroyed on the way in: `openBatch` copies
-   * the deposit chain rather than resetting it, so abandoning is just forgetting the copy. A design
-   * that reset the live chain per batch would have to splice deposits that arrived mid-batch back
+   * the inbox chain rather than resetting it, so abandoning is just forgetting the copy. A design
+   * that reset the live chain per batch would have to splice entries that arrived mid-batch back
    * onto a sealed chain, which cannot be done to a hash chain at all.
    *
    * Creator-gated: abandoning is harmless to the settled state but would let anyone cancel a batch
@@ -1061,37 +920,21 @@ export class RollupVerifier extends Contract {
     this.chunkAccumulator.delete();
     this.batchLength.delete();
     this.postedLength.delete();
-    this.sealedDepositChain.delete();
-    this.sealedDepositCursor.delete();
-    this.sealedRequestChain.delete();
-    this.sealedRequestCursor.delete();
+    this.sealedInboxChain.delete();
+    this.sealedInboxCursor.delete();
   }
 
   /**
    * Start a batch, seeding the accumulator from the length its bytes are declared to have and
-   * sealing the deposit chain the batch will have to fold to.
+   * sealing the inbox chain the batch will have to fold to.
    *
    * Mirrors `chunk_accumulator_seed`.
    *
-   * `expectedDepositCursor` is what the sequencer believed the queue length to be when it built the
-   * batch. It is not needed for correctness -- `verifyBatch` compares the chain itself, and would
-   * catch any disagreement -- but a deposit landing between the sequencer's snapshot and this call
-   * would otherwise not be discovered until after every chunk had been posted and paid for. Eight
-   * bytes and one assert turn that into a cheap failure here. An equal cursor implies an equal
-   * chain because the queue is strictly append-only.
-   *
-   * The seal is a copy, not a move. Deposits arriving while this batch is in flight keep extending
-   * `depositChain` past the sealed point and belong to the next batch.
-   *
-   * `targetRequestCursor` may select any prefix from the settled request cursor through the live
-   * cursor. The request immediately before it stores the matching hash-chain checkpoint, so this
-   * costs one box read regardless of the prefix length. Requests beyond the target remain pending.
+   * The target cursor may select any FIFO prefix from the settled cursor through the live cursor.
+   * The record immediately before the endpoint stores the matching hash-chain checkpoint, so
+   * opening reads at most one box regardless of prefix length. Later arrivals remain pending.
    */
-  openBatch(
-    batchLength: uint64,
-    expectedDepositCursor: uint64,
-    targetRequestCursor: uint64,
-  ): void {
+  openBatch(batchLength: uint64, targetInboxCursor: uint64): void {
     assert(
       Txn.sender === Global.creatorAddress,
       "only the creator may open a batch",
@@ -1101,16 +944,12 @@ export class RollupVerifier extends Contract {
     // a batch has to be finished before the next one begins. See `abandonBatch` for the way out.
     assert(!this.batchLength.hasValue, "a batch is already being posted");
     assert(
-      this.depositCursor.value === expectedDepositCursor,
-      "a deposit arrived after this batch was built",
+      targetInboxCursor >= this.settledInboxCursor.value,
+      "the batch cannot move the inbox cursor backwards",
     );
     assert(
-      targetRequestCursor >= this.settledRequestCursor.value,
-      "the batch cannot move the request cursor backwards",
-    );
-    assert(
-      targetRequestCursor <= this.requestCursor.value,
-      "the batch cannot answer a request that has not arrived",
+      targetInboxCursor <= this.inboxCursor.value,
+      "the batch cannot consume an inbox entry that has not arrived",
     );
 
     this.chunkAccumulator.value = sha256(
@@ -1121,16 +960,14 @@ export class RollupVerifier extends Contract {
 
     // Written unconditionally, even with nothing pending -- `verifyBatch` compares it every time,
     // so `hasValue` must never become load-bearing here. Same discipline as `chunkAccumulator`.
-    this.sealedDepositChain.value = this.depositChain.value;
-    this.sealedDepositCursor.value = this.depositCursor.value;
-    if (targetRequestCursor === this.settledRequestCursor.value) {
-      this.sealedRequestChain.value = this.settledRequestChain.value;
+    if (targetInboxCursor === this.settledInboxCursor.value) {
+      this.sealedInboxChain.value = this.settledInboxChain.value;
     } else {
-      this.sealedRequestChain.value = this.requests(
-        targetRequestCursor - 1,
+      this.sealedInboxChain.value = this.inbox(
+        targetInboxCursor - 1,
       ).value.chainAfter;
     }
-    this.sealedRequestCursor.value = targetRequestCursor;
+    this.sealedInboxCursor.value = targetInboxCursor;
   }
 
   /**
@@ -1174,7 +1011,7 @@ export class RollupVerifier extends Contract {
    * Settle a fully posted batch: check the proof against what the contract is holding, then advance
    * to what the proof landed on.
    *
-   * Six things have to line up, and each one is load-bearing:
+   * Five things have to line up, and each one is load-bearing:
    *
    * - `publicValues[0..32]` against `stateRoot` -- the proof has to start where the chain is, so a
    *   valid proof of some other transition cannot be replayed here.
@@ -1182,29 +1019,22 @@ export class RollupVerifier extends Contract {
    *   commitment, so this is what ties the transition to bytes the chain has actually recorded.
    *   Refusing to settle until the declared length has been posted in full is what makes the data
    *   available: stopping a chunk short leaves an accumulator that is not the commitment.
-   * - `publicValues[96..128]` against `settledDepositChain` -- where the batch's deposits begin.
-   * - `publicValues[128..160]` against `sealedDepositChain` -- where they end. Pinning both ends
-   *   rather than just the last is what stops a prover choosing an anchor that makes a fabricated
-   *   fold land correctly; with both fixed, the deposits between them are determined.
-   * - `publicValues[192..224]` and `publicValues[224..256]` against `settledRequestChain` and
-   *   `sealedRequestChain` -- the same two-ended pin on the request side, for the same reason one
-   *   end would not be enough.
-   * - the proof itself, over all 264 bytes.
+   * - `publicValues[96..128]` against `settledInboxChain` -- where the batch's FIFO prefix begins.
+   * - `publicValues[128..160]` against `sealedInboxChain` -- where it ends. Pinning both ends stops a
+   *   prover choosing an anchor that makes a fabricated fold land correctly.
+   * - the proof itself, over all 200 bytes.
    *
-   * **All 264, not merely the words compared above.** The withdrawal root and count have no prior
+   * **All 200, not merely the words compared above.** The withdrawal root and count have no prior
    * L1 values to compare against: they claim what the batch authorized paying out, and the root is
    * tested later in `claimWithdrawal`. That makes the proof their only defence. A verifier bound to
    * a prefix would leave them ordinary arguments, allowing a queue that pays withdrawals no batch
-   * contained. `PublicValues` is `bytes<264>` for exactly that reason.
+   * contained. `PublicValues` is `bytes<200>` for exactly that reason.
    *
-   * The two deposit checks are together what make the batch's deposits exactly L1's: inventing,
-   * dropping, reordering or altering one diverges the fold and never recovers. Note this needs no
-   * special case for a batch with no deposits -- such a batch commits `new == old`, which settles
-   * only if nothing is pending, because a pending deposit is precisely what makes the sealed chain
-   * differ from the settled one.
+   * The two inbox checks make the selected FIFO prefix exactly L1's: inventing, dropping, reordering
+   * or altering either kind of entry diverges the fold and never recovers.
    *
    * **None of that binds yet.** The proof is not verified -- see the TODO below -- and
-   * `publicValues` is an ordinary argument, so a dishonest sequencer can read `sealedDepositChain`
+   * `publicValues` is an ordinary argument, so a dishonest sequencer can read `sealedInboxChain`
    * straight out of global state and hand it back while the batch bytes say something else -- and
    * can put whatever it likes in the withdrawal root and count. The
    * chain is the right mechanism and becomes airtight the moment the verifier lands, with no
@@ -1213,15 +1043,12 @@ export class RollupVerifier extends Contract {
    * on-chain, so the fraud is detectable by replay, just not preventable.
    *
    * No box is read here, and none should ever be. That is what keeps the cost of settling
-   * independent of how many deposits are queued.
+   * independent of how many inbox entries are queued.
    *
-   * Settlement clears a pending `signalEscape` only after both settled cursors reach the frontiers
-   * recorded by the signal. While a request target remains, advancing a full 256-request FIFO
-   * tranche extends the existing deadline by one grace period. The target never moves, so each
-   * extension consumes a finite part of the signal-time backlog. Smaller advances earn nothing.
-   *
-   * An unresolved deposit target prevents extensions, so request progress cannot postpone a stale
-   * deposit's escape. Once the deadline has passed no settlement can race `executeEscape`.
+   * Settlement clears a pending `signalEscape` when the settled cursor reaches its fixed snapshot.
+   * While that target remains unresolved, advancing at least 256 FIFO entries extends the existing
+   * deadline by one grace period. Later arrivals never move the target, and a final partial prefix
+   * clears without extending. Once the deadline has passed no settlement can race `executeEscape`.
    */
   verifyBatch(publicValues: PublicValues): void {
     assert(
@@ -1243,12 +1070,10 @@ export class RollupVerifier extends Contract {
     const oldRoot = publicValues.slice(0, 32);
     const newRoot = publicValues.slice(32, 64);
     const batchCommitment = publicValues.slice(64, 96);
-    const oldDepositChain = publicValues.slice(96, 128);
-    const newDepositChain = publicValues.slice(128, 160);
+    const oldInboxChain = publicValues.slice(96, 128);
+    const newInboxChain = publicValues.slice(128, 160);
     const withdrawalRoot = publicValues.slice(160, 192);
-    const oldRequestChain = publicValues.slice(192, 224);
-    const newRequestChain = publicValues.slice(224, 256);
-    const withdrawalCount = btoi(publicValues.slice(256, 264));
+    const withdrawalCount = btoi(publicValues.slice(192, 200));
 
     assert(
       oldRoot === this.stateRoot.value,
@@ -1259,30 +1084,19 @@ export class RollupVerifier extends Contract {
       "the proof is not for the batch that was posted",
     );
     assert(
-      oldDepositChain === this.settledDepositChain.value,
-      "the proof does not start from the settled deposit chain",
+      oldInboxChain === this.settledInboxChain.value,
+      "the proof does not start from the settled inbox chain",
     );
     assert(
-      newDepositChain === this.sealedDepositChain.value,
-      "the batch does not credit exactly the deposits this contract accepted",
-    );
-    assert(
-      oldRequestChain === this.settledRequestChain.value,
-      "the proof does not start from the settled request chain",
+      newInboxChain === this.sealedInboxChain.value,
+      "the batch does not consume exactly the selected inbox prefix",
     );
 
-    assert(
-      newRequestChain === this.sealedRequestChain.value,
-      "the batch does not answer exactly the selected withdrawal-request prefix",
-    );
-
-    const oldSettledRequestCursor = this.settledRequestCursor.value;
+    const oldSettledInboxCursor = this.settledInboxCursor.value;
 
     this.stateRoot.value = newRoot.toFixed({ length: 32 });
-    this.settledDepositChain.value = this.sealedDepositChain.value;
-    this.settledDepositCursor.value = this.sealedDepositCursor.value;
-    this.settledRequestChain.value = this.sealedRequestChain.value;
-    this.settledRequestCursor.value = this.sealedRequestCursor.value;
+    this.settledInboxChain.value = this.sealedInboxChain.value;
+    this.settledInboxCursor.value = this.sealedInboxCursor.value;
 
     // A batch that withdrew nothing folds to the genesis value and opens no queue, so the common
     // case costs one comparison and no box. Otherwise the tip goes into a box of its own, and the
@@ -1331,47 +1145,17 @@ export class RollupVerifier extends Contract {
     this.chunkAccumulator.delete();
     this.batchLength.delete();
     this.postedLength.delete();
-    this.sealedDepositChain.delete();
-    this.sealedDepositCursor.delete();
-    this.sealedRequestChain.delete();
-    this.sealedRequestCursor.delete();
+    this.sealedInboxChain.delete();
+    this.sealedInboxCursor.delete();
 
-    let depositTargetAnswered = true;
-    if (
-      this.escapeDepositTarget.hasValue &&
-      this.settledDepositCursor.value < this.escapeDepositTarget.value
-    ) {
-      depositTargetAnswered = false;
-    }
-
-    let requestTargetAnswered = true;
-    if (
-      this.escapeRequestTarget.hasValue &&
-      this.settledRequestCursor.value < this.escapeRequestTarget.value
-    ) {
-      requestTargetAnswered = false;
-    }
-
-    if (depositTargetAnswered && requestTargetAnswered) {
-      this.escapeDeadline.delete();
-      this.escapeDepositTarget.delete();
-      this.escapeRequestTarget.delete();
-    } else if (
-      this.escapeDeadline.hasValue &&
-      depositTargetAnswered &&
-      this.escapeRequestTarget.hasValue &&
-      !requestTargetAnswered
-    ) {
-      const progress: uint64 =
-        this.settledRequestCursor.value - oldSettledRequestCursor;
-      const remainingBeforeBatch: uint64 =
-        this.escapeRequestTarget.value - oldSettledRequestCursor;
-      let requiredProgress: uint64 = MAX_WITHDRAWALS;
-      if (remainingBeforeBatch < MAX_WITHDRAWALS) {
-        requiredProgress = remainingBeforeBatch;
-      }
-
-      if (progress >= requiredProgress) {
+    if (this.escapeInboxTarget.hasValue) {
+      if (this.settledInboxCursor.value >= this.escapeInboxTarget.value) {
+        this.escapeInboxTarget.delete();
+        this.escapeDeadline.delete();
+      } else if (
+        this.settledInboxCursor.value - oldSettledInboxCursor >=
+        ESCAPE_PROGRESS_TRANCHE
+      ) {
         this.escapeDeadline.value =
           this.escapeDeadline.value + this.escapeGrace.value;
       }

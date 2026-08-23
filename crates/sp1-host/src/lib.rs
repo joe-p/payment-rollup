@@ -1,12 +1,12 @@
 //! Everything a settlement transaction needs, produced without a zkVM.
 //!
 //! The guest is [`payment_rollup::execute`] wrapped in zkVM io, so running that function directly
-//! gives the exact 264 bytes a proof would commit for the cost of replaying the block. What is
+//! gives the exact 200 bytes a proof would commit for the cost of replaying the block. What is
 //! missing is only the proof that the replay happened, which is precisely the part the settlement
 //! contract does not check yet.
 //!
 //! So a [`Settlement`] is the whole of a settlement's argument list: the declared batch length to
-//! open with, the chunks to post, the deposits to replay onto L1 first, the withdrawals to claim
+//! open with, the chunks to post, the ordered inbox items to replay onto L1 first, withdrawals
 //! afterwards, and the public values to settle against. See [`scenarios`] for the blocks these are
 //! built from.
 
@@ -29,9 +29,21 @@ pub use payment_rollup::{CHUNK_SIZE, PUBLIC_VALUES_SIZE};
 /// contract there -- see [`Settlement::settles_from_genesis`].
 pub const GENESIS_ROOT: [u8; 32] = [0u8; 32];
 
-/// The deposit chain a freshly deployed contract starts life holding; see
-/// [`payment_rollup::accumulate_deposit`].
-pub use payment_rollup::DEPOSIT_CHAIN_GENESIS;
+/// The unified L1 inbox chain a freshly deployed contract starts life holding.
+pub use payment_rollup::INBOX_CHAIN_GENESIS;
+
+/// One L1 action, in the global order the settlement must submit it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InboxItem {
+    Deposit {
+        recipient: Address,
+        amount: u64,
+    },
+    ForcedWithdrawal {
+        address: Address,
+        recipient: L1Address,
+    },
+}
 
 /// One block, reduced to the arguments the settlement contract takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,15 +51,14 @@ pub struct Settlement {
     domain: DeploymentDomain,
     old_root: [u8; 32],
     new_root: [u8; 32],
-    old_deposit_chain: [u8; 32],
-    new_deposit_chain: [u8; 32],
-    old_request_chain: [u8; 32],
-    new_request_chain: [u8; 32],
+    old_inbox_chain: [u8; 32],
+    new_inbox_chain: [u8; 32],
     withdrawal_root: [u8; 32],
     withdrawal_count: u64,
     deposits: Vec<(Address, u64)>,
     withdrawals: Vec<(L1Address, u64)>,
     requests: Vec<(Address, L1Address)>,
+    inbox: Vec<InboxItem>,
     txn_count: usize,
     batch_bytes: Vec<u8>,
     sidecar_bytes: Vec<u8>,
@@ -67,8 +78,7 @@ impl Settlement {
         let public_values = execute(
             block.domain(),
             block.old_root(),
-            block.old_deposit_chain(),
-            block.old_request_chain(),
+            block.old_inbox_chain(),
             &batch_bytes,
             &sidecar_bytes,
         )?;
@@ -77,10 +87,9 @@ impl Settlement {
         // the root this block claims is a real disagreement and not a redundant check. The same
         // goes for every chain.
         if public_values[32..64] != block.new_root()
-            || public_values[128..160] != block.new_deposit_chain()
+            || public_values[128..160] != block.new_inbox_chain()
             || public_values[160..192] != block.withdrawal_root()
-            || public_values[224..256] != block.new_request_chain()
-            || public_values[256..264] != block.withdrawal_count().to_be_bytes()
+            || public_values[192..200] != block.withdrawal_count().to_be_bytes()
         {
             return Err(ExecutionError::Verification(
                 VerificationError::RootMismatch,
@@ -117,19 +126,34 @@ impl Settlement {
             })
             .collect();
 
+        let inbox = txns
+            .txns()
+            .iter()
+            .filter_map(|txn| match txn {
+                Transaction::Deposit(deposit) => Some(InboxItem::Deposit {
+                    recipient: deposit.receiver(),
+                    amount: deposit.amount(),
+                }),
+                Transaction::ForcedWithdrawal(forced) => Some(InboxItem::ForcedWithdrawal {
+                    address: forced.address(),
+                    recipient: forced.recipient(),
+                }),
+                _ => None,
+            })
+            .collect();
+
         Ok(Self {
             domain: block.domain(),
             old_root: block.old_root(),
             new_root: block.new_root(),
-            old_deposit_chain: block.old_deposit_chain(),
-            new_deposit_chain: block.new_deposit_chain(),
-            old_request_chain: block.old_request_chain(),
-            new_request_chain: block.new_request_chain(),
+            old_inbox_chain: block.old_inbox_chain(),
+            new_inbox_chain: block.new_inbox_chain(),
             withdrawal_root: block.withdrawal_root(),
             withdrawal_count: block.withdrawal_count(),
             deposits,
             withdrawals,
             requests,
+            inbox,
             txn_count: block.batch().len(),
             batch_bytes,
             sidecar_bytes,
@@ -137,22 +161,20 @@ impl Settlement {
         })
     }
 
-    /// The deposit chain the batch anchors to: what the contract must have settled last time.
-    pub fn deposit_chain_from(&self) -> [u8; 32] {
-        self.old_deposit_chain
+    /// The inbox chain the batch anchors to: what the contract must have settled last time.
+    pub fn inbox_chain_from(&self) -> [u8; 32] {
+        self.old_inbox_chain
     }
 
-    /// The deposit chain the batch's deposits fold it to: what the contract must be holding when it
-    /// settles.
-    pub fn deposit_chain_to(&self) -> [u8; 32] {
-        self.new_deposit_chain
+    /// The inbox chain the batch's L1 items fold it to.
+    pub fn inbox_chain_to(&self) -> [u8; 32] {
+        self.new_inbox_chain
     }
 
     /// Every deposit the batch credits, in the order it credits them.
     ///
     /// These have to be replayed onto L1 -- one `deposit` call each, in this order -- before the
-    /// batch can settle, because [`Self::deposit_chain_to`] is only reachable by folding them in
-    /// exactly this sequence.
+    /// This is a convenience view. [`Self::inbox`] is authoritative for L1 submission order.
     pub fn deposits(&self) -> &[(Address, u64)] {
         &self.deposits
     }
@@ -169,24 +191,16 @@ impl Settlement {
         self.withdrawal_count
     }
 
-    /// The request chain the batch anchors to: what the contract must have settled last time.
-    pub fn request_chain_from(&self) -> [u8; 32] {
-        self.old_request_chain
-    }
-
-    /// The request chain the batch's forced withdrawals fold it to: what the contract must be
-    /// holding when it settles.
-    pub fn request_chain_to(&self) -> [u8; 32] {
-        self.new_request_chain
-    }
-
     /// Every L1 withdrawal request the batch answers, in the order it answers them.
     ///
-    /// These have to be filed on L1 -- one `requestWithdrawal` call each, in this order -- before
-    /// the batch can settle, for the same reason the deposits do: [`Self::request_chain_to`] is
-    /// only reachable by folding them in exactly this sequence.
+    /// This is a convenience view. [`Self::inbox`] is authoritative for L1 submission order.
     pub fn requests(&self) -> &[(Address, L1Address)] {
         &self.requests
+    }
+
+    /// Deposits and forced withdrawals in exact batch order.
+    pub fn inbox(&self) -> &[InboxItem] {
+        &self.inbox
     }
 
     /// Every withdrawal the batch makes, in the order it makes them.
@@ -223,7 +237,7 @@ impl Settlement {
         &self.sidecar_bytes
     }
 
-    /// The 264 bytes a proof would commit, and the single argument `verifyBatch` takes.
+    /// The 200 bytes a proof would commit, and the single argument `verifyBatch` takes.
     pub fn public_values(&self) -> &[u8; PUBLIC_VALUES_SIZE] {
         &self.public_values
     }
@@ -255,7 +269,7 @@ impl Settlement {
     /// tests assert exactly that. It is kept as a named invariant rather than deleted because it is
     /// the property that let the contract's `seedStateRoot` escape hatch be removed.
     pub fn settles_from_genesis(&self) -> bool {
-        self.old_root == GENESIS_ROOT && self.old_deposit_chain == DEPOSIT_CHAIN_GENESIS
+        self.old_root == GENESIS_ROOT && self.old_inbox_chain == INBOX_CHAIN_GENESIS
     }
 }
 
@@ -269,7 +283,8 @@ mod tests {
     use super::*;
 
     use payment_rollup::{
-        accumulate_chunk, accumulate_deposit, chunk_accumulator_seed, chunk_digest,
+        accumulate_chunk, accumulate_deposit, accumulate_request, chunk_accumulator_seed,
+        chunk_digest,
     };
 
     const DOMAIN: DeploymentDomain = [0x42; 32];
@@ -297,26 +312,18 @@ mod tests {
             assert_eq!(&settlement.public_values[32..64], &settlement.new_root());
             assert_eq!(
                 &settlement.public_values[96..128],
-                &settlement.deposit_chain_from()
+                &settlement.inbox_chain_from()
             );
             assert_eq!(
                 &settlement.public_values[128..160],
-                &settlement.deposit_chain_to()
+                &settlement.inbox_chain_to()
             );
             assert_eq!(
                 &settlement.public_values[160..192],
                 &settlement.withdrawal_root()
             );
             assert_eq!(
-                &settlement.public_values[192..224],
-                &settlement.request_chain_from()
-            );
-            assert_eq!(
-                &settlement.public_values[224..256],
-                &settlement.request_chain_to()
-            );
-            assert_eq!(
-                &settlement.public_values[256..264],
+                &settlement.public_values[192..200],
                 &settlement.withdrawal_count().to_be_bytes()
             );
             assert_eq!(
@@ -328,29 +335,34 @@ mod tests {
         }
     }
 
-    /// The contract's side of the deposit chain: one fold per deposit, as they arrive. If this does
-    /// not land on what the guest committed, the two implementations of the fold disagree.
+    /// The contract's side of the unified inbox: one fold per L1 action in batch order.
     #[test]
-    fn every_scenario_deposit_chain_folds_from_its_anchor() {
+    fn every_scenario_inbox_folds_from_its_anchor() {
         for scenario in scenarios::all() {
             let settlement = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
 
-            let mut chain = settlement.deposit_chain_from();
-            for (receiver, amount) in settlement.deposits() {
-                chain = accumulate_deposit(&chain, receiver, *amount);
+            let mut chain = settlement.inbox_chain_from();
+            for item in settlement.inbox() {
+                chain = match item {
+                    InboxItem::Deposit { recipient, amount } => {
+                        accumulate_deposit(&chain, recipient, *amount)
+                    }
+                    InboxItem::ForcedWithdrawal { address, recipient } => {
+                        accumulate_request(&chain, address, recipient)
+                    }
+                };
             }
 
             assert_eq!(
                 chain,
-                settlement.deposit_chain_to(),
-                "{}: replaying the deposits onto L1 must reach the chain the batch folds to",
+                settlement.inbox_chain_to(),
+                "{}: replaying the inbox onto L1 must reach the chain the batch folds to",
                 scenario.name
             );
         }
     }
 
-    // A batch with no deposits leaves the chain where it was, which is what makes the empty-deposit
-    // case need no distinguishing seed: "unchanged" is already a distinguishable commitment.
+    // A batch with no inbox items leaves the chain where it was.
     #[test]
     fn a_scenario_without_deposits_leaves_the_chain_alone() {
         let settlement = Settlement::for_block(&(scenarios::find("genesis-empty-batch")
@@ -358,11 +370,8 @@ mod tests {
             .build)(DOMAIN))
         .unwrap();
 
-        assert!(settlement.deposits().is_empty());
-        assert_eq!(
-            settlement.deposit_chain_to(),
-            settlement.deposit_chain_from()
-        );
+        assert!(settlement.inbox().is_empty());
+        assert_eq!(settlement.inbox_chain_to(), settlement.inbox_chain_from());
     }
 
     // Deposits are the only way value enters, so a scenario that moves money has to start with one.

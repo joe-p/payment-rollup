@@ -1,10 +1,9 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   CHUNK_SIZE,
-  DEPOSIT_BOX_MBR,
   EXIT_BOX_MBR,
+  INBOX_BOX_MBR,
   MIN_WITHDRAWAL,
-  REQUEST_BOX_MBR,
   RollupVerifier,
   WITHDRAWAL_BOX_MBR,
   deploymentDomain,
@@ -29,6 +28,9 @@ const bytes = (value: bigint) => {
   result.writeBigUInt64BE(value);
   return result;
 };
+
+const queueBox = (cursor: bigint) =>
+  Buffer.concat([Buffer.from("i"), bytes(cursor)]);
 
 const sha256 = (...parts: Uint8Array[]) => {
   const hash = createHash("sha256");
@@ -175,7 +177,7 @@ describe("rollup verifier", () => {
     const publicValues = Buffer.from(hex(s.publicValues));
     batchCommitment.copy(publicValues, 64);
     withdrawalRoot.copy(publicValues, 160);
-    bytes(BigInt(withdrawals.length)).copy(publicValues, 256);
+    bytes(BigInt(withdrawals.length)).copy(publicValues, 192);
 
     return {
       ...s,
@@ -195,29 +197,29 @@ describe("rollup verifier", () => {
   ): Promise<Scenario> =>
     bindScenarioToDomain(s, await client.deploymentDomain());
 
-  /**
-   * File a scenario's L1 withdrawal requests, in the order the batch answers them.
-   *
-   * The mirror of {@link replayDeposits}, and just as load-bearing: the request chain only reaches
-   * `requestChainTo` if L1 sees exactly these, exactly here.
-   */
-  const replayRequests = async (client: RollupVerifier, s: Scenario) => {
-    for (const request of s.requests) {
-      const pair = keyPairFor(request.address)!;
-      await client.requestWithdrawal(
-        sender,
-        hex(request.address),
-        pair.publicKey,
-        algosdk.encodeAddress(hex(request.recipient)),
-        pair.secretKey,
-      );
-    }
-  };
-
-  /** Everything L1 must see before a batch can settle. */
+  /** Replay the fixture's authoritative cross-kind L1 order before settlement. */
   const replayL1 = async (client: RollupVerifier, s: Scenario) => {
-    await replayDeposits(client, s);
-    await replayRequests(client, s);
+    for (const [expectedIndex, item] of s.inbox.entries()) {
+      let index: bigint;
+      if (item.kind === "deposit") {
+        index = await client.deposit(
+          sender,
+          hex(item.recipient),
+          BigInt(item.amount),
+        );
+      } else {
+        const pair = keyPairFor(item.address)!;
+        const returnedIndex = await client.requestWithdrawal(
+          sender,
+          hex(item.address),
+          pair.publicKey,
+          algosdk.encodeAddress(hex(item.recipient)),
+          pair.secretKey,
+        );
+        index = returnedIndex ?? (await client.inboxCursor()) - 1n;
+      }
+      expect(index).toBe(BigInt(expectedIndex));
+    }
   };
 
   /** Settle a scenario, funding the withdrawal queue box when the batch needs one. */
@@ -250,7 +252,7 @@ describe("rollup verifier", () => {
     }
   };
 
-  /** Replay a scenario's deposits onto L1, in the order the batch credits them. */
+  /** Replay only a scenario's deposits for tests that deliberately omit its requests. */
   const replayDeposits = async (client: RollupVerifier, s: Scenario) => {
     for (const deposit of s.deposits) {
       await client.deposit(
@@ -333,10 +335,20 @@ describe("rollup verifier", () => {
         s.newRoot,
       );
       expect(
-        Buffer.from(state.settledDepositChain!.asByteArray()!).toString("hex"),
-      ).toBe(s.depositChainTo);
+        Buffer.from(state.settledInboxChain!.asByteArray()!).toString("hex"),
+      ).toBe(s.inboxChainTo);
+      expect(state.settledInboxCursor).toBe(BigInt(s.inbox.length));
     });
   }
+
+  it("replays the Rust inbox-ordering scenario in cross-kind L1 order", () => {
+    const s = scenario("inbox-ordering");
+    expect(s.inbox.map((item) => item.kind)).toEqual([
+      "deposit",
+      "forcedWithdrawal",
+      "deposit",
+    ]);
+  });
 
   describe("batch posting", () => {
     it("rejects a settlement committed for another application", async () => {
@@ -389,7 +401,7 @@ describe("rollup verifier", () => {
       const empty = await bindScenario(client, scenario("genesis-empty-batch"));
       const publicValues = hex(empty.publicValues);
       publicValues.fill(1, 160, 192);
-      bytes(257n).copy(publicValues, 256);
+      bytes(257n).copy(publicValues, 192);
 
       await expect(
         client.verifyBatch(sender, hex(empty.batch), publicValues),
@@ -404,9 +416,9 @@ describe("rollup verifier", () => {
       const open = {
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
+          targetInboxCursor: await client.inboxCursor(),
         },
+        boxReferences: [queueBox(2n)],
       };
 
       await expect(
@@ -455,8 +467,7 @@ describe("rollup verifier", () => {
         signer: sender.txnSigner,
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: 0n,
-          targetRequestCursor: 0n,
+          targetInboxCursor: 0n,
         },
       });
       for (const chunk of s.chunks) {
@@ -478,7 +489,7 @@ describe("rollup verifier", () => {
       ).rejects.toThrow();
     });
 
-    it("chains a second settlement from the first settled root and inboxes", async () => {
+    it("chains a second settlement from the first settled root and inbox", async () => {
       const client = await RollupVerifier.create(algorand, sender);
       const firstFixture = scenario("deposits-only");
       await replayDeposits(client, firstFixture);
@@ -491,10 +502,8 @@ describe("rollup verifier", () => {
       const publicValues = hex(second.publicValues);
       hex(first.newRoot).copy(publicValues, 0);
       hex(first.newRoot).copy(publicValues, 32);
-      hex(first.depositChainTo).copy(publicValues, 96);
-      hex(first.depositChainTo).copy(publicValues, 128);
-      hex(first.requestChainTo).copy(publicValues, 192);
-      hex(first.requestChainTo).copy(publicValues, 224);
+      hex(first.inboxChainTo).copy(publicValues, 96);
+      hex(first.inboxChainTo).copy(publicValues, 128);
 
       await client.verifyBatch(sender, hex(second.batch), publicValues);
 
@@ -506,7 +515,7 @@ describe("rollup verifier", () => {
     });
   });
 
-  describe("deposit inclusion", () => {
+  describe("inbox deposit inclusion", () => {
     // Every case below settles a batch whose deposits do not match what L1 saw. The chain is what
     // catches each one, and it catches all of them the same way: the fold lands somewhere the
     // contract is not holding.
@@ -608,9 +617,9 @@ describe("rollup verifier", () => {
         signer: sender.txnSigner,
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
+          targetInboxCursor: await client.inboxCursor(),
         },
+        boxReferences: [queueBox(2n)],
       });
 
       // Mid-batch, after the seal.
@@ -632,29 +641,25 @@ describe("rollup verifier", () => {
 
       // The batch settled against the sealed chain, and the late deposit is still pending.
       const state = await client.appClient.state.global.getAll();
-      expect(state.settledDepositCursor).toBe(3n);
-      expect(state.depositCursor).toBe(4n);
+      expect(state.settledInboxCursor).toBe(3n);
+      expect(state.inboxCursor).toBe(4n);
     });
 
-    it("refuses to open a batch built before a deposit landed", async () => {
+    it("allows a batch to stop before a later pending deposit", async () => {
       const client = await RollupVerifier.create(algorand, sender);
-      const s = depositsOnly();
+      const s = await bindScenario(client, depositsOnly());
 
       await replayDeposits(client, s);
-      const stale = await client.depositCursor();
+      const stale = await client.inboxCursor();
       await client.deposit(sender, hex(s.deposits[0].recipient), 1_000n);
 
-      await expect(
-        client.appClient.send.openBatch({
-          sender: sender.address,
-          signer: sender.txnSigner,
-          args: {
-            batchLength: s.batchLength,
-            expectedDepositCursor: stale,
-            targetRequestCursor: await client.requestCursor(),
-          },
-        }),
-      ).rejects.toThrow();
+      await client.verifyBatch(sender, hex(s.batch), hex(s.publicValues), {
+        inboxCursor: stale,
+      });
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.settledInboxCursor).toBe(3n);
+      expect(state.inboxCursor).toBe(4n);
     });
   });
 
@@ -679,16 +684,17 @@ describe("rollup verifier", () => {
       // Each deposit brought its own box's minimum balance on top of what it credits, so the app
       // is never out of pocket for holding the queue.
       expect(funded - before).toBe(
-        credited + DEPOSIT_BOX_MBR * BigInt(s.deposits.length),
+        credited + INBOX_BOX_MBR * BigInt(s.deposits.length),
       );
 
       await settle(client, s);
 
+      await expect(client.pruneRequest(sender, 0n)).rejects.toThrow();
       await client.pruneDeposit(sender, 0n);
 
       const pruned = (await algorand.account.getInformation(app)).balance
         .microAlgo;
-      expect(funded - pruned).toBe(DEPOSIT_BOX_MBR);
+      expect(funded - pruned).toBe(INBOX_BOX_MBR);
     });
 
     it("refuses to prune a deposit that has not settled", async () => {
@@ -707,10 +713,10 @@ describe("rollup verifier", () => {
   describe("withdrawals", () => {
     const withdrawing = () => scenario("withdrawals");
 
-    /** Deploy, replay the deposits, settle, and hand back the queue's batch number. */
+    /** Deploy, replay the inbox, settle, and hand back the queue's batch number. */
     const settled = async (s: Scenario) => {
       const client = await RollupVerifier.create(algorand, sender);
-      await replayDeposits(client, s);
+      await replayL1(client, s);
 
       const batchNumber = await client.batchNumber();
       const bound = await settle(client, s);
@@ -861,11 +867,10 @@ describe("rollup verifier", () => {
       await settle(client, s);
 
       const names = await client.appClient.appClient.getBoxNames();
-      // The deposit boxes are asserted alongside so that this cannot pass by seeing no boxes at
-      // all -- the point is that the "w" prefix in particular is absent.
+      // The inbox boxes are asserted alongside so this cannot pass by seeing no boxes at all.
       expect(
-        names.filter((n) => n.nameRaw[0] === "d".charCodeAt(0)),
-      ).toHaveLength(s.deposits.length);
+        names.filter((n) => n.nameRaw[0] === "i".charCodeAt(0)),
+      ).toHaveLength(s.inbox.length);
       expect(
         names.filter((n) => n.nameRaw[0] === "w".charCodeAt(0)),
       ).toHaveLength(0);
@@ -1024,12 +1029,11 @@ describe("rollup verifier", () => {
 
       const state = await client.appClient.state.global.getAll();
       expect(state.escapeDeadline).toBeUndefined();
-      expect(state.escapeDepositTarget).toBeUndefined();
-      expect(state.escapeRequestTarget).toBeUndefined();
+      expect(state.escapeInboxTarget).toBeUndefined();
       await expect(client.executeEscape(sender)).rejects.toThrow();
     });
 
-    it("does not clear a deposit target created after an old batch opened", async () => {
+    it("does not clear an inbox target created after an old batch opened", async () => {
       const client = await escapable();
       const s = await bindScenario(client, scenario("deposits-only"));
       await replayDeposits(client, s);
@@ -1038,13 +1042,15 @@ describe("rollup verifier", () => {
         signer: sender.txnSigner,
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
+          targetInboxCursor: await client.inboxCursor(),
         },
+        boxReferences: [queueBox(2n)],
       });
       await client.deposit(sender, recipient(), 1_000n);
       await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
       await client.signalEscape(sender);
+      const initialDeadline = (await client.appClient.state.global.getAll())
+        .escapeDeadline;
       for (const chunk of s.chunks) {
         await client.appClient.send.accumulateChunk({
           sender: sender.address,
@@ -1059,52 +1065,9 @@ describe("rollup verifier", () => {
       });
 
       const state = await client.appClient.state.global.getAll();
-      expect(state.settledDepositCursor).toBe(3n);
-      expect(state.escapeDepositTarget).toBe(4n);
-      expect(state.escapeDeadline).toBeGreaterThan(0n);
-    });
-
-    it("does not clear a request target created after an old batch opened", async () => {
-      const client = await escapable();
-      const s = await bindScenario(client, scenario("forced-exit"));
-      const request = scenario("forced-inclusion").requests[0];
-      const pair = keyPairFor(request.address)!;
-      await replayDeposits(client, s);
-      await client.appClient.send.openBatch({
-        sender: sender.address,
-        signer: sender.txnSigner,
-        args: {
-          batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
-        },
-      });
-      await client.requestWithdrawal(
-        sender,
-        hex(request.address),
-        pair.publicKey,
-        algosdk.encodeAddress(hex(request.recipient)),
-        pair.secretKey,
-      );
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
-      await client.signalEscape(sender);
-      for (const chunk of s.chunks) {
-        await client.appClient.send.accumulateChunk({
-          sender: sender.address,
-          signer: sender.txnSigner,
-          args: { chunk: hex(chunk) },
-        });
-      }
-      await client.appClient.send.verifyBatch({
-        sender: sender.address,
-        signer: sender.txnSigner,
-        args: { publicValues: hex(s.publicValues) },
-      });
-
-      const state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(0n);
-      expect(state.escapeRequestTarget).toBe(1n);
-      expect(state.escapeDeadline).toBeGreaterThan(0n);
+      expect(state.settledInboxCursor).toBe(3n);
+      expect(state.escapeInboxTarget).toBe(4n);
+      expect(state.escapeDeadline).toBe(initialDeadline);
     });
 
     it("refuses to execute before the grace period has run out", async () => {
@@ -1161,9 +1124,9 @@ describe("rollup verifier", () => {
         signer: sender.txnSigner,
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
+          targetInboxCursor: await client.inboxCursor(),
         },
+        boxReferences: [queueBox(0n)],
       });
 
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
@@ -1174,9 +1137,9 @@ describe("rollup verifier", () => {
       const state = await client.appClient.state.global.getAll();
       expect(state.batchLength).toBeUndefined();
       expect(state.postedLength).toBeUndefined();
-      expect(state.sealedDepositCursor).toBeUndefined();
+      expect(state.sealedInboxCursor).toBeUndefined();
       expect(state.chunkAccumulator?.asByteArray()).toBeUndefined();
-      expect(state.sealedDepositChain?.asByteArray()).toBeUndefined();
+      expect(state.sealedInboxChain?.asByteArray()).toBeUndefined();
     });
 
     it("freezes the rollup once the hatch is pulled", async () => {
@@ -1194,8 +1157,7 @@ describe("rollup verifier", () => {
           signer: sender.txnSigner,
           args: {
             batchLength: s.batchLength,
-            expectedDepositCursor: 1n,
-            targetRequestCursor: 0n,
+            targetInboxCursor: 1n,
           },
         }),
       ).rejects.toThrow();
@@ -1237,9 +1199,9 @@ describe("rollup verifier", () => {
       await client.reclaimDeposit(sender, 0n);
 
       expect((await balanceOf(depositor.addr)) - stranded).toBe(
-        500_000n + DEPOSIT_BOX_MBR,
+        500_000n + INBOX_BOX_MBR,
       );
-      expect(held - (await balanceOf(app))).toBe(500_000n + DEPOSIT_BOX_MBR);
+      expect(held - (await balanceOf(app))).toBe(500_000n + INBOX_BOX_MBR);
 
       // The box is gone, so there is no second refund to collect.
       await expect(client.reclaimDeposit(sender, 0n)).rejects.toThrow();
@@ -1253,7 +1215,7 @@ describe("rollup verifier", () => {
       await expect(client.reclaimDeposit(sender, 0n)).rejects.toThrow();
     });
 
-    // `pruneDeposit` and `reclaimDeposit` partition the queue at `settledDepositCursor`, and the
+    // `pruneDeposit` and `reclaimDeposit` partition the queue at `settledInboxCursor`, and the
     // partition is what makes a bare cursor comparison enough to decide who is owed what.
     it("splits the queue at the settled cursor", async () => {
       const client = await escapable();
@@ -1322,9 +1284,9 @@ describe("rollup verifier", () => {
 
       const state = await client.appClient.state.global.getAll();
       expect(
-        Buffer.from(state.settledRequestChain!.asByteArray()!).toString("hex"),
-      ).toBe(s.requestChainTo);
-      expect(state.settledRequestCursor).toBe(1n);
+        Buffer.from(state.settledInboxChain!.asByteArray()!).toString("hex"),
+      ).toBe(s.inboxChainTo);
+      expect(state.settledInboxCursor).toBe(3n);
     });
 
     // The hole this whole mechanism exists to close. Before it, a sequencer could settle batches
@@ -1381,17 +1343,18 @@ describe("rollup verifier", () => {
       await settle(client, s);
 
       const before = await balanceOf(sender.address);
-      await client.pruneRequest(sender, 0n);
+      await expect(client.pruneDeposit(sender, 2n)).rejects.toThrow();
+      await client.pruneRequest(sender, 2n);
 
-      // The refund lands and the app's own minimum balance falls by the same amount, so the two
-      // cancel exactly as they do for a deposit box.
+      // The request and deposits share indexes and box funding; only the request at index 2 is
+      // removed here.
       expect(await balanceOf(sender.address)).toBeGreaterThan(
-        before + REQUEST_BOX_MBR - 3_000n,
+        before + INBOX_BOX_MBR - 3_000n,
       );
       const names = await client.appClient.appClient.getBoxNames();
       expect(
-        names.filter((n) => n.nameRaw[0] === "r".charCodeAt(0)),
-      ).toHaveLength(0);
+        names.filter((n) => n.nameRaw[0] === "i".charCodeAt(0)),
+      ).toHaveLength(2);
       expect(app).toBeDefined();
     });
 
@@ -1472,7 +1435,7 @@ describe("rollup verifier", () => {
         {
           sender: sender.address,
           receiver: client.appClient.appAddress,
-          amount: microAlgo(REQUEST_BOX_MBR),
+          amount: microAlgo(INBOX_BOX_MBR),
         },
       );
       const signerArgs = { sender: sender.address, signer: sender.txnSigner };
@@ -1494,7 +1457,7 @@ describe("rollup verifier", () => {
               pubKey: pair.publicKey,
               signature: stale,
             },
-            boxReferences: [Buffer.concat([Buffer.from("r"), bytes(1n)])],
+            boxReferences: [queueBox(1n)],
           })
           .send(),
       ).rejects.toThrow();
@@ -1506,7 +1469,7 @@ describe("rollup verifier", () => {
       const { request, pair } = subject();
 
       await replayDeposits(client, s);
-      const stale = await client.requestCursor();
+      const stale = await client.inboxCursor();
       await client.requestWithdrawal(
         sender,
         hex(request.address),
@@ -1520,154 +1483,149 @@ describe("rollup verifier", () => {
         sender,
         hex(bound.batch),
         hex(bound.publicValues),
-        stale,
+        { inboxCursor: stale },
       );
 
       const state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(0n);
-      expect(state.requestCursor).toBe(1n);
+      expect(state.settledInboxCursor).toBe(2n);
+      expect(state.inboxCursor).toBe(3n);
     });
 
-    it("settles a signalled request frontier across multiple batches", async () => {
-      const client = await RollupVerifier.create(
-        algorand,
-        sender,
-        TEST_DEPOSIT_TIMEOUT,
-        20n,
-      );
+    const settleSyntheticPrefix = async (
+      client: RollupVerifier,
+      oldChain: Uint8Array,
+      newChain: Uint8Array,
+      inboxCursor: bigint,
+      scenarioName:
+        "genesis-empty-batch" | "forced-exit" = "genesis-empty-batch",
+    ) => {
+      // Proof verification is still TODO, so these values intentionally isolate L1 FIFO watchdog
+      // behavior without pretending the empty Rust batch produced the synthetic inbox transition.
+      const s = await bindScenario(client, scenario(scenarioName));
+      const publicValues = hex(s.publicValues);
+      Buffer.from(oldChain).copy(publicValues, 96);
+      Buffer.from(newChain).copy(publicValues, 128);
+      await client.verifyBatch(sender, hex(s.batch), publicValues, {
+        inboxCursor,
+      });
+      return s;
+    };
+
+    it("does not extend for a sub-256 mixed FIFO prefix and clears at its fixed target", async () => {
+      const grace = 20n;
+      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
       const { request, pair } = subject();
-      const recipientAddress = algosdk.encodeAddress(hex(request.recipient));
+      const depositRecipient = hex(
+        scenario("deposits-only").deposits[0].recipient,
+      );
+      const requestRecipient = hex(request.recipient);
 
+      expect(await client.deposit(sender, depositRecipient, 1n)).toBe(0n);
       await client.requestWithdrawal(
         sender,
         hex(request.address),
         pair.publicKey,
-        recipientAddress,
+        algosdk.encodeAddress(requestRecipient),
         pair.secretKey,
       );
-      await client.requestWithdrawal(
-        sender,
-        hex(request.address),
-        pair.publicKey,
-        recipientAddress,
-        pair.secretKey,
-      );
+      expect(await client.inboxCursor()).toBe(2n);
 
-      const zero = Buffer.alloc(32);
       const firstChain = sha256(
-        tag("REQUEST"),
-        zero,
-        hex(request.address),
-        hex(request.recipient),
+        tag("INBOXD"),
+        Buffer.alloc(32),
+        depositRecipient,
+        bytes(1n),
       );
-      const secondChain = sha256(
-        tag("REQUEST"),
+      const targetChain = sha256(
+        tag("INBOXW"),
         firstChain,
         hex(request.address),
-        hex(request.recipient),
+        requestRecipient,
       );
 
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(2);
       await client.signalEscape(sender);
       const initialDeadline = (await client.appClient.state.global.getAll())
-        .escapeDeadline;
+        .escapeDeadline!;
 
-      const first = await bindScenario(client, scenario("genesis-empty-batch"));
-      const firstValues = hex(first.publicValues);
-      firstChain.copy(firstValues, 224);
-      await client.verifyBatch(sender, hex(first.batch), firstValues, 1n);
-
+      const first = await settleSyntheticPrefix(
+        client,
+        Buffer.alloc(32),
+        firstChain,
+        1n,
+      );
       let state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(1n);
-      expect(state.escapeRequestTarget).toBe(2n);
+      expect(state.settledInboxCursor).toBe(1n);
+      expect(state.escapeInboxTarget).toBe(2n);
       expect(state.escapeDeadline).toBe(initialDeadline);
 
       await expect(
         client.appClient.send.openBatch({
           sender: sender.address,
           signer: sender.txnSigner,
-          args: {
-            batchLength: first.batchLength,
-            expectedDepositCursor: 0n,
-            targetRequestCursor: 0n,
-          },
+          args: { batchLength: first.batchLength, targetInboxCursor: 0n },
         }),
       ).rejects.toThrow();
 
-      const second = await bindScenario(client, scenario("forced-exit"));
-      const secondValues = hex(second.publicValues);
-      zero.copy(secondValues, 0);
-      zero.copy(secondValues, 32);
-      zero.copy(secondValues, 96);
-      zero.copy(secondValues, 128);
-      zero.copy(secondValues, 160);
-      firstChain.copy(secondValues, 192);
-      secondChain.copy(secondValues, 224);
-      bytes(0n).copy(secondValues, 256);
-      await client.verifyBatch(sender, hex(second.batch), secondValues, 2n);
-
+      await settleSyntheticPrefix(
+        client,
+        firstChain,
+        targetChain,
+        2n,
+        "forced-exit",
+      );
       state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(2n);
-      expect(state.escapeRequestTarget).toBeUndefined();
+      expect(state.settledInboxCursor).toBe(2n);
+      expect(state.escapeInboxTarget).toBeUndefined();
       expect(state.escapeDeadline).toBeUndefined();
     });
 
-    it("extends the deadline only after a full FIFO request tranche", async () => {
+    it("extends exactly once for the first 256 of 257 FIFO entries, then clears", async () => {
       const grace = 20n;
       const client = await RollupVerifier.create(algorand, sender, 1n, grace);
-      const { request, pair } = subject();
-      const recipientAddress = algosdk.encodeAddress(hex(request.recipient));
+      const recipient = hex(scenario("deposits-only").deposits[0].recipient);
       let chain = Buffer.alloc(32);
       let firstTrancheChain = Buffer.alloc(32);
 
       for (let index = 0; index < 257; index++) {
-        await client.requestWithdrawal(
-          sender,
-          hex(request.address),
-          pair.publicKey,
-          recipientAddress,
-          pair.secretKey,
-        );
-        chain = sha256(
-          tag("REQUEST"),
-          chain,
-          hex(request.address),
-          hex(request.recipient),
-        );
+        expect(await client.deposit(sender, recipient, 1n)).toBe(BigInt(index));
+        chain = sha256(tag("INBOXD"), chain, recipient, bytes(1n));
         if (index === 255) firstTrancheChain = chain;
       }
-      const targetChain = chain;
 
       await client.signalEscape(sender);
       const initialDeadline = (await client.appClient.state.global.getAll())
         .escapeDeadline!;
-
-      const first = await bindScenario(client, scenario("genesis-empty-batch"));
-      const firstValues = hex(first.publicValues);
-      firstTrancheChain.copy(firstValues, 224);
-      await client.verifyBatch(sender, hex(first.batch), firstValues, 256n);
+      const first = await settleSyntheticPrefix(
+        client,
+        Buffer.alloc(32),
+        firstTrancheChain,
+        256n,
+      );
 
       let state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(256n);
-      expect(state.escapeRequestTarget).toBe(257n);
+      expect(state.settledInboxCursor).toBe(256n);
+      expect(state.escapeInboxTarget).toBe(257n);
       expect(state.escapeDeadline).toBe(initialDeadline + grace);
 
-      const second = await bindScenario(client, scenario("forced-exit"));
-      const secondValues = hex(second.publicValues);
-      const zero = Buffer.alloc(32);
-      zero.copy(secondValues, 0);
-      zero.copy(secondValues, 32);
-      zero.copy(secondValues, 96);
-      zero.copy(secondValues, 128);
-      zero.copy(secondValues, 160);
-      firstTrancheChain.copy(secondValues, 192);
-      targetChain.copy(secondValues, 224);
-      bytes(0n).copy(secondValues, 256);
-      await client.verifyBatch(sender, hex(second.batch), secondValues, 257n);
+      await expect(
+        client.appClient.send.openBatch({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { batchLength: first.batchLength, targetInboxCursor: 255n },
+        }),
+      ).rejects.toThrow();
 
+      await settleSyntheticPrefix(
+        client,
+        firstTrancheChain,
+        chain,
+        257n,
+        "forced-exit",
+      );
       state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(257n);
-      expect(state.escapeRequestTarget).toBeUndefined();
+      expect(state.settledInboxCursor).toBe(257n);
+      expect(state.escapeInboxTarget).toBeUndefined();
       expect(state.escapeDeadline).toBeUndefined();
     }, 120_000);
 
@@ -1684,9 +1642,9 @@ describe("rollup verifier", () => {
         signer: sender.txnSigner,
         args: {
           batchLength: s.batchLength,
-          expectedDepositCursor: await client.depositCursor(),
-          targetRequestCursor: await client.requestCursor(),
+          targetInboxCursor: await client.inboxCursor(),
         },
+        boxReferences: [queueBox(1n)],
       });
 
       await client.requestWithdrawal(
@@ -1711,13 +1669,12 @@ describe("rollup verifier", () => {
       });
 
       const state = await client.appClient.state.global.getAll();
-      expect(state.settledRequestCursor).toBe(0n);
-      expect(state.requestCursor).toBe(1n);
+      expect(state.settledInboxCursor).toBe(2n);
+      expect(state.inboxCursor).toBe(3n);
     });
 
-    // The point of the second escape clock. A sequencer that keeps crediting deposits while
-    // declining to let anyone out leaves the deposit queue spotless, so the deposit clock never
-    // fires -- and before this, nothing else would either.
+    // A sequencer that credited the earlier deposits but ignores the next request still leaves a
+    // stale unified inbox head that can trigger escape.
     it("lets a censored withdrawal trigger the escape on its own", async () => {
       const client = await RollupVerifier.create(
         algorand,
@@ -1728,12 +1685,12 @@ describe("rollup verifier", () => {
       const s = scenario("forced-exit");
       const { request, pair } = subject();
 
-      // The rollup is live and its deposit queue is clean: every deposit has been credited.
+      // The rollup is live and its inbox is clean: every earlier deposit has been credited.
       await replayDeposits(client, s);
       await settle(client, s);
 
       const state = await client.appClient.state.global.getAll();
-      expect(state.settledDepositCursor).toBe(state.depositCursor);
+      expect(state.settledInboxCursor).toBe(state.inboxCursor);
 
       // Somebody demands an exit, and the sequencer simply stops rather than honour it.
       await client.requestWithdrawal(
@@ -1744,7 +1701,7 @@ describe("rollup verifier", () => {
         pair.secretKey,
       );
 
-      // Nothing is owed on the deposit side, so this can only be the request queue talking.
+      // The only pending unified inbox entry is the request.
       await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
@@ -2114,9 +2071,9 @@ describe("rollup verifier", () => {
       signer: sender.txnSigner,
       args: {
         batchLength: s.batchLength + 1,
-        expectedDepositCursor: await client.depositCursor(),
-        targetRequestCursor: await client.requestCursor(),
+        targetInboxCursor: await client.inboxCursor(),
       },
+      boxReferences: [queueBox(2n)],
     });
 
     await client.abandonBatch(sender);
