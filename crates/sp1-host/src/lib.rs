@@ -1,7 +1,7 @@
 //! Everything a settlement transaction needs, produced without a zkVM.
 //!
 //! The guest is [`payment_rollup::execute`] wrapped in zkVM io, so running that function directly
-//! gives the exact 200 bytes a proof would commit for the cost of replaying the block. What is
+//! gives the exact 192 bytes a proof would commit for the cost of replaying the block. What is
 //! missing is only the proof that the replay happened, which is precisely the part the settlement
 //! contract does not check yet.
 //!
@@ -12,7 +12,7 @@
 
 use payment_rollup::{
     Address, Block, DeploymentDomain, ExecutionError, L1Address, Transaction, VerificationError,
-    WithdrawalClaim, chunk_count, execute,
+    WithdrawalLink, chunk_count, execute,
 };
 
 pub mod scenarios;
@@ -53,8 +53,7 @@ pub struct Settlement {
     new_root: [u8; 32],
     old_inbox_chain: [u8; 32],
     new_inbox_chain: [u8; 32],
-    withdrawal_root: [u8; 32],
-    withdrawal_count: u64,
+    withdrawal_chain: [u8; 32],
     deposits: Vec<(Address, u64)>,
     withdrawals: Vec<(L1Address, u64)>,
     requests: Vec<(Address, L1Address)>,
@@ -88,8 +87,7 @@ impl Settlement {
         // goes for every chain.
         if public_values[32..64] != block.new_root()
             || public_values[128..160] != block.new_inbox_chain()
-            || public_values[160..192] != block.withdrawal_root()
-            || public_values[192..200] != block.withdrawal_count().to_be_bytes()
+            || public_values[160..192] != block.withdrawal_chain()
         {
             return Err(ExecutionError::Verification(
                 VerificationError::RootMismatch,
@@ -148,8 +146,7 @@ impl Settlement {
             new_root: block.new_root(),
             old_inbox_chain: block.old_inbox_chain(),
             new_inbox_chain: block.new_inbox_chain(),
-            withdrawal_root: block.withdrawal_root(),
-            withdrawal_count: block.withdrawal_count(),
+            withdrawal_chain: block.withdrawal_chain(),
             deposits,
             withdrawals,
             requests,
@@ -183,12 +180,8 @@ impl Settlement {
         self.domain
     }
 
-    pub fn withdrawal_root(&self) -> [u8; 32] {
-        self.withdrawal_root
-    }
-
-    pub fn withdrawal_count(&self) -> u64 {
-        self.withdrawal_count
+    pub fn withdrawal_chain(&self) -> [u8; 32] {
+        self.withdrawal_chain
     }
 
     /// Every L1 withdrawal request the batch answers, in the order it answers them.
@@ -209,9 +202,9 @@ impl Settlement {
         &self.withdrawals
     }
 
-    pub fn withdrawal_claims(&self) -> Vec<WithdrawalClaim> {
-        payment_rollup::withdrawal_claims(&self.batch_commitment(), &self.withdrawals)
-            .expect("a settled block has at most MAX_WITHDRAWALS payouts")
+    /// The payout calls the settlement contract will accept, in the only order it will accept them.
+    pub fn withdrawal_links(&self) -> Vec<WithdrawalLink> {
+        payment_rollup::withdrawal_links(&self.domain, &self.withdrawals)
     }
 
     pub fn old_root(&self) -> [u8; 32] {
@@ -320,11 +313,7 @@ mod tests {
             );
             assert_eq!(
                 &settlement.public_values[160..192],
-                &settlement.withdrawal_root()
-            );
-            assert_eq!(
-                &settlement.public_values[192..200],
-                &settlement.withdrawal_count().to_be_bytes()
+                &settlement.withdrawal_chain()
             );
             assert_eq!(
                 accumulate_as_the_contract_would(&settlement),

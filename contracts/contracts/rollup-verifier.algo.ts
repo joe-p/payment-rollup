@@ -16,12 +16,10 @@ import {
   Account,
 } from "@algorandfoundation/algorand-typescript";
 import {
-  btoi,
   bzero,
   ed25519verifyBare,
   getBit,
   itob,
-  setBit,
   sha256,
 } from "@algorandfoundation/algorand-typescript/op";
 
@@ -49,7 +47,7 @@ const CHUNK_SIZE = 4094;
 export type Chunk = bytes;
 
 /**
- * The 200 bytes the guest commits:
+ * The 192 bytes the guest commits:
  *
  * ```text
  * [  0.. 32)  old_root
@@ -57,8 +55,7 @@ export type Chunk = bytes;
  * [ 64.. 96)  batch_commitment
  * [ 96..128)  old_inbox_chain
  * [128..160)  new_inbox_chain
- * [160..192)  withdrawal_root
- * [192..200)  withdrawal_count
+ * [160..192)  withdrawal_chain
  * ```
  *
  * Mirrors `public_values`. Nothing else escapes the proof, which is why the batch itself has to
@@ -69,11 +66,12 @@ export type Chunk = bytes;
  * withdrawals. It therefore prevents both minting value L1 never received and skipping an exit L1
  * was told to force.
  *
- * The withdrawal root and count are the odd pair out: the contract stores rather than compares
- * them. They claim what the batch authorized paying out and are checked later through independent
- * Merkle claims. See `claimWithdrawal`.
+ * The withdrawal chain is the odd one out: the contract stores rather than compares it. It claims
+ * what the batch authorized paying out, and is then spent one payout at a time by `payWithdrawal`
+ * until it reaches `withdrawalTerminal()`. There is no count beside it because the chain carries
+ * one: reaching the terminal is what says there are no more.
  */
-export type PublicValues = bytes<200>;
+export type PublicValues = bytes<192>;
 
 /**
  * Minimum balance the network charges for one inbox box: `2500 + 400 * (key + value)`, over a
@@ -86,19 +84,13 @@ export type PublicValues = bytes<200>;
 const INBOX_BOX_MBR = 64_100;
 
 /**
- * Minimum balance for one withdrawal queue box: `2500 + 400 * (key + value)`, over a 9-byte key
- * (`"w"` and an 8-byte batch number) and a 112-byte value.
+ * Obligations the rollup must discharge to earn one escape grace extension.
  *
- * Advanced by whoever settles the batch and returned to them when the queue drains, so the app is
- * never out of pocket for holding a queue -- the same arrangement `INBOX_BOX_MBR` makes for the
- * inbox.
+ * An obligation is one unit of work L1 can see the sequencer owe and then see it do: one inbox entry
+ * consumed by a settlement, or one payout made from a settled batch's chain. The two are counted
+ * against the same tranche deliberately -- they are the two directions of the same duty, and the
+ * watchdog has no business caring which one the sequencer is currently discharging.
  */
-const WITHDRAWAL_BOX_MBR = 50_900;
-
-/** Maximum payable withdrawals one batch may commit, and therefore bits in its claim bitmap. */
-const MAX_WITHDRAWALS = 256;
-
-/** FIFO cursor progress required to earn one escape grace extension. */
 const ESCAPE_PROGRESS_TRANCHE = 256;
 
 /**
@@ -154,21 +146,6 @@ type InboxRecord = {
   chainAfter: bytes<32>;
 };
 
-/**
- * One batch's independently claimable payouts.
- *
- * The proof-bound root authorizes each indexed payout. The bitmap is the nullifier set: one bit per
- * possible payout, bounded so all nullifiers and the root fit in one refundable box.
- */
-type WithdrawalQueue = {
-  root: bytes<32>;
-  count: uint64;
-  claimed: uint64;
-  bitmap: bytes<32>;
-  /** Who advanced `WITHDRAWAL_BOX_MBR`, and gets it back when the queue drains. */
-  funder: Account;
-};
-
 /** The network- and application-specific domain shared with the guest and signing clients. */
 function deploymentDomain(): bytes<32> {
   return sha256(
@@ -176,6 +153,20 @@ function deploymentDomain(): bytes<32> {
       .concat(Global.genesisHash)
       .concat(itob(Global.currentApplicationId.id)),
   );
+}
+
+/**
+ * Where a batch's payout chain ends, and so the value `pendingWithdrawals` drains to.
+ *
+ * Mirrors `withdrawal_chain_terminal`. Recomputed rather than stored, which is the whole reason it
+ * is bound to the deployment domain instead of to the batch: a batch-bound terminal would have to
+ * be held in a global of its own, because the commitment it would come from is deleted the instant
+ * the batch settles. Nothing is lost by that. The chain head only ever enters state from a
+ * settlement's public values, never from a caller, so there is no other batch's chain to be spliced
+ * onto this one and nothing for batch-binding to prevent.
+ */
+function withdrawalTerminal(): bytes<32> {
+  return sha256(Bytes("WEND").concat(deploymentDomain()));
 }
 
 export class RollupVerifier extends Contract {
@@ -231,33 +222,26 @@ export class RollupVerifier extends Contract {
   inbox = BoxMap<uint64, InboxRecord>({ keyPrefix: "i" });
 
   /**
-   * How many batches have settled, and so the number the next one takes.
+   * Head of the payout chain the last settled batch committed, or absent once it has drained.
    *
-   * Only ever used to key a withdrawal queue. Monotonic and never reset, so two batches can never
-   * share a box even if the first one's queue has already been drained and deleted.
+   * The debt the rollup has taken on and not yet discharged, in one word. `hasValue` doubles as
+   * "payouts are outstanding" -- the same idiom `batchLength` uses for "a batch is being posted" --
+   * and that is what `openBatch` refuses on, so a batch's payouts are always made before the next
+   * batch begins.
+   *
+   * Written only here, out of a settlement's public values, and never from a caller's arguments --
+   * which is what makes it safe for `payWithdrawal` to be permissionless.
    */
-  batchNumber = GlobalState<uint64>();
-
-  /**
-   * Unclaimed payouts, one box per settled batch that had any.
-   *
-   * Each batch has its own Merkle root and claim bitmap. A claim against one batch therefore neither
-   * blocks nor is blocked by another, and the box can be deleted as soon as its own bitmap drains.
-   *
-   * Like `inbox`, deliberately outside the settlement path in the sense that matters: settling
-   * touches at most this one box, whatever the batch withdrew, so the cost of settling still does
-   * not depend on how much is queued.
-   */
-  withdrawals = BoxMap<uint64, WithdrawalQueue>({ keyPrefix: "w" });
+  pendingWithdrawals = GlobalState<bytes<32>>();
 
   /**
    * Rollup addresses that have already been paid out by `forceExit`, and what each was paid.
    *
    * A nullifier, and it has to be one: after an escape the state root never moves again, so the
    * Merkle proof that an account holds a balance stays valid forever and would otherwise authorize
-   * an unlimited number of identical payouts. Settled withdrawal queues carry a bounded bitmap,
-   * but escape exits have no finite batch whose nullifiers can share one, so each needs a permanent
-   * record of its own.
+   * an unlimited number of identical payouts. A settled batch's payouts are nullified by their
+   * position in `pendingWithdrawals`, but an escape exit belongs to no batch and no chain, so each
+   * needs a permanent record of its own.
    *
    * Never deleted, for the same reason. The value is what was paid, which makes the boxes an
    * auditable record of where the app's balance went rather than a bare set of flags.
@@ -284,12 +268,28 @@ export class RollupVerifier extends Contract {
    *
    * `hasValue` doubles as "an escape has been signalled", the same idiom `batchLength` uses for "a
    * batch is being posted". Deleted by `executeEscape`, or once settlement reaches every recorded
-   * target. Full FIFO tranches may extend it without moving that target.
+   * target. Full obligation tranches may extend it without moving that target.
    */
   escapeDeadline = GlobalState<uint64>();
 
   /** Inbox frontier a pending escape signal requires settlement to reach. */
   escapeInboxTarget = GlobalState<uint64>();
+
+  /**
+   * Obligations discharged since the pending signal last bought a grace extension.
+   *
+   * The one counter both directions feed: `verifyBatch` credits the inbox entries its prefix
+   * consumed, and `payWithdrawal` credits the payout it just made. Counting them together is what
+   * stops the two mechanisms from starving each other -- an outstanding payout chain closes
+   * `openBatch`, so without this a sequencer could be frozen out mid-drain for failing to settle
+   * when settling was the one thing the drain was blocking.
+   *
+   * Lives and dies with `escapeDeadline`, since progress is only ever measured against a live
+   * accusation. Reset rather than carried when a tranche is spent: at most one extension per call,
+   * whatever the size of the credit, which is what keeps a single enormous settlement from buying
+   * windows by the hundred.
+   */
+  escapeProgress = GlobalState<uint64>();
 
   /**
    * Rounds the oldest pending inbox entry may age before it counts as evidence the sequencer has
@@ -306,8 +306,8 @@ export class RollupVerifier extends Contract {
    * Rounds between `signalEscape` and `executeEscape`.
    *
    * The grace period is what stops a signal from voiding a nearly-complete batch the instant the
-   * timeout ticks over. Each full inbox tranche earns one additional window, while a final partial
-   * advance clears the signal only by reaching the fixed target.
+   * timeout ticks over. Each full tranche of discharged obligations earns one additional window,
+   * while reaching the fixed target clears the signal outright.
    */
   escapeGrace = GlobalState<uint64>();
 
@@ -334,7 +334,6 @@ export class RollupVerifier extends Contract {
     this.escaped.value = false;
     this.depositTimeout.value = depositTimeout;
     this.escapeGrace.value = escapeGrace;
-    this.batchNumber.value = 0;
   }
 
   /**
@@ -617,79 +616,69 @@ export class RollupVerifier extends Contract {
       .submit();
   }
 
-  /** Pay one independently proven withdrawal from a settled batch. */
-  claimWithdrawal(
-    batchNumber: uint64,
-    index: uint64,
-    batchCommitment: bytes<32>,
-    recipient: Account,
-    amount: uint64,
-    siblings: bytes,
-  ): void {
-    const queue = clone(this.withdrawals(batchNumber).value);
-    assert(index < queue.count, "the withdrawal index is outside this batch");
+  /**
+   * Make the next payout the settled batch committed, and step the chain past it.
+   *
+   * The sequencer's obligation rather than the recipient's errand. A settled batch has already
+   * debited these balances on L2, so the rollup owes the money whether anyone comes to ask for it,
+   * and `openBatch` will not let the sequencer continue until every one of them has been paid.
+   *
+   * The check is what makes this safe to be a bare fold. `tail` is the chain value that follows this
+   * payout, so `sha256("WPAY" || tail || recipient || amount)` has to reproduce the head being held
+   * -- and only the batch's genuine next payout does. Note the order that forces: the contract
+   * cannot tell a right payout from a wrong one *after* making it, only before, which is why the
+   * chain is built back to front. A chain folded the other way would have to pay first and discover
+   * the mismatch at the end, by which point the money is gone and the committed value is
+   * unreachable for good.
+   *
+   * That check is also the whole of the replay protection. A payout matches exactly one head, and
+   * the head has moved on by the time the call returns, so the same payout can never be made twice
+   * and needs no nullifier recorded anywhere. Two identical payouts in one batch are two distinct
+   * positions in the chain, and each is made once.
+   *
+   * Permissionless, deliberately. Nothing a caller passes can redirect a payment -- the arguments
+   * either reproduce the head or the call fails -- so the only thing an outsider can do here is pay
+   * a fee on the sequencer's behalf. That is the liveness valve: if the sequencer stalls with a
+   * chain outstanding, the recipients can drain it themselves.
+   *
+   * A payout is also an obligation discharged, and the sequencer's own payouts are credited against
+   * a pending escape signal exactly as consumed inbox entries are. That is what makes the
+   * `openBatch` gate safe: the drain the gate demands cannot be the reason the sequencer misses the
+   * deadline for settling.
+   *
+   * No `escaped` guard either, for the same reason `pruneRequest` has none. These balances left L2 in
+   * a batch that settled; the debt is real and survives the rollup freezing. An escape stops the
+   * root advancing, not the rollup paying what it already owes.
+   *
+   * The payment cannot fail. `MIN_WITHDRAWAL` in the guest keeps every amount at or above the
+   * network minimum balance, so it goes through even against a receiver that does not yet exist --
+   * which matters far more here than it did for independent claims, because one unpayable payment
+   * would block the rest of the chain and with it the next batch.
+   */
+  payWithdrawal(recipient: Account, amount: uint64, tail: bytes<32>): void {
+    assert(this.pendingWithdrawals.hasValue, "no payouts are outstanding");
     assert(
-      !getBit(queue.bitmap, index),
-      "this withdrawal has already been claimed",
-    );
-    assert(
-      siblings.length % 32 === 0,
-      "the proof is not a whole number of siblings",
+      sha256(
+        Bytes("WPAY").concat(tail).concat(recipient.bytes).concat(itob(amount)),
+      ) === this.pendingWithdrawals.value,
+      "this is not the next payout the batch committed",
     );
 
-    let width: uint64 = 1;
-    let expectedDepth: uint64 = 0;
-    while (width < queue.count) {
-      width = width * 2;
-      expectedDepth = expectedDepth + 1;
+    if (tail === withdrawalTerminal()) {
+      this.pendingWithdrawals.delete();
+    } else {
+      this.pendingWithdrawals.value = tail;
     }
-    assert(
-      siblings.length === expectedDepth * 32,
-      "the proof depth does not match the withdrawal count",
-    );
 
-    let current = sha256(
-      Bytes("WLEAF")
-        .concat(batchCommitment)
-        .concat(itob(index))
-        .concat(recipient.bytes)
-        .concat(itob(amount)),
-    );
-
-    let position = index;
-    for (let level: uint64 = 0; level < expectedDepth; level = level + 1) {
-      const sibling = siblings.slice(level * 32, (level + 1) * 32);
-      current =
-        position % 2
-          ? sha256(Bytes("WNODE").concat(sibling).concat(current))
-          : sha256(Bytes("WNODE").concat(current).concat(sibling));
-      position = position / 2;
+    // Only the sequencer's own payouts answer an accusation. The signal says the sequencer has
+    // stopped, and an outsider draining the chain is no evidence whatever that it has not -- so the
+    // payout stays permissionless while the credit for it does not. `verifyBatch` needs no such
+    // test, being creator-gated already, which is what makes the two sources of credit comparable.
+    if (Txn.sender === Global.creatorAddress) {
+      this.creditEscapeProgress(1);
     }
-
-    assert(
-      current === queue.root,
-      "the withdrawal does not prove against this batch",
-    );
 
     itxn.payment({ receiver: recipient, amount: amount, fee: 0 }).submit();
-
-    const claimed: uint64 = queue.claimed + 1;
-    if (claimed === queue.count) {
-      this.withdrawals(batchNumber).delete();
-
-      itxn
-        .payment({ receiver: queue.funder, amount: WITHDRAWAL_BOX_MBR, fee: 0 })
-        .submit();
-    } else {
-      this.withdrawals(batchNumber).value.claimed = claimed;
-      this.withdrawals(batchNumber).value.bitmap = setBit(
-        queue.bitmap,
-        index,
-        1,
-      ).toFixed({
-        length: 32,
-      });
-    }
   }
 
   /**
@@ -834,8 +823,9 @@ export class RollupVerifier extends Contract {
    * `signalEscape` reads one queue head. `openBatch` reads one checkpoint for a selected non-empty
    * prefix; neither cost depends on how much is queued.
    *
-   * Permissionless, because the accusation is checkable. Settlement either reaches the recorded
-   * target or proves meaningful FIFO progress in a full inbox tranche.
+   * Permissionless, because the accusation is checkable. The sequencer either settles its way to the
+   * recorded target or answers with a full tranche of discharged obligations -- inbox entries
+   * consumed, payouts made, or any mix of the two. See `creditEscapeProgress`.
    */
   signalEscape(): void {
     assert(!this.escaped.value, "the rollup has already escaped");
@@ -856,8 +846,41 @@ export class RollupVerifier extends Contract {
     );
 
     this.escapeInboxTarget.value = this.inboxCursor.value;
+    this.escapeProgress.value = 0;
 
     this.escapeDeadline.value = Global.round + this.escapeGrace.value;
+  }
+
+  /**
+   * Credit `discharged` obligations against a pending accusation, buying a grace window per tranche.
+   *
+   * The answer to an accusation that the sequencer has stopped is work, and this is the one place
+   * that judges it -- so a settlement and a payout are worth exactly the same per unit, and neither
+   * can be starved by the other blocking it.
+   *
+   * At most one extension per call. The remainder is dropped rather than carried, which loses at
+   * worst `ESCAPE_PROGRESS_TRANCHE - 1` obligations of credit and in exchange keeps a single
+   * settlement that consumed a hundred thousand inbox entries from converting them into hundreds of
+   * grace windows and neutering the watchdog outright.
+   *
+   * Extends from the existing deadline rather than from the current round, so windows accumulate
+   * from where the accusation put them instead of resetting the clock on every call.
+   *
+   * Silent when nothing has been signalled, so callers need not know whether an accusation is live.
+   */
+  private creditEscapeProgress(discharged: uint64): void {
+    if (!this.escapeDeadline.hasValue) {
+      return;
+    }
+
+    const progress: uint64 = this.escapeProgress.value + discharged;
+    if (progress >= ESCAPE_PROGRESS_TRANCHE) {
+      this.escapeDeadline.value =
+        this.escapeDeadline.value + this.escapeGrace.value;
+      this.escapeProgress.value = 0;
+    } else {
+      this.escapeProgress.value = progress;
+    }
   }
 
   /**
@@ -869,6 +892,11 @@ export class RollupVerifier extends Contract {
    * Any open batch is discarded on the way, the same five keys `abandonBatch` deletes. Doing it
    * here rather than requiring the creator to go first matters: the whole premise is that the
    * sequencer is gone, so a path that needs the sequencer's cooperation is not an escape hatch.
+   *
+   * `pendingWithdrawals` is deliberately left alone. An open batch was never settled and so owes
+   * nothing, but an outstanding payout chain came from a batch that *did* settle -- those balances
+   * have already left L2, and freezing the root does not unmake the debt. `payWithdrawal` keeps
+   * working afterwards, and being permissionless it needs nobody's cooperation either.
    *
    * Permissionless. There is nothing left to gate -- the deadline is the authorization, and it can
    * only have been set by pending work that exceeded `depositTimeout`, plus any grace extensions
@@ -885,6 +913,7 @@ export class RollupVerifier extends Contract {
     this.escaped.value = true;
     this.escapeDeadline.delete();
     this.escapeInboxTarget.delete();
+    this.escapeProgress.delete();
 
     if (this.batchLength.hasValue) {
       this.chunkAccumulator.delete();
@@ -933,6 +962,12 @@ export class RollupVerifier extends Contract {
    * The target cursor may select any FIFO prefix from the settled cursor through the live cursor.
    * The record immediately before the endpoint stores the matching hash-chain checkpoint, so
    * opening reads at most one box regardless of prefix length. Later arrivals remain pending.
+   *
+   * Also the one place the payout chain gates progress. The rollup may not move on while it still
+   * owes the last batch's withdrawals, which is what turns a payout from something a recipient has
+   * to come and claim into something the sequencer has to do. One assertion covers it completely:
+   * `verifyBatch` is the only thing that ever sets a chain outstanding, and it requires a batch to
+   * be open, so no payouts can appear between here and the settlement that clears them.
    */
   openBatch(batchLength: uint64, targetInboxCursor: uint64): void {
     assert(
@@ -943,6 +978,10 @@ export class RollupVerifier extends Contract {
     // A second open would abandon a half-posted batch and start folding over its accumulator, so
     // a batch has to be finished before the next one begins. See `abandonBatch` for the way out.
     assert(!this.batchLength.hasValue, "a batch is already being posted");
+    assert(
+      !this.pendingWithdrawals.hasValue,
+      "the last batch's payouts have not all been made",
+    );
     assert(
       targetInboxCursor >= this.settledInboxCursor.value,
       "the batch cannot move the inbox cursor backwards",
@@ -1022,13 +1061,13 @@ export class RollupVerifier extends Contract {
    * - `publicValues[96..128]` against `settledInboxChain` -- where the batch's FIFO prefix begins.
    * - `publicValues[128..160]` against `sealedInboxChain` -- where it ends. Pinning both ends stops a
    *   prover choosing an anchor that makes a fabricated fold land correctly.
-   * - the proof itself, over all 200 bytes.
+   * - the proof itself, over all 192 bytes.
    *
-   * **All 200, not merely the words compared above.** The withdrawal root and count have no prior
-   * L1 values to compare against: they claim what the batch authorized paying out, and the root is
-   * tested later in `claimWithdrawal`. That makes the proof their only defence. A verifier bound to
-   * a prefix would leave them ordinary arguments, allowing a queue that pays withdrawals no batch
-   * contained. `PublicValues` is `bytes<200>` for exactly that reason.
+   * **All 192, not merely the words compared above.** The withdrawal chain has no prior L1 value to
+   * compare against: it claims what the batch authorized paying out, and every payout made against
+   * it is checked only against the chain itself. That makes the proof its only defence. A verifier
+   * bound to a prefix would leave it an ordinary argument, allowing a chain that pays withdrawals no
+   * batch contained. `PublicValues` is `bytes<192>` for exactly that reason.
    *
    * The two inbox checks make the selected FIFO prefix exactly L1's: inventing, dropping, reordering
    * or altering either kind of entry diverges the fold and never recovers.
@@ -1036,19 +1075,25 @@ export class RollupVerifier extends Contract {
    * **None of that binds yet.** The proof is not verified -- see the TODO below -- and
    * `publicValues` is an ordinary argument, so a dishonest sequencer can read `sealedInboxChain`
    * straight out of global state and hand it back while the batch bytes say something else -- and
-   * can put whatever it likes in the withdrawal root and count. The
+   * can put whatever it likes in the withdrawal chain. The
    * chain is the right mechanism and becomes airtight the moment the verifier lands, with no
    * redesign; until then the sequencer is trusted here exactly as it is already trusted with
    * `stateRoot`. What does hold today is data availability: the accumulator forces the real bytes
    * on-chain, so the fraud is detectable by replay, just not preventable.
    *
    * No box is read here, and none should ever be. That is what keeps the cost of settling
-   * independent of how many inbox entries are queued.
+   * independent of how many inbox entries are queued -- and now of how much the batch withdrew, too,
+   * since the payout chain is one global rather than a funded box.
+   *
+   * Nothing here bounds how many payouts a batch may commit. Nothing needs to: a sequencer that
+   * commits a great many has to make every one of them, at its own expense, before it may open
+   * another batch -- and because each one is an obligation the watchdog counts, a long drain buys
+   * the time it takes rather than running the clock down. See `creditEscapeProgress`.
    *
    * Settlement clears a pending `signalEscape` when the settled cursor reaches its fixed snapshot.
-   * While that target remains unresolved, advancing at least 256 FIFO entries extends the existing
-   * deadline by one grace period. Later arrivals never move the target, and a final partial prefix
-   * clears without extending. Once the deadline has passed no settlement can race `executeEscape`.
+   * While that target remains unresolved, the inbox entries this prefix consumed are credited as
+   * obligations discharged, on the same counter `payWithdrawal` feeds. Later arrivals never move the
+   * target. Once the deadline has passed no settlement can race `executeEscape`.
    */
   verifyBatch(publicValues: PublicValues): void {
     assert(
@@ -1072,8 +1117,7 @@ export class RollupVerifier extends Contract {
     const batchCommitment = publicValues.slice(64, 96);
     const oldInboxChain = publicValues.slice(96, 128);
     const newInboxChain = publicValues.slice(128, 160);
-    const withdrawalRoot = publicValues.slice(160, 192);
-    const withdrawalCount = btoi(publicValues.slice(192, 200));
+    const withdrawalChain = publicValues.slice(160, 192);
 
     assert(
       oldRoot === this.stateRoot.value,
@@ -1098,47 +1142,15 @@ export class RollupVerifier extends Contract {
     this.settledInboxChain.value = this.sealedInboxChain.value;
     this.settledInboxCursor.value = this.sealedInboxCursor.value;
 
-    // A batch that withdrew nothing folds to the genesis value and opens no queue, so the common
-    // case costs one comparison and no box. Otherwise the tip goes into a box of its own, and the
-    // minimum balance for it comes from a payment immediately before this call -- taken from the
-    // group rather than the argument list so a settlement with no withdrawals is not made to carry
-    // a funding transaction it has no use for.
-    assert(
-      withdrawalCount <= MAX_WITHDRAWALS,
-      "the batch contains too many withdrawals",
-    );
-    assert(
-      (withdrawalCount === 0) === (withdrawalRoot === bzero(32)),
-      "the withdrawal root and count disagree",
-    );
-
-    if (withdrawalCount > 0) {
-      assert(
-        Txn.groupIndex > 0,
-        "a batch with withdrawals must be funded for its queue box",
-      );
-      const funding = gtxn.PaymentTxn(Txn.groupIndex - 1);
-      assertMatch(
-        funding,
-        {
-          receiver: Global.currentApplicationAddress,
-          closeRemainderTo: Global.zeroAddress,
-          rekeyTo: Global.zeroAddress,
-          amount: WITHDRAWAL_BOX_MBR,
-        },
-        "the withdrawal queue box must be funded with exactly its minimum balance",
-      );
-
-      this.withdrawals(this.batchNumber.value).value = {
-        root: withdrawalRoot.toFixed({ length: 32 }),
-        count: withdrawalCount,
-        claimed: 0,
-        bitmap: bzero(32),
-        funder: funding.sender,
-      };
+    // A batch that withdrew nothing commits the terminal itself, so the common case writes nothing
+    // and the rollup is free to open the next batch immediately. Otherwise the head goes into state
+    // and `openBatch` is closed until `payWithdrawal` has walked it back down to the terminal.
+    //
+    // No funding transaction and no box either way, which is what makes a withdrawing settlement
+    // cost exactly what a non-withdrawing one does.
+    if (withdrawalChain !== withdrawalTerminal()) {
+      this.pendingWithdrawals.value = withdrawalChain.toFixed({ length: 32 });
     }
-
-    this.batchNumber.value = this.batchNumber.value + 1;
 
     // TODO: Actual ZK verification
 
@@ -1152,12 +1164,14 @@ export class RollupVerifier extends Contract {
       if (this.settledInboxCursor.value >= this.escapeInboxTarget.value) {
         this.escapeInboxTarget.delete();
         this.escapeDeadline.delete();
-      } else if (
-        this.settledInboxCursor.value - oldSettledInboxCursor >=
-        ESCAPE_PROGRESS_TRANCHE
-      ) {
-        this.escapeDeadline.value =
-          this.escapeDeadline.value + this.escapeGrace.value;
+        this.escapeProgress.delete();
+      } else {
+        // Falling short of the target still discharges obligations, and they are credited on the
+        // same counter the drain feeds -- so a prefix too small to earn a window on its own is not
+        // thrown away, it waits for the payouts that follow it.
+        this.creditEscapeProgress(
+          this.settledInboxCursor.value - oldSettledInboxCursor,
+        );
       }
     }
   }

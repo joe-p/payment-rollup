@@ -222,8 +222,7 @@ fn fixture(
         "deploymentDomain": hex(&settlement.domain()),
         "inboxChainFrom": hex(&settlement.inbox_chain_from()),
         "inboxChainTo": hex(&settlement.inbox_chain_to()),
-        "withdrawalRoot": hex(&settlement.withdrawal_root()),
-        "withdrawalCount": settlement.withdrawal_count(),
+        "withdrawalChain": hex(&settlement.withdrawal_chain()),
         // Convenience views only. `inbox` below is authoritative for cross-kind L1 order.
         "requests": settlement
             .requests()
@@ -258,15 +257,15 @@ fn fixture(
             })
             .collect::<Vec<_>>(),
 
-        // One ordered-Merkle claim per payout after the batch has settled.
+        // One `payWithdrawal(...)` call per payout after the batch has settled, in this exact order
+        // -- the contract holds the head of the chain and will accept no other.
         "withdrawals": settlement
-            .withdrawal_claims()
+            .withdrawal_links()
             .iter()
-            .map(|claim| json!({
-                "index": claim.index,
-                "recipient": hex(&claim.recipient),
-                "amount": claim.amount,
-                "siblings": claim.siblings.iter().map(|sibling| hex(sibling)).collect::<Vec<_>>(),
+            .map(|link| json!({
+                "recipient": hex(&link.recipient),
+                "amount": link.amount,
+                "tail": hex(&link.tail),
             }))
             .collect::<Vec<_>>(),
 

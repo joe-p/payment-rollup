@@ -1,7 +1,7 @@
 //! Proves one block: that `old_root` becomes `new_root`, and `inbox_anchor` becomes the unified L1
 //! inbox chain the batch folds to, by replaying the batch the chain records.
 //!
-//! Everything read here is prover-supplied and private. The only thing that escapes is the 200
+//! Everything read here is prover-supplied and private. The only thing that escapes is the 192
 //! bytes of [`public_values`], and the batch bytes are represented there by a commitment rather
 //! than in full -- public values are hashed into the proof and handed to the verifier, so carrying
 //! the batch in them would mean paying for it twice. The settlement contract is given the batch
@@ -33,7 +33,7 @@ pub fn main() {
     let batch_bytes = sp1_zkvm::io::read_vec();
     let sidecar_bytes = sp1_zkvm::io::read_vec();
 
-    // Everything the proof asserts lives in `execute`, so the host can compute these same 200 bytes
+    // Everything the proof asserts lives in `execute`, so the host can compute these same 192 bytes
     // without a zkVM. This is only the io.
     let values = execute(domain, old_root, inbox_anchor, &batch_bytes, &sidecar_bytes)
         .expect("block must prove");

@@ -517,7 +517,7 @@ mod tests {
         ));
     }
 
-    // The e2e claims this queue one payout at a time and asserts each lands where it was addressed.
+    // The e2e drains this chain one payout at a time and asserts each lands where it was addressed.
     #[test]
     fn the_withdrawals_scenario_has_no_two_alike() {
         let settled = Settlement::for_block(&withdrawals(DOMAIN)).unwrap();
@@ -538,14 +538,19 @@ mod tests {
 
         assert_eq!(settled.withdrawals().len(), 2);
         assert_eq!(settled.withdrawals()[0], settled.withdrawals()[1]);
-        assert_ne!(
-            settled.withdrawal_claims()[0].index,
-            settled.withdrawal_claims()[1].index
-        );
+
+        // Identical payouts, so the two links differ only in their tails -- which is exactly what
+        // keeps them distinct positions in the chain rather than one payout the contract could make
+        // twice.
+        let links = settled.withdrawal_links();
+        assert_eq!(links[0].recipient, links[1].recipient);
+        assert_eq!(links[0].amount, links[1].amount);
+        assert_ne!(links[0].tail, links[1].tail);
     }
 
     // The one bound the guest enforces on a withdrawal, and the reason the settlement contract can
-    // pay a claim out without worrying whether the payment will go through.
+    // pay one out without worrying whether the payment will go through -- and so the reason a drain
+    // cannot stall halfway with the next batch waiting on it.
     #[test]
     fn no_scenario_withdraws_below_the_minimum() {
         for scenario in all() {
@@ -561,18 +566,20 @@ mod tests {
         }
     }
 
-    // Every block folds its withdrawals from genesis, so a block with none has to land exactly
-    // there -- that is how the contract knows not to open a payout queue.
+    // Every block folds its withdrawals onto the terminal, so a block with none has to land exactly
+    // there -- that is how the contract knows there is nothing to pay out.
     #[test]
-    fn only_the_withdrawing_scenarios_have_a_withdrawal_root() {
+    fn only_the_withdrawing_scenarios_move_off_the_withdrawal_terminal() {
+        let terminal = payment_rollup::withdrawal_chain_terminal(&DOMAIN);
+
         for scenario in all() {
             let settled = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
-            let moved = settled.withdrawal_root() != payment_rollup::EMPTY_WITHDRAWAL_ROOT;
+            let moved = settled.withdrawal_chain() != terminal;
 
             assert_eq!(
                 moved,
                 !settled.withdrawals().is_empty(),
-                "{}: the withdrawal root is nonzero iff the batch withdrew something",
+                "{}: the withdrawal chain leaves the terminal iff the batch withdrew something",
                 scenario.name
             );
         }

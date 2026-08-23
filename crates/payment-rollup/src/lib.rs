@@ -42,6 +42,11 @@ pub fn deployment_domain(genesis_hash: &[u8; 32], app_id: u64) -> DeploymentDoma
 /// Enforcing it here rather than on L1 is what makes that impossible rather than merely unlikely: a
 /// block containing an unpayable withdrawal does not verify, so the contract is never asked to make
 /// a payment it cannot complete.
+///
+/// Load-bearing for liveness as well as for correctness, since payouts are made in chain order:
+/// see [`withdrawal_chain`]. One unpayable payment would not merely fail on its own, it would block
+/// every later payout in the same batch -- and with them the next batch, which cannot open until
+/// the chain drains. This constant is what rules that out.
 pub const MIN_WITHDRAWAL: u64 = 100_000;
 
 /// The sender of a [`Deposit`]: the one address no key can produce.
@@ -187,8 +192,6 @@ pub enum VerificationError {
     /// [`Sidecar::decode`] reads each entry in the shape the batch's transaction kinds dictate, so
     /// a mismatched pair cannot be encoded. It exists for sidecars built by hand.
     SidecarKindMismatch,
-    /// A batch queues more payouts than the settlement contract can address.
-    TooManyWithdrawals,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +337,7 @@ impl Payment {
 ///
 /// The mirror of a [`Deposit`]: a deposit writes one slot and credits it, a withdrawal writes one
 /// slot and debits it. Total balances fall, and the settlement contract makes the holder whole in
-/// real ALGO once the batch settles -- see [`withdrawal_root`] for how it learns to.
+/// real ALGO once the batch settles -- see [`withdrawal_chain`] for how it learns to.
 ///
 /// **`recipient` is an Algorand address, not a rollup address.** Everywhere else in this crate a
 /// 32-byte destination is an [`Address`], meaning a position in the state tree; here it is the raw
@@ -587,7 +590,7 @@ impl SignedTransaction {
     ///
     /// The signature is what authorizes the debit; the chain the batch folds to is only what tells
     /// L1 whom to pay. Both are needed, and they answer different questions -- see
-    /// [`withdrawal_root`].
+    /// [`withdrawal_chain`].
     pub fn withdrawal(withdrawal: Withdrawal, sig: Signature) -> Self {
         SignedTransaction::Withdrawal { withdrawal, sig }
     }
@@ -742,8 +745,7 @@ pub struct Block {
     new_root: [u8; 32],
     old_inbox_chain: [u8; 32],
     new_inbox_chain: [u8; 32],
-    withdrawal_root: [u8; 32],
-    withdrawal_count: u64,
+    withdrawal_chain: [u8; 32],
     batch: Batch,
     sidecar: Sidecar,
 }
@@ -771,12 +773,9 @@ impl Block {
         self.new_inbox_chain
     }
 
-    pub fn withdrawal_root(&self) -> [u8; 32] {
-        self.withdrawal_root
-    }
-
-    pub fn withdrawal_count(&self) -> u64 {
-        self.withdrawal_count
+    /// Reverse-linked chain over every payout the block authorizes; see [`withdrawal_chain`].
+    pub fn withdrawal_chain(&self) -> [u8; 32] {
+        self.withdrawal_chain
     }
 
     pub fn batch(&self) -> &Batch {
@@ -824,127 +823,105 @@ pub fn accumulate_deposit(chain: &[u8; 32], receiver: &Address, amount: u64) -> 
     hasher.finalize().into()
 }
 
-/// Maximum number of payouts one batch can commit.
-pub const MAX_WITHDRAWALS: usize = 256;
-
-/// Root used when a batch has no payouts. Its count is also zero.
-pub const EMPTY_WITHDRAWAL_ROOT: [u8; 32] = [0u8; 32];
-
-fn withdrawal_leaf(
-    batch_commitment: &[u8; 32],
-    index: u64,
-    recipient: &L1Address,
-    amount: u64,
-) -> [u8; 32] {
+/// Where a batch's payout chain ends, and so the value the settlement contract stops at.
+///
+/// Domain-separated rather than batch-separated, which is worth being explicit about because the
+/// obvious alternative -- folding [`batch_commitment`] in -- looks stronger and is not. The chain
+/// head is written to L1 only by the settlement call, out of the proof's public values, and never
+/// by whoever makes a payout; so there is no batch whose chain could be spliced onto another's, and
+/// nothing for batch-binding to prevent. It would only cost the contract a second global to hold,
+/// since the commitment it would be derived from is deleted the moment the batch settles.
+///
+/// Two batches with identical payout lists therefore commit the same chain, which is harmless: each
+/// head is installed and drained on its own, and the payouts are the same payouts.
+pub fn withdrawal_chain_terminal(domain: &DeploymentDomain) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"WLEAF");
-    hasher.update(batch_commitment);
-    hasher.update(index.to_be_bytes());
+    hasher.update(b"WEND");
+    hasher.update(domain);
+
+    hasher.finalize().into()
+}
+
+/// Fold one payout onto the front of a batch's payout chain.
+///
+/// Note the direction: this prepends, so the argument is the chain value that comes *after* the
+/// payout being added and the result is the value that comes before it. Building the chain
+/// backwards is what lets the settlement contract check a payout before making it -- it holds the
+/// head, and a caller offering the next payout must offer the tail it links to, so the preimage
+/// either reproduces the head or it does not. A chain folded the other way could only be checked
+/// once every payout had already been made, which is exactly too late.
+///
+/// The preimage is 76 bytes, far inside [`AVM_MAX_BYTE_SLICE`]. The domain tag keeps a chain value
+/// from ever being mistakable for an inbox chain, a state root, or a chunk accumulator.
+pub fn accumulate_withdrawal(tail: &[u8; 32], recipient: &L1Address, amount: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"WPAY");
+    hasher.update(tail);
     hasher.update(recipient);
     hasher.update(amount.to_be_bytes());
 
     hasher.finalize().into()
 }
 
-fn withdrawal_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"WNODE");
-    hasher.update(left);
-    hasher.update(right);
-
-    hasher.finalize().into()
+/// The one word that commits to every payout a batch authorized, in order.
+///
+/// A reverse-linked hash chain over the payouts, anchored at [`withdrawal_chain_terminal`]. Like
+/// the inbox chain, one 32-byte value pins the set, the order, and the count at once: each step
+/// consumes the next, so inventing, dropping, reordering, or altering a payout diverges the chain
+/// and never recovers.
+///
+/// What it replaces is a Merkle tree with a claim bitmap on L1. The tree let recipients claim in
+/// any order, which needed a nullifier per payout, which needed a bound on how many a batch could
+/// hold. A chain needs no nullifiers -- position in it *is* the nullifier -- so the bound goes too,
+/// along with the tree, its proofs, and the box the bitmap lived in.
+///
+/// The cost is that payouts must be made in order and the sequencer must make them: the settlement
+/// contract will not open the next batch until the chain has drained. That is the point rather than
+/// a side effect. It turns withdrawals from something a recipient has to come and claim into
+/// something the rollup owes and has to pay before it may continue.
+pub fn withdrawal_chain(domain: &DeploymentDomain, payouts: &[(L1Address, u64)]) -> [u8; 32] {
+    payouts.iter().rev().fold(
+        withdrawal_chain_terminal(domain),
+        |tail, (recipient, amount)| accumulate_withdrawal(&tail, recipient, *amount),
+    )
 }
 
-fn withdrawal_empty() -> [u8; 32] {
-    Sha256::digest(b"WEMPTY").into()
-}
-
-fn withdrawal_levels(
-    batch_commitment: &[u8; 32],
-    payouts: &[(L1Address, u64)],
-) -> Result<Vec<Vec<[u8; 32]>>, VerificationError> {
-    if payouts.len() > MAX_WITHDRAWALS {
-        return Err(VerificationError::TooManyWithdrawals);
-    }
-    if payouts.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let width = payouts.len().next_power_of_two();
-    let mut level = Vec::with_capacity(width);
-    for (index, (recipient, amount)) in payouts.iter().enumerate() {
-        level.push(withdrawal_leaf(
-            batch_commitment,
-            index as u64,
-            recipient,
-            *amount,
-        ));
-    }
-    level.resize(width, withdrawal_empty());
-
-    let mut levels = vec![level];
-    while levels.last().unwrap().len() > 1 {
-        let next = levels
-            .last()
-            .unwrap()
-            .chunks_exact(2)
-            .map(|pair| withdrawal_node(&pair[0], &pair[1]))
-            .collect();
-        levels.push(next);
-    }
-
-    Ok(levels)
-}
-
-/// Ordered Merkle root of the payouts authorized by one batch.
-pub fn withdrawal_root(
-    batch_commitment: &[u8; 32],
-    payouts: &[(L1Address, u64)],
-) -> Result<[u8; 32], VerificationError> {
-    let levels = withdrawal_levels(batch_commitment, payouts)?;
-    Ok(levels
-        .last()
-        .map_or(EMPTY_WITHDRAWAL_ROOT, |level| level[0]))
-}
-
-/// One payout and its ordered Merkle inclusion path, leaf sibling first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WithdrawalClaim {
-    pub index: u64,
+/// One payout, and the chain value that follows it.
+///
+/// Exactly the arguments one settlement-contract payout call takes. `tail` is what makes the call
+/// checkable: the contract recomputes [`accumulate_withdrawal`] over these three fields and
+/// compares against the head it is holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithdrawalLink {
     pub recipient: L1Address,
     pub amount: u64,
-    pub siblings: Vec<[u8; 32]>,
+    pub tail: [u8; 32],
 }
 
-pub fn withdrawal_claims(
-    batch_commitment: &[u8; 32],
+/// Every payout call a batch's chain requires, in the order the contract will accept them.
+///
+/// The counterpart to [`withdrawal_chain`] for whoever has to act on it, and the replacement for
+/// what used to be a list of Merkle inclusion proofs. Folding [`accumulate_withdrawal`] over the
+/// first link reproduces the committed chain, and each link's `tail` is the head the contract holds
+/// once that payout has been made.
+pub fn withdrawal_links(
+    domain: &DeploymentDomain,
     payouts: &[(L1Address, u64)],
-) -> Result<Vec<WithdrawalClaim>, VerificationError> {
-    let levels = withdrawal_levels(batch_commitment, payouts)?;
+) -> Vec<WithdrawalLink> {
+    let mut links = Vec::with_capacity(payouts.len());
+    let mut tail = withdrawal_chain_terminal(domain);
 
-    Ok(payouts
-        .iter()
-        .enumerate()
-        .map(|(index, (recipient, amount))| {
-            let mut position = index;
-            let siblings = levels
-                .iter()
-                .take(levels.len().saturating_sub(1))
-                .map(|level| {
-                    let sibling = level[position ^ 1];
-                    position /= 2;
-                    sibling
-                })
-                .collect();
+    for (recipient, amount) in payouts.iter().rev() {
+        links.push(WithdrawalLink {
+            recipient: *recipient,
+            amount: *amount,
+            tail,
+        });
+        tail = accumulate_withdrawal(&tail, recipient, *amount);
+    }
 
-            WithdrawalClaim {
-                index: index as u64,
-                recipient: *recipient,
-                amount: *amount,
-                siblings,
-            }
-        })
-        .collect())
+    links.reverse();
+    links
 }
 
 /// Fold one L1 withdrawal request into the running L1 inbox chain.
@@ -1069,7 +1046,7 @@ fn credit(
 ///
 /// A withdrawal writes one slot too, and it is the other one. There is no receiver to credit, so
 /// total balances fall -- the burn is matched by the settlement contract paying out real ALGO, and
-/// what tells it whom to pay is the withdrawal Merkle root: see [`withdrawal_root`]. This is the
+/// what tells it whom to pay is the withdrawal chain: see [`withdrawal_chain`]. This is the
 /// exact inverse of a deposit, down to which half of the payment is missing.
 ///
 /// Deposits, payments and withdrawals interleave freely. Their commitments preserve transaction
@@ -1079,20 +1056,22 @@ fn credit(
 /// Nothing here trusts the sidecar. Addresses and amounts come from the batch, nonces are derived
 /// from the witnessed account, and post-states are computed rather than supplied, so a doctored
 /// sidecar produces a rejected block rather than a redirected payment.
+///
+/// The batch bytes themselves are not an argument, only the decoded [`Batch`]: replay reads
+/// transactions, and the one thing the raw bytes are needed for -- the commitment -- is computed
+/// where it is used, in [`public_values`].
 pub fn verify_batch(
     domain: &DeploymentDomain,
-    batch_bytes: &[u8],
     old_root: [u8; 32],
     inbox_anchor: [u8; 32],
     batch: &Batch,
     sidecar: &Sidecar,
-) -> Result<([u8; 32], [u8; 32], [u8; 32], u64), VerificationError> {
+) -> Result<([u8; 32], [u8; 32], [u8; 32]), VerificationError> {
     if batch.txns.len() != sidecar.entries.len() {
         return Err(VerificationError::SidecarLengthMismatch);
     }
 
     let mut root = old_root;
-    let batch_commitment = batch_commitment(domain, batch_bytes);
     let mut inbox_chain = inbox_anchor;
     let mut payouts = Vec::new();
 
@@ -1134,9 +1113,6 @@ pub fn verify_batch(
                 root = debit(&sender_addr, &entry.sender_witness, &entry.sig, amt, root)?;
 
                 payouts.push((recipient, amt));
-                if payouts.len() > MAX_WITHDRAWALS {
-                    return Err(VerificationError::TooManyWithdrawals);
-                }
             }
             (Transaction::ForcedWithdrawal(forced), TxnSidecar::ForcedWithdrawal(entry)) => {
                 let (address, recipient) = (forced.header.sender, forced.recipient);
@@ -1170,9 +1146,6 @@ pub fn verify_batch(
                     root = root_with(&address, Some(&account), &entry.sender_witness.proof)?;
 
                     payouts.push((recipient, balance));
-                    if payouts.len() > MAX_WITHDRAWALS {
-                        return Err(VerificationError::TooManyWithdrawals);
-                    }
                 }
 
                 // Folded either way. A request the batch could not pay is still a request the batch
@@ -1184,25 +1157,21 @@ pub fn verify_batch(
         }
     }
 
-    Ok((
-        root,
-        inbox_chain,
-        withdrawal_root(&batch_commitment, &payouts)?,
-        payouts.len() as u64,
-    ))
+    Ok((root, inbox_chain, withdrawal_chain(domain, &payouts)))
 }
 
 /// Every payout a batch queues on L1, in the order it queues them.
 ///
 /// A reporting function, not a checking one: [`verify_batch`] has already decided what is valid, and
-/// this reads the same decisions back out for whoever has to act on them. A claimer needs it because
-/// payout claims need an ordered Merkle tree over what went into the batch, and a
-/// [`ForcedWithdrawal`]'s amount is not on the wire -- it is the balance its witness reveals.
+/// this reads the same decisions back out for whoever has to act on them. The sequencer needs it
+/// because it has to make each of these payouts on L1 before the next batch may open, and a
+/// [`ForcedWithdrawal`]'s amount is not on the wire -- it is the balance its witness reveals. Feed
+/// the result to [`withdrawal_links`] to get the calls themselves.
 ///
 /// The `MIN_WITHDRAWAL` condition is repeated from the forced-withdrawal arm of [`verify_batch`],
 /// which is a duplication worth being uneasy about. What keeps the two honest is that folding
-/// [`withdrawal_root`] over this list has to reproduce the root that arm computed, and a test asserts
-/// exactly that for every scenario.
+/// [`withdrawal_chain`] over this list has to reproduce the chain that arm computed, and a test
+/// asserts exactly that for every scenario.
 ///
 /// Garbage in, garbage out: pair a batch with a sidecar that never verified and the amounts are
 /// whatever that sidecar claimed.
@@ -1332,10 +1301,10 @@ pub fn batch_commitment(domain: &DeploymentDomain, batch_bytes: &[u8]) -> [u8; 3
     accumulator
 }
 
-pub const PUBLIC_VALUES_SIZE: usize = 32 * 6 + 8;
+pub const PUBLIC_VALUES_SIZE: usize = 32 * 6;
 
 /// What a proof exposes: the two roots, batch commitment, unified inbox endpoints, and the
-/// withdrawal root and count.
+/// withdrawal chain.
 ///
 /// ```text
 /// [  0.. 32)  old_root
@@ -1343,15 +1312,14 @@ pub const PUBLIC_VALUES_SIZE: usize = 32 * 6 + 8;
 /// [ 64.. 96)  batch_commitment
 /// [ 96..128)  old_inbox_chain
 /// [128..160)  new_inbox_chain
-/// [160..192)  withdrawal_root
-/// [192..200)  withdrawal_count (u64, big-endian)
+/// [160..192)  withdrawal_chain
 /// ```
 ///
-/// Laid out here so the guest and the settlement contract read the same 200 bytes the same way. The
+/// Laid out here so the guest and the settlement contract read the same 192 bytes the same way. The
 /// contract's side is: check `old_root` against the root it has stored, check the commitment
 /// against a hash of the batch bytes it was handed across the preceding transactions, check both
 /// inbox-chain ends against what it has recorded, verify the proof,
-/// store `new_root`, and store the withdrawal root when its count is nonzero.
+/// store `new_root`, and store the withdrawal chain unless it is already the terminal.
 ///
 /// One chain preserves the global L1 order between deposits and forced withdrawals. It makes a
 /// batch credit exactly what L1 accepted and answer every forced withdrawal in that same order.
@@ -1362,9 +1330,9 @@ pub const PUBLIC_VALUES_SIZE: usize = 32 * 6 + 8;
 /// [`accumulate_deposit`]. Both ends are pinned rather than just the last, so a prover cannot pick
 /// an anchor that makes a fabricated fold land correctly.
 ///
-/// The withdrawal root and count describe a per-batch ordered Merkle tree. Each claim proves one
-/// indexed leaf against that root; replay protection remains contract state rather than being
-/// encoded into the commitment.
+/// The withdrawal chain needs no count beside it and no nullifiers on L1. Its own structure carries
+/// both: the contract walks it one payout at a time, a payout's position in the chain is what makes
+/// it unrepeatable, and reaching [`withdrawal_chain_terminal`] is what says there are no more.
 pub fn public_values(
     domain: &DeploymentDomain,
     old_root: &[u8; 32],
@@ -1372,8 +1340,7 @@ pub fn public_values(
     batch_bytes: &[u8],
     old_inbox_chain: &[u8; 32],
     new_inbox_chain: &[u8; 32],
-    withdrawal_root: &[u8; 32],
-    withdrawal_count: u64,
+    withdrawal_chain: &[u8; 32],
 ) -> [u8; PUBLIC_VALUES_SIZE] {
     let mut buf = [0u8; PUBLIC_VALUES_SIZE];
 
@@ -1382,8 +1349,7 @@ pub fn public_values(
     buf[64..96].copy_from_slice(&batch_commitment(domain, batch_bytes));
     buf[96..128].copy_from_slice(old_inbox_chain);
     buf[128..160].copy_from_slice(new_inbox_chain);
-    buf[160..192].copy_from_slice(withdrawal_root);
-    buf[192..200].copy_from_slice(&withdrawal_count.to_be_bytes());
+    buf[160..192].copy_from_slice(withdrawal_chain);
 
     buf
 }
@@ -1443,14 +1409,8 @@ pub fn execute(
     let batch = Batch::decode(batch_bytes)?;
     let sidecar = Sidecar::decode(sidecar_bytes, &batch)?;
 
-    let (new_root, new_inbox_chain, withdrawal_root, withdrawal_count) = verify_batch(
-        &domain,
-        batch_bytes,
-        old_root,
-        inbox_anchor,
-        &batch,
-        &sidecar,
-    )?;
+    let (new_root, new_inbox_chain, withdrawal_chain) =
+        verify_batch(&domain, old_root, inbox_anchor, &batch, &sidecar)?;
 
     Ok(public_values(
         &domain,
@@ -1459,8 +1419,7 @@ pub fn execute(
         batch_bytes,
         &inbox_anchor,
         &new_inbox_chain,
-        &withdrawal_root,
-        withdrawal_count,
+        &withdrawal_chain,
     ))
 }
 
@@ -1470,10 +1429,8 @@ pub fn execute(
 /// values it claims, so this is the one place `RootMismatch` can come from. The guest calls
 /// [`verify_batch`] directly and lets the settlement contract make the comparison.
 pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
-    let batch_bytes = block.batch.encode();
-    let (root, inbox_chain, withdrawal_root, withdrawal_count) = verify_batch(
+    let (root, inbox_chain, withdrawal_chain) = verify_batch(
         &block.domain,
-        &batch_bytes,
         block.old_root,
         block.old_inbox_chain,
         &block.batch,
@@ -1482,8 +1439,7 @@ pub fn verify_block(block: &Block) -> Result<(), VerificationError> {
 
     if root == block.new_root
         && inbox_chain == block.new_inbox_chain
-        && withdrawal_root == block.withdrawal_root
-        && withdrawal_count == block.withdrawal_count
+        && withdrawal_chain == block.withdrawal_chain
     {
         Ok(())
     } else {
@@ -1614,10 +1570,6 @@ impl Ledger {
                         self.debit(withdrawal.header.sender, withdrawal.amount, &sig);
 
                     payouts.push((withdrawal.recipient, withdrawal.amount));
-                    assert!(
-                        payouts.len() <= MAX_WITHDRAWALS,
-                        "a batch cannot contain more than MAX_WITHDRAWALS payouts",
-                    );
 
                     entries.push(TxnSidecar::Withdrawal(WithdrawalSidecar {
                         sig,
@@ -1649,10 +1601,6 @@ impl Ledger {
                         self.tree.update(&address, Some(&account));
 
                         payouts.push((forced.recipient, balance));
-                        assert!(
-                            payouts.len() <= MAX_WITHDRAWALS,
-                            "a batch cannot contain more than MAX_WITHDRAWALS payouts",
-                        );
                     }
 
                     self.inbox_chain =
@@ -1669,19 +1617,14 @@ impl Ledger {
             txns.push(txn);
         }
 
-        let batch = Batch { txns };
-        let commitment = batch_commitment(&self.domain, &batch.encode());
-        let withdrawal_root = withdrawal_root(&commitment, &payouts).unwrap();
-
         Block {
             domain: self.domain,
             old_root,
             new_root: self.state_root(),
             old_inbox_chain,
             new_inbox_chain: self.inbox_chain,
-            withdrawal_root,
-            withdrawal_count: payouts.len() as u64,
-            batch,
+            withdrawal_chain: withdrawal_chain(&self.domain, &payouts),
+            batch: Batch { txns },
             sidecar: Sidecar { entries },
         }
     }
@@ -1929,7 +1872,6 @@ mod tests {
         assert_eq!(
             verify_batch(
                 &block.domain,
-                &block.batch.encode(),
                 block.old_root,
                 block.old_inbox_chain,
                 &block.batch,
@@ -1939,7 +1881,7 @@ mod tests {
         );
     }
 
-    // The settlement contract reads these 200 bytes by offset, so the layout is as load-bearing as
+    // The settlement contract reads these 192 bytes by offset, so the layout is as load-bearing as
     // the roots themselves.
     #[test]
     fn public_values_lay_out_the_transition_and_the_batch_commitment() {
@@ -1953,8 +1895,7 @@ mod tests {
             &batch_bytes,
             &block.old_inbox_chain(),
             &block.new_inbox_chain(),
-            &block.withdrawal_root(),
-            block.withdrawal_count(),
+            &block.withdrawal_chain(),
         );
 
         assert_eq!(values.len(), PUBLIC_VALUES_SIZE);
@@ -1966,8 +1907,7 @@ mod tests {
         );
         assert_eq!(&values[96..128], &block.old_inbox_chain());
         assert_eq!(&values[128..160], &block.new_inbox_chain());
-        assert_eq!(&values[160..192], &block.withdrawal_root());
-        assert_eq!(&values[192..200], &block.withdrawal_count().to_be_bytes());
+        assert_eq!(&values[160..192], &block.withdrawal_chain());
 
         // The commitment is domain-separated and covers every byte, so a batch that differs
         // anywhere cannot be presented against this proof.
@@ -2161,7 +2101,6 @@ mod tests {
         assert_eq!(
             verify_batch(
                 &block.domain,
-                &block.batch.encode(),
                 block.old_root,
                 block.old_inbox_chain,
                 &block.batch,
@@ -2202,7 +2141,6 @@ mod tests {
         assert_eq!(
             verify_batch(
                 &block.domain,
-                &block.batch.encode(),
                 block.old_root,
                 block.old_inbox_chain,
                 &block.batch,
@@ -2254,9 +2192,11 @@ mod tests {
 
         // Both commitments moved, and neither is the other's.
         assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
-        assert_ne!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
-        assert_ne!(block.withdrawal_root(), block.new_inbox_chain());
-        assert_eq!(block.withdrawal_count(), 1);
+        assert_ne!(
+            block.withdrawal_chain(),
+            withdrawal_chain_terminal(&block.domain())
+        );
+        assert_ne!(block.withdrawal_chain(), block.new_inbox_chain());
     }
 
     #[test]
@@ -2270,91 +2210,124 @@ mod tests {
         let second = second_ledger.get_block(vec![withdrawal(b"a key", l1(1), 100_000)]);
 
         assert_eq!(first.batch().encode(), second.batch().encode());
-        assert_ne!(first.withdrawal_root(), second.withdrawal_root());
+        assert_ne!(first.withdrawal_chain(), second.withdrawal_chain());
     }
 
     #[test]
-    fn a_block_with_no_withdrawals_has_zero_root_and_count() {
+    fn a_block_with_no_withdrawals_lands_on_the_terminal() {
         let block = Ledger::new().get_block(vec![deposit(b"a key", 1_000)]);
 
-        assert_eq!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
-        assert_eq!(block.withdrawal_count(), 0);
+        assert_eq!(
+            block.withdrawal_chain(),
+            withdrawal_chain_terminal(&block.domain())
+        );
         assert_eq!(verify_block(&block), Ok(()));
     }
 
-    fn verify_withdrawal_claim(
-        batch_commitment: &[u8; 32],
-        root: [u8; 32],
-        claim: &WithdrawalClaim,
-    ) -> bool {
-        let mut hash = withdrawal_leaf(
-            batch_commitment,
-            claim.index,
-            &claim.recipient,
-            claim.amount,
-        );
-        let mut index = claim.index;
-        for sibling in &claim.siblings {
-            hash = if index & 1 == 0 {
-                withdrawal_node(&hash, sibling)
-            } else {
-                withdrawal_node(sibling, &hash)
-            };
-            index >>= 1;
-        }
-        hash == root
-    }
-
+    // The whole of what the settlement contract does, in the order it does it: hold the head, take
+    // the next link, check it reproduces the head, and step to its tail. Reaching the terminal after
+    // exactly as many steps as there were payouts is what says the chain committed those payouts and
+    // no others.
     #[test]
-    fn withdrawal_claims_verify_for_ordered_padded_tree() {
+    fn the_links_walk_the_chain_from_its_head_to_the_terminal() {
         let payouts = [(l1(1), 100_000u64), (l1(2), 250_000), (l1(3), 999_999)];
-        let commitment = [7u8; 32];
-        let root = withdrawal_root(&commitment, &payouts).unwrap();
-        let claims = withdrawal_claims(&commitment, &payouts).unwrap();
-        assert_eq!(claims.len(), payouts.len());
-        assert!(claims.iter().all(|claim| claim.siblings.len() == 2));
-        for (index, claim) in claims.iter().enumerate() {
-            assert_eq!(claim.index, index as u64);
-            assert!(verify_withdrawal_claim(&commitment, root, claim));
+        let links = withdrawal_links(&TEST_DOMAIN, &payouts);
+
+        assert_eq!(links.len(), payouts.len());
+
+        let mut head = withdrawal_chain(&TEST_DOMAIN, &payouts);
+        for (link, (recipient, amount)) in links.iter().zip(&payouts) {
+            assert_eq!(link.recipient, *recipient);
+            assert_eq!(link.amount, *amount);
+            assert_eq!(
+                accumulate_withdrawal(&link.tail, &link.recipient, link.amount),
+                head,
+                "the link does not reproduce the head the contract is holding"
+            );
+            head = link.tail;
         }
-        assert_eq!(claims[2].siblings[0], withdrawal_empty());
+
+        assert_eq!(head, withdrawal_chain_terminal(&TEST_DOMAIN));
+    }
+
+    // A payout can only be made against the head, so offering the second link while the first is
+    // still outstanding has to fail -- this is what replaces the claim bitmap. It is also what makes
+    // a payout unrepeatable: once the head has stepped past a link, that link never matches again.
+    #[test]
+    fn a_link_only_matches_the_head_it_belongs_to() {
+        let payouts = [(l1(1), 100_000u64), (l1(2), 250_000)];
+        let head = withdrawal_chain(&TEST_DOMAIN, &payouts);
+        let links = withdrawal_links(&TEST_DOMAIN, &payouts);
+
+        // Out of order.
+        assert_ne!(
+            accumulate_withdrawal(&links[1].tail, &links[1].recipient, links[1].amount),
+            head
+        );
+        // Replayed after the head has moved on.
+        assert_ne!(
+            accumulate_withdrawal(&links[0].tail, &links[0].recipient, links[0].amount),
+            links[0].tail
+        );
+        // Right position, wrong recipient or amount.
+        assert_ne!(
+            accumulate_withdrawal(&links[0].tail, &l1(9), links[0].amount),
+            head
+        );
+        assert_ne!(
+            accumulate_withdrawal(&links[0].tail, &links[0].recipient, links[0].amount + 1),
+            head
+        );
     }
 
     #[test]
-    fn empty_and_single_withdrawal_trees_have_canonical_roots() {
-        let commitment = [8u8; 32];
+    fn empty_and_single_withdrawal_chains_are_canonical() {
         assert_eq!(
-            withdrawal_root(&commitment, &[]).unwrap(),
-            EMPTY_WITHDRAWAL_ROOT
+            withdrawal_chain(&TEST_DOMAIN, &[]),
+            withdrawal_chain_terminal(&TEST_DOMAIN)
         );
 
-        let payout = [(l1(1), 100_000)];
         assert_eq!(
-            withdrawal_root(&commitment, &payout).unwrap(),
-            withdrawal_leaf(&commitment, 0, &l1(1), 100_000)
+            withdrawal_chain(&TEST_DOMAIN, &[(l1(1), 100_000)]),
+            accumulate_withdrawal(&withdrawal_chain_terminal(&TEST_DOMAIN), &l1(1), 100_000)
         );
-        assert!(
-            withdrawal_claims(&commitment, &payout).unwrap()[0]
-                .siblings
-                .is_empty()
+
+        // A one-payout chain drains in a single step, so its only link points straight at the
+        // terminal.
+        assert_eq!(
+            withdrawal_links(&TEST_DOMAIN, &[(l1(1), 100_000)])[0].tail,
+            withdrawal_chain_terminal(&TEST_DOMAIN)
         );
     }
 
     #[test]
-    fn the_withdrawal_root_pins_batch_recipient_amount_and_order() {
+    fn the_withdrawal_chain_pins_domain_recipient_amount_and_order() {
         let a = [(l1(1), 100_000), (l1(2), 200_000)];
         let b = [(l1(2), 200_000), (l1(1), 100_000)];
 
-        assert_ne!(withdrawal_root(&[1; 32], &a), withdrawal_root(&[1; 32], &b));
         assert_ne!(
-            withdrawal_root(&[1; 32], &[(l1(1), 100_000)]),
-            withdrawal_root(&[1; 32], &[(l1(1), 100_001)])
+            withdrawal_chain(&[1; 32], &a),
+            withdrawal_chain(&[1; 32], &b)
         );
         assert_ne!(
-            withdrawal_root(&[1; 32], &[(l1(1), 100_000)]),
-            withdrawal_root(&[1; 32], &[(l1(2), 100_000)])
+            withdrawal_chain(&[1; 32], &[(l1(1), 100_000)]),
+            withdrawal_chain(&[1; 32], &[(l1(1), 100_001)])
         );
-        assert_ne!(withdrawal_root(&[1; 32], &a), withdrawal_root(&[2; 32], &a));
+        assert_ne!(
+            withdrawal_chain(&[1; 32], &[(l1(1), 100_000)]),
+            withdrawal_chain(&[1; 32], &[(l1(2), 100_000)])
+        );
+        assert_ne!(
+            withdrawal_chain(&[1; 32], &a),
+            withdrawal_chain(&[2; 32], &a)
+        );
+
+        // And a prefix is not the whole: dropping the last payout cannot reach the same head, which
+        // is what stops a sequencer stopping short of the chain it committed.
+        assert_ne!(
+            withdrawal_chain(&[1; 32], &a),
+            withdrawal_chain(&[1; 32], &a[..1])
+        );
     }
 
     // Without the tags a payment and a withdrawal of the same amount, from the same sender at the
@@ -2404,25 +2377,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn withdrawal_tree_rejects_more_than_256_payouts() {
-        let payouts = vec![(l1(1), MIN_WITHDRAWAL); MAX_WITHDRAWALS];
-        assert!(withdrawal_root(&[1u8; 32], &payouts).is_ok());
-        assert!(
-            withdrawal_claims(&[1u8; 32], &payouts)
-                .unwrap()
-                .iter()
-                .all(|claim| claim.siblings.len() == 8)
-        );
-
-        let mut too_many = payouts;
-        too_many.push((l1(2), MIN_WITHDRAWAL));
-        assert_eq!(
-            withdrawal_root(&[1u8; 32], &too_many),
-            Err(VerificationError::TooManyWithdrawals)
-        );
-    }
-
     /// A withdrawal L1 ordered, emptying the account for `key` to `recipient`.
     fn forced(key: &[u8], recipient: L1Address) -> SignedTransaction {
         SignedTransaction::forced_withdrawal(ForcedWithdrawal::new(
@@ -2446,20 +2400,19 @@ mod tests {
         // The payout is queued for the whole balance, without the amount ever being on the wire.
         assert_eq!(block.batch().txns()[0].amount(), None);
         assert_eq!(
-            block.withdrawal_root(),
-            withdrawal_root(
-                &batch_commitment(&block.domain(), &block.batch().encode()),
-                &[(l1(7), 1_000_000)]
-            )
-            .unwrap()
+            block.withdrawal_chain(),
+            withdrawal_chain(&block.domain(), &[(l1(7), 1_000_000)])
         );
-        assert_eq!(block.withdrawal_count(), 1);
     }
 
+    // There is no cap on how many payouts one block may commit -- the claim bitmap that used to
+    // impose one is gone -- so a backlog of forced withdrawals larger than any old limit is
+    // answerable in a single block. What bounds it now is only that the sequencer has to make every
+    // one of these payouts on L1 before its next block may open.
     #[test]
-    fn forced_withdrawals_over_the_limit_split_across_blocks() {
+    fn one_block_can_answer_a_large_forced_withdrawal_backlog() {
         let mut ledger = Ledger::new();
-        let keys: Vec<_> = (0..MAX_WITHDRAWALS + 1)
+        let keys: Vec<_> = (0..300)
             .map(|index| format!("forced account {index}").into_bytes())
             .collect();
 
@@ -2467,22 +2420,19 @@ mod tests {
             fund(&mut ledger, key, MIN_WITHDRAWAL);
         }
 
-        let first = ledger.get_block(
-            keys[..MAX_WITHDRAWALS]
-                .iter()
-                .map(|key| forced(key, l1(1)))
-                .collect(),
-        );
-        let second = ledger.get_block(vec![forced(&keys[MAX_WITHDRAWALS], l1(2))]);
+        let block = ledger.get_block(keys.iter().map(|key| forced(key, l1(1))).collect());
 
-        assert_eq!(first.withdrawal_count(), MAX_WITHDRAWALS as u64);
-        assert_eq!(second.withdrawal_count(), 1);
-        assert_eq!(second.old_root(), first.new_root());
-        assert_eq!(first.old_inbox_chain(), INBOX_CHAIN_GENESIS);
-        assert_ne!(first.new_inbox_chain(), first.old_inbox_chain());
-        assert_eq!(second.old_inbox_chain(), first.new_inbox_chain());
-        assert_eq!(verify_block(&first), Ok(()));
-        assert_eq!(verify_block(&second), Ok(()));
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(block.old_inbox_chain(), INBOX_CHAIN_GENESIS);
+        assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
+        assert_eq!(
+            withdrawal_links(
+                &block.domain(),
+                &withdrawal_payouts(block.batch(), block.sidecar())
+            )
+            .len(),
+            keys.len()
+        );
     }
 
     // The property the whole mechanism exists for. An ordinary withdrawal can be dropped by the
@@ -2549,8 +2499,10 @@ mod tests {
         let block = ledger.get_block(vec![forced(b"a key", l1(7))]);
 
         assert_eq!(verify_block(&block), Ok(()));
-        assert_eq!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
-        assert_eq!(block.withdrawal_count(), 0);
+        assert_eq!(
+            block.withdrawal_chain(),
+            withdrawal_chain_terminal(&block.domain())
+        );
         assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
         // Untouched, including the nonce -- nothing happened to it.
         assert_eq!(ledger.account(&a).unwrap().amount(), MIN_WITHDRAWAL - 1);
@@ -2564,8 +2516,10 @@ mod tests {
 
         assert_eq!(verify_block(&block), Ok(()));
         assert_eq!(block.old_root(), block.new_root());
-        assert_eq!(block.withdrawal_root(), EMPTY_WITHDRAWAL_ROOT);
-        assert_eq!(block.withdrawal_count(), 0);
+        assert_eq!(
+            block.withdrawal_chain(),
+            withdrawal_chain_terminal(&block.domain())
+        );
         assert_ne!(block.new_inbox_chain(), block.old_inbox_chain());
     }
 
@@ -2625,20 +2579,16 @@ mod tests {
         assert_eq!(block.new_inbox_chain(), deposit_then_request);
         // Deposited and emptied in the same batch, so the payout is the whole deposit.
         assert_eq!(
-            block.withdrawal_root(),
-            withdrawal_root(
-                &batch_commitment(&block.domain(), &block.batch().encode()),
-                &[(l1(7), 1_000_000)]
-            )
-            .unwrap()
+            block.withdrawal_chain(),
+            withdrawal_chain(&block.domain(), &[(l1(7), 1_000_000)])
         );
     }
 
     // `withdrawal_payouts` repeats the drop rule from `verify_batch`, so the two have to be held
     // together by something. This is that something: the reported payouts have to reproduce the
-    // Merkle root the replay committed.
+    // chain the replay committed.
     #[test]
-    fn the_reported_payouts_reproduce_the_committed_root() {
+    fn the_reported_payouts_reproduce_the_committed_chain() {
         let mut ledger = Ledger::new();
         fund(&mut ledger, b"rich", 5_000_000);
         fund(&mut ledger, b"dust", MIN_WITHDRAWAL - 1);
@@ -2658,12 +2608,22 @@ mod tests {
         // The dust request queued nothing, so only two of the three withdrawals are payable.
         assert_eq!(payouts.len(), 2);
 
-        let commitment = batch_commitment(&block.domain(), &block.batch().encode());
         assert_eq!(
-            withdrawal_root(&commitment, &payouts).unwrap(),
-            block.withdrawal_root()
+            withdrawal_chain(&block.domain(), &payouts),
+            block.withdrawal_chain()
         );
-        assert_eq!(block.withdrawal_count(), payouts.len() as u64);
+
+        // And the links built from them walk that chain to its terminal, which is the sequence of
+        // calls L1 will actually accept.
+        let mut head = block.withdrawal_chain();
+        for link in withdrawal_links(&block.domain(), &payouts) {
+            assert_eq!(
+                accumulate_withdrawal(&link.tail, &link.recipient, link.amount),
+                head
+            );
+            head = link.tail;
+        }
+        assert_eq!(head, withdrawal_chain_terminal(&block.domain()));
     }
 
     #[test]
@@ -2672,8 +2632,8 @@ mod tests {
         let digest_preimage = CHUNK_SIZE;
         let fold_preimage = b"CHUNK".len() + 32 + 32;
         let deposit_preimage = b"INBOXD".len() + 32 + 32 + size_of::<u64>();
-        let withdrawal_leaf_preimage = b"WLEAF".len() + 32 + 8 + 32 + size_of::<u64>();
-        let withdrawal_node_preimage = b"WNODE".len() + 32 + 32;
+        let withdrawal_terminal_preimage = b"WEND".len() + 32;
+        let withdrawal_fold_preimage = b"WPAY".len() + 32 + 32 + size_of::<u64>();
         let request_preimage = b"INBOXW".len() + 32 + 32 + 32;
 
         for (name, len) in [
@@ -2681,8 +2641,8 @@ mod tests {
             ("chunk digest", digest_preimage),
             ("fold step", fold_preimage),
             ("deposit fold", deposit_preimage),
-            ("withdrawal leaf", withdrawal_leaf_preimage),
-            ("withdrawal node", withdrawal_node_preimage),
+            ("withdrawal terminal", withdrawal_terminal_preimage),
+            ("withdrawal fold", withdrawal_fold_preimage),
             ("request fold", request_preimage),
         ] {
             assert!(

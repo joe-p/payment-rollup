@@ -713,7 +713,6 @@ mod tests {
         assert_eq!(
             verify_batch(
                 &block.domain,
-                &batch_bytes,
                 block.old_root,
                 block.old_inbox_chain,
                 &batch,
@@ -722,8 +721,7 @@ mod tests {
             Ok((
                 block.new_root,
                 block.new_inbox_chain,
-                block.withdrawal_root,
-                block.withdrawal_count
+                block.withdrawal_chain
             ))
         );
     }
@@ -803,7 +801,6 @@ mod tests {
         assert_eq!(
             verify_batch(
                 &block.domain,
-                &block.batch.encode(),
                 block.old_root,
                 block.old_inbox_chain,
                 &block.batch,

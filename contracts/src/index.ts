@@ -18,18 +18,12 @@ export const CHUNK_SIZE = 4094;
 export const INBOX_BOX_MBR = 64_100n;
 
 /**
- * Minimum balance one withdrawal queue box costs, advanced by whoever settles the batch and
- * returned when the queue drains. Mirrors `WITHDRAWAL_BOX_MBR` in the contract.
- */
-export const WITHDRAWAL_BOX_MBR = 50_900n;
-export const MAX_WITHDRAWALS = 256;
-
-/**
  * Smallest withdrawal the guest will prove, in microALGO. Mirrors `MIN_WITHDRAWAL` in the core
  * crate.
  *
- * Equal to the network minimum balance, which is what lets `claimWithdrawal` pay out with an inner
- * transaction that cannot fail for want of a receiver account.
+ * Equal to the network minimum balance, which is what lets `payWithdrawal` pay out with an inner
+ * transaction that cannot fail for want of a receiver account -- and so what keeps one payout from
+ * blocking the rest of its batch's chain.
  */
 export const MIN_WITHDRAWAL = 100_000n;
 
@@ -146,9 +140,6 @@ function boxName(prefix: string, key: bigint): Uint8Array {
 
 /** The box a deposit or forced withdrawal request is filed in. */
 const inboxBoxName = (index: bigint) => boxName("i", index);
-
-/** The box a settled batch's unclaimed withdrawals are queued in. */
-const withdrawalBoxName = (batchNumber: bigint) => boxName("w", batchNumber);
 
 /**
  * The bytes a holder signs to demand that their account be let out.
@@ -558,47 +549,58 @@ export class RollupVerifier {
     return exit.amount - EXIT_BOX_MBR;
   }
 
-  /** Number the next batch to settle will take, and so the key its withdrawal queue lands under. */
-  async batchNumber(): Promise<bigint> {
-    return (await this.appClient.state.global.batchNumber()) ?? 0n;
+  /**
+   * Head of the payout chain the last settled batch committed, or `undefined` once it has drained.
+   *
+   * While this has a value the rollup owes withdrawals and {@link RollupVerifier.verifyBatch} cannot
+   * open the next batch.
+   */
+  async pendingWithdrawals(): Promise<Uint8Array | undefined> {
+    // The generated accessor wraps a byte-slice global, and the wrapper is truthy even when the key
+    // is absent -- so unwrap before deciding whether anything is outstanding.
+    return (
+      await this.appClient.state.global.pendingWithdrawals()
+    ).asByteArray();
   }
 
   /**
-   * Pay out one withdrawal from a settled batch's queue.
+   * Make the next payout the settled batch committed.
    *
-   * Claims are independent: `index` selects the nullifier bit and `siblings` proves the indexed
-   * payout against this batch's root. Permissionless -- the payout goes to `recipient` whoever
-   * calls this.
+   * `tail` is the chain value that follows this payout, which the contract folds together with the
+   * other two arguments and compares against the head it holds -- so only the batch's genuine next
+   * payout is accepted, and only once. Take these from `withdrawals` in the fixtures, or from
+   * `withdrawal_links` in the core crate, and submit them in order.
+   *
+   * Permissionless: the payout goes to `recipient` whoever calls this.
    */
-  async claimWithdrawal(
+  async payWithdrawal(
     sender: algosdk.AddressWithTransactionSigner,
-    batchNumber: bigint,
-    index: bigint,
-    batchCommitment: Uint8Array,
     recipient: string,
     amount: bigint,
-    siblings: Uint8Array[],
+    tail: Uint8Array,
   ): Promise<void> {
-    const proof = new Uint8Array(siblings.length * 32);
-    siblings.forEach((sibling, i) => proof.set(sibling, i * 32));
-
-    // Draining the queue deletes the box and refunds its minimum balance, which is a second inner
-    // transaction. Paying for both every time costs 1000 µALGO and avoids making the caller know
-    // which claim is the last one.
-    await this.appClient.send.claimWithdrawal({
+    await this.appClient.send.payWithdrawal({
       sender: sender.address,
       signer: sender.txnSigner,
-      args: {
-        batchNumber,
-        index,
-        batchCommitment,
-        recipient,
-        amount,
-        siblings: proof,
-      },
-      boxReferences: [withdrawalBoxName(batchNumber)],
-      extraFee: microAlgo(2_000),
+      args: { recipient, amount, tail },
+      // Covers the payout's inner transaction, whose own fee the contract sets to zero.
+      extraFee: microAlgo(1_000),
     });
+  }
+
+  /**
+   * Walk a settled batch's whole payout chain, in the one order the contract accepts.
+   *
+   * The sequencer's obligation after every settlement that withdrew anything: until this has run to
+   * the end, {@link RollupVerifier.verifyBatch} cannot open another batch.
+   */
+  async drainWithdrawals(
+    sender: algosdk.AddressWithTransactionSigner,
+    links: { recipient: string; amount: bigint; tail: Uint8Array }[],
+  ): Promise<void> {
+    for (const link of links) {
+      await this.payWithdrawal(sender, link.recipient, link.amount, link.tail);
+    }
   }
 
   /**
@@ -607,8 +609,9 @@ export class RollupVerifier {
    * The inbox entries the batch consumes must already have been filed. `verifyBatch` compares the
    * L1 inbox chain against the batch's fold, so a missing or out-of-order entry fails at the end.
    *
-   * A nonzero withdrawal count in the public values makes the settling call fund and reference the
-   * batch's claim-bitmap box.
+   * The previous batch's payouts must all have been made, or `openBatch` refuses -- see
+   * {@link RollupVerifier.drainWithdrawals}. Settling itself needs no funding transaction and
+   * touches no box, whatever the batch withdraws.
    *
    * An optional cursor target selects the exclusive end of the unified inbox prefix this batch
    * processes. It defaults to the live cursor and may stop earlier to split a backlog across batches.
@@ -661,41 +664,13 @@ export class RollupVerifier {
 
     await composer.send();
 
-    if (publicValues.byteLength !== 200) {
-      throw new Error("public values must be exactly 200 bytes");
-    }
-    const withdrawalCount = new DataView(
-      publicValues.buffer,
-      publicValues.byteOffset + 192,
-      8,
-    ).getBigUint64(0);
-
-    if (withdrawalCount === 0n) {
-      await this.appClient.send.verifyBatch({
-        ...senderSigner,
-        args: { publicValues },
-      });
-
-      return;
+    if (publicValues.byteLength !== 192) {
+      throw new Error("public values must be exactly 192 bytes");
     }
 
-    // The contract reads the transaction immediately before this one, so the funding payment and
-    // the settling call have to travel together.
-    const batchNumber = await this.batchNumber();
-    const funding = await this.appClient.algorand.createTransaction.payment({
-      sender: sender.address,
-      receiver: this.appClient.appAddress,
-      amount: microAlgo(WITHDRAWAL_BOX_MBR),
+    await this.appClient.send.verifyBatch({
+      ...senderSigner,
+      args: { publicValues },
     });
-
-    await this.appClient
-      .newGroup()
-      .addTransaction(funding, sender.txnSigner)
-      .verifyBatch({
-        ...senderSigner,
-        args: { publicValues },
-        boxReferences: [withdrawalBoxName(batchNumber)],
-      })
-      .send();
   }
 }

@@ -5,7 +5,6 @@ import {
   INBOX_BOX_MBR,
   MIN_WITHDRAWAL,
   RollupVerifier,
-  WITHDRAWAL_BOX_MBR,
   deploymentDomain,
   exitMessage,
   l2Address,
@@ -39,6 +38,16 @@ const sha256 = (...parts: Uint8Array[]) => {
 };
 
 const tag = (value: string) => new TextEncoder().encode(value);
+
+/** Where a batch's payout chain ends. Mirrors `withdrawalTerminal` and `withdrawal_chain_terminal`. */
+const withdrawalTerminal = (domain: Uint8Array) => sha256(tag("WEND"), domain);
+
+/** Prepend one payout to a payout chain. Mirrors `accumulate_withdrawal`. */
+const accumulateWithdrawal = (
+  tail: Uint8Array,
+  recipient: Uint8Array,
+  amount: bigint,
+) => sha256(tag("WPAY"), tail, recipient, bytes(amount));
 
 /**
  * Escape parameters small enough for a test to wait out.
@@ -139,52 +148,29 @@ describe("rollup verifier", () => {
       batchCommitment = sha256(tag("CHUNK"), batchCommitment, sha256(chunk));
     }
 
-    const withdrawals = s.withdrawals.map((withdrawal, index) => ({
-      ...withdrawal,
-      index,
-      siblings: [] as string[],
-    }));
-    let withdrawalRoot = Buffer.alloc(32);
-    if (withdrawals.length > 0) {
-      const width = 2 ** Math.ceil(Math.log2(withdrawals.length));
-      const leaves = withdrawals.map((withdrawal) =>
-        sha256(
-          tag("WLEAF"),
-          batchCommitment,
-          bytes(BigInt(withdrawal.index)),
-          hex(withdrawal.recipient),
-          bytes(BigInt(withdrawal.amount)),
-        ),
+    // The payout chain, built back to front from the terminal, which is how the contract can check
+    // a payout before making it: each link carries the tail it folds onto. Mirrors
+    // `withdrawal_links` and `withdrawal_chain`.
+    let chain = withdrawalTerminal(domain);
+    const withdrawals = [];
+    for (const withdrawal of [...s.withdrawals].reverse()) {
+      withdrawals.unshift({ ...withdrawal, tail: chain.toString("hex") });
+      chain = accumulateWithdrawal(
+        chain,
+        hex(withdrawal.recipient),
+        BigInt(withdrawal.amount),
       );
-      while (leaves.length < width) leaves.push(sha256(tag("WEMPTY")));
-
-      let level = leaves;
-      let positions = withdrawals.map((_, index) => index);
-      while (level.length > 1) {
-        for (const [claim, position] of positions.entries()) {
-          withdrawals[claim].siblings.push(level[position ^ 1].toString("hex"));
-        }
-        const next = [];
-        for (let index = 0; index < level.length; index += 2) {
-          next.push(sha256(tag("WNODE"), level[index], level[index + 1]));
-        }
-        level = next;
-        positions = positions.map((position) => Math.floor(position / 2));
-      }
-      withdrawalRoot = level[0];
     }
 
     const publicValues = Buffer.from(hex(s.publicValues));
     batchCommitment.copy(publicValues, 64);
-    withdrawalRoot.copy(publicValues, 160);
-    bytes(BigInt(withdrawals.length)).copy(publicValues, 192);
+    chain.copy(publicValues, 160);
 
     return {
       ...s,
       deploymentDomain: Buffer.from(domain).toString("hex"),
       batchCommitment: batchCommitment.toString("hex"),
-      withdrawalRoot: withdrawalRoot.toString("hex"),
-      withdrawalCount: withdrawals.length,
+      withdrawalChain: chain.toString("hex"),
       withdrawals,
       publicValues: publicValues.toString("hex"),
     };
@@ -222,7 +208,7 @@ describe("rollup verifier", () => {
     }
   };
 
-  /** Settle a scenario, funding the withdrawal queue box when the batch needs one. */
+  /** Settle a scenario. Needs no funding transaction, whatever the batch withdraws. */
   const settle = async (client: RollupVerifier, s: Scenario) => {
     const bound = await bindScenario(client, s);
     await client.verifyBatch(sender, hex(bound.batch), hex(bound.publicValues));
@@ -230,24 +216,18 @@ describe("rollup verifier", () => {
   };
 
   /**
-   * Drain a settled batch's payout queue.
+   * Walk a settled batch's payout chain to its terminal.
    *
-   * Claims are independently proven, so callers may submit them in any order.
+   * Order is not a convention here: the contract holds the head, so only the next payout is
+   * acceptable at any point.
    */
-  const claimAll = async (
-    client: RollupVerifier,
-    s: Scenario,
-    batchNumber: bigint,
-  ) => {
+  const drainAll = async (client: RollupVerifier, s: Scenario) => {
     for (const w of s.withdrawals) {
-      await client.claimWithdrawal(
+      await client.payWithdrawal(
         sender,
-        batchNumber,
-        BigInt(w.index),
-        hex(s.batchCommitment),
         algosdk.encodeAddress(hex(w.recipient)),
         BigInt(w.amount),
-        w.siblings.map(hex),
+        hex(w.tail),
       );
     }
   };
@@ -310,7 +290,7 @@ describe("rollup verifier", () => {
     );
   });
 
-  it("reproduces the Rust fixture commitments and withdrawal proofs", () => {
+  it("reproduces the Rust fixture commitments and withdrawal chains", () => {
     const domain = deploymentDomain(
       hex(fixture.genesisHash),
       BigInt(fixture.appId),
@@ -371,41 +351,31 @@ describe("rollup verifier", () => {
       expect(secondBound.batchCommitment).not.toBe(firstBound.batchCommitment);
     });
 
-    it("rejects a withdrawal root and count that disagree", async () => {
-      const emptyClient = await RollupVerifier.create(algorand, sender);
-      const empty = await bindScenario(
-        emptyClient,
-        scenario("genesis-empty-batch"),
-      );
-      const rootWithoutCount = hex(empty.publicValues);
-      rootWithoutCount.fill(1, 160, 192);
-      await expect(
-        emptyClient.verifyBatch(sender, hex(empty.batch), rootWithoutCount),
-      ).rejects.toThrow();
-
-      const countedClient = await RollupVerifier.create(algorand, sender);
-      const counted = await bindScenario(
-        countedClient,
-        scenario("withdrawals"),
-      );
-      await replayDeposits(countedClient, counted);
-      const countWithoutRoot = hex(counted.publicValues);
-      countWithoutRoot.fill(0, 160, 192);
-      await expect(
-        countedClient.verifyBatch(sender, hex(counted.batch), countWithoutRoot),
-      ).rejects.toThrow();
-    });
-
-    it("rejects more withdrawals than the claim bitmap can represent", async () => {
+    // There is nothing for the contract to compare a withdrawal chain against, so a fabricated one
+    // settles -- and then wedges the sequencer, because no payout can ever reproduce a head that
+    // came from nowhere. That is the honest statement of where the trust sits until the verifier
+    // lands, and it costs the sequencer rather than anybody's funds.
+    it("accepts any withdrawal chain and is then stuck with it", async () => {
       const client = await RollupVerifier.create(algorand, sender);
       const empty = await bindScenario(client, scenario("genesis-empty-batch"));
       const publicValues = hex(empty.publicValues);
       publicValues.fill(1, 160, 192);
-      bytes(257n).copy(publicValues, 192);
 
+      await client.verifyBatch(sender, hex(empty.batch), publicValues);
+      expect(await client.pendingWithdrawals()).toEqual(
+        new Uint8Array(Buffer.alloc(32, 1)),
+      );
+
+      // No link folds to `0x01…01`, so the chain cannot be drained and no further batch can open.
       await expect(
-        client.verifyBatch(sender, hex(empty.batch), publicValues),
+        client.payWithdrawal(
+          sender,
+          sender.address.toString(),
+          100_000n,
+          Buffer.alloc(32),
+        ),
       ).rejects.toThrow();
+      await expect(settle(client, scenario("deposits-only"))).rejects.toThrow();
     });
 
     it("restricts open, chunk, verify, and abandon to the creator", async () => {
@@ -508,10 +478,11 @@ describe("rollup verifier", () => {
       await client.verifyBatch(sender, hex(second.batch), publicValues);
 
       const state = await client.appClient.state.global.getAll();
-      expect(state.batchNumber).toBe(2n);
       expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
         first.newRoot,
       );
+      // Neither batch withdrew anything, so neither left a payout chain to hold the other up.
+      expect(await client.pendingWithdrawals()).toBeUndefined();
     });
   });
 
@@ -713,19 +684,17 @@ describe("rollup verifier", () => {
   describe("withdrawals", () => {
     const withdrawing = () => scenario("withdrawals");
 
-    /** Deploy, replay the inbox, settle, and hand back the queue's batch number. */
+    /** Deploy, replay the inbox, and settle, leaving the payout chain outstanding. */
     const settled = async (s: Scenario) => {
       const client = await RollupVerifier.create(algorand, sender);
       await replayL1(client, s);
-
-      const batchNumber = await client.batchNumber();
       const bound = await settle(client, s);
 
-      return { client, batchNumber, s: bound };
+      return { client, s: bound };
     };
 
     it("pays every withdrawal out to the account the batch named", async () => {
-      const { client, batchNumber, s } = await settled(withdrawing());
+      const { client, s } = await settled(withdrawing());
 
       const before = await Promise.all(
         s.withdrawals.map((w) =>
@@ -733,141 +702,165 @@ describe("rollup verifier", () => {
         ),
       );
 
-      await claimAll(client, s, batchNumber);
+      await drainAll(client, s);
 
-      // Each recipient got its own amount, proving each index independently.
       for (const [index, w] of s.withdrawals.entries()) {
         const after = await balanceOf(algosdk.encodeAddress(hex(w.recipient)));
         expect(after - before[index]).toBe(BigInt(w.amount));
       }
+
+      // Reaching the terminal clears the chain, so the rollup owes nothing.
+      expect(await client.pendingWithdrawals()).toBeUndefined();
     });
 
-    it("allows independent claims in arbitrary order", async () => {
-      const { client, batchNumber, s } = await settled(withdrawing());
-      await claimAll(
-        client,
-        { ...s, withdrawals: [...s.withdrawals].reverse() },
-        batchNumber,
+    // The chain is the order. This is what replaces the claim bitmap: there is no bit to check
+    // because there is only ever one payout the contract will accept.
+    it("refuses a payout out of chain order", async () => {
+      const { client, s } = await settled(withdrawing());
+      const second = s.withdrawals[1];
+
+      await expect(
+        client.payWithdrawal(
+          sender,
+          algosdk.encodeAddress(hex(second.recipient)),
+          BigInt(second.amount),
+          hex(second.tail),
+        ),
+      ).rejects.toThrow();
+
+      // The head has not moved, so the first payout still goes through.
+      const first = s.withdrawals[0];
+      await client.payWithdrawal(
+        sender,
+        algosdk.encodeAddress(hex(first.recipient)),
+        BigInt(first.amount),
+        hex(first.tail),
       );
     });
 
-    it("refuses altered index, recipient, amount, commitment, sibling, or proof length", async () => {
-      const { client, batchNumber, s } = await settled(withdrawing());
-      const withdrawal = s.withdrawals[0];
-      const claim = (
-        index = BigInt(withdrawal.index),
-        commitment = hex(s.batchCommitment),
-        recipient = algosdk.encodeAddress(hex(withdrawal.recipient)),
-        amount = BigInt(withdrawal.amount),
-        siblings = withdrawal.siblings.map(hex),
-      ) =>
-        client.claimWithdrawal(
-          sender,
-          batchNumber,
-          index,
-          commitment,
-          recipient,
-          amount,
-          siblings,
-        );
+    it("refuses an altered recipient, amount, or tail", async () => {
+      const { client, s } = await settled(withdrawing());
+      const w = s.withdrawals[0];
+      const pay = (
+        recipient = algosdk.encodeAddress(hex(w.recipient)),
+        amount = BigInt(w.amount),
+        tail = hex(w.tail),
+      ) => client.payWithdrawal(sender, recipient, amount, tail);
 
-      await expect(claim(1n)).rejects.toThrow();
-      await expect(
-        claim(undefined, undefined, sender.address.toString()),
-      ).rejects.toThrow();
-      await expect(
-        claim(undefined, undefined, undefined, BigInt(withdrawal.amount) + 1n),
-      ).rejects.toThrow();
-      const commitment = Buffer.from(hex(s.batchCommitment));
-      commitment[0] ^= 1;
-      await expect(claim(undefined, commitment)).rejects.toThrow();
-      const siblings = withdrawal.siblings.map(hex);
-      siblings[0] = Buffer.from(siblings[0]);
-      siblings[0][0] ^= 1;
-      await expect(
-        claim(undefined, undefined, undefined, undefined, siblings),
-      ).rejects.toThrow();
-      await expect(
-        claim(undefined, undefined, undefined, undefined, siblings.slice(1)),
-      ).rejects.toThrow();
+      await expect(pay(sender.address.toString())).rejects.toThrow();
+      await expect(pay(undefined, BigInt(w.amount) + 1n)).rejects.toThrow();
+      const tail = Buffer.from(hex(w.tail));
+      tail[0] ^= 1;
+      await expect(pay(undefined, undefined, tail)).rejects.toThrow();
+
+      // None of them moved the head, so the genuine payout is still the next one.
+      await pay();
     });
 
-    it("rejects a duplicate withdrawal index", async () => {
-      const { client, batchNumber, s } = await settled(withdrawing());
-      const withdrawal = s.withdrawals[0];
-
-      const claim = () =>
-        client.claimWithdrawal(
+    // Position in the chain is the nullifier: once the head has stepped past a payout, the same
+    // arguments can never reproduce a head again.
+    it("refuses a replayed payout", async () => {
+      const { client, s } = await settled(withdrawing());
+      const w = s.withdrawals[0];
+      const pay = () =>
+        client.payWithdrawal(
           sender,
-          batchNumber,
-          BigInt(withdrawal.index),
-          hex(s.batchCommitment),
-          algosdk.encodeAddress(hex(withdrawal.recipient)),
-          BigInt(withdrawal.amount),
-          withdrawal.siblings.map(hex),
+          algosdk.encodeAddress(hex(w.recipient)),
+          BigInt(w.amount),
+          hex(w.tail),
         );
 
-      await claim();
-      await expect(claim()).rejects.toThrow();
+      await pay();
+      await expect(pay()).rejects.toThrow();
     });
 
-    it("pays identical withdrawals at distinct indices independently", async () => {
-      const { client, batchNumber, s } = await settled(
-        scenario("duplicate-withdrawals"),
-      );
+    // Two identical payouts are two distinct positions in the chain, differing only in their tails,
+    // and each is made exactly once.
+    it("pays identical withdrawals at distinct chain positions", async () => {
+      const { client, s } = await settled(scenario("duplicate-withdrawals"));
       const recipient = algosdk.encodeAddress(hex(s.withdrawals[0].recipient));
       const before = await balanceOf(recipient);
 
-      await claimAll(
-        client,
-        { ...s, withdrawals: [...s.withdrawals].reverse() },
-        batchNumber,
-      );
+      expect(s.withdrawals[0].recipient).toBe(s.withdrawals[1].recipient);
+      expect(s.withdrawals[0].amount).toBe(s.withdrawals[1].amount);
+      expect(s.withdrawals[0].tail).not.toBe(s.withdrawals[1].tail);
+
+      await drainAll(client, s);
 
       expect((await balanceOf(recipient)) - before).toBe(
         BigInt(s.withdrawals[0].amount) * 2n,
       );
     });
 
-    it("returns the queue box minimum balance when the last claim lands", async () => {
+    // The rule the whole redesign exists for: the sequencer cannot move on while it still owes
+    // withdrawals.
+    it("refuses to open the next batch until the chain has drained", async () => {
+      const { client, s } = await settled(withdrawing());
+
+      expect(await client.pendingWithdrawals()).toBeDefined();
+      await expect(settle(client, scenario("deposits-only"))).rejects.toThrow();
+
+      // Halfway is still not drained.
+      const [first, ...rest] = s.withdrawals;
+      await client.payWithdrawal(
+        sender,
+        algosdk.encodeAddress(hex(first.recipient)),
+        BigInt(first.amount),
+        hex(first.tail),
+      );
+      expect(await client.pendingWithdrawals()).toBeDefined();
+      await expect(settle(client, scenario("deposits-only"))).rejects.toThrow();
+
+      await drainAll(client, { ...s, withdrawals: rest });
+      expect(await client.pendingWithdrawals()).toBeUndefined();
+    });
+
+    // Draining costs the app exactly the payouts and nothing else -- no box minimum balance is
+    // advanced at settlement and none is returned at the end, because there is no box.
+    it("pays out exactly the withdrawals, with no box minimum balance either way", async () => {
       const s = withdrawing();
       const client = await RollupVerifier.create(algorand, sender);
       await replayDeposits(client, s);
 
-      const batchNumber = await client.batchNumber();
-      const bound = await settle(client, s);
-
-      // The settler advanced the box's minimum balance out of their own pocket, so the app is
-      // holding it on top of what it owes.
       const app = client.appClient.appAddress;
-      const held = await balanceOf(app);
-      const queues = async () =>
-        (await client.appClient.appClient.getBoxNames()).filter(
-          (n) => n.nameRaw[0] === "w".charCodeAt(0),
-        );
-      expect(await queues()).toHaveLength(1);
+      const beforeSettle = await balanceOf(app);
+      const bound = await settle(client, s);
+      expect(await balanceOf(app)).toBe(beforeSettle);
 
-      await claimAll(client, bound, batchNumber);
+      await drainAll(client, bound);
 
       const paid = s.withdrawals.reduce((t, w) => t + BigInt(w.amount), 0n);
-      // The app paid out exactly the withdrawals and gave the box minimum balance back.
-      expect(held - (await balanceOf(app))).toBe(paid + WITHDRAWAL_BOX_MBR);
+      expect(beforeSettle - (await balanceOf(app))).toBe(paid);
 
-      // And the box is gone, so nothing else can be claimed against that batch.
-      expect(await queues()).toHaveLength(0);
+      // And no box was ever created for the chain.
+      const names = await client.appClient.appClient.getBoxNames();
+      expect(
+        names.filter((n) => n.nameRaw[0] === "w".charCodeAt(0)),
+      ).toHaveLength(0);
     });
 
-    // A batch that withdraws nothing folds to the genesis value and must not open a box at all --
-    // that is what keeps the common settlement free of the whole mechanism.
-    it("opens no queue for a batch that withdraws nothing", async () => {
+    // A batch that withdraws nothing commits the terminal itself, so it writes no chain and the
+    // rollup is free to continue immediately -- that is what keeps the common settlement free of the
+    // whole mechanism.
+    it("leaves no chain for a batch that withdraws nothing", async () => {
       const s = scenario("deposits-only");
       const client = await RollupVerifier.create(algorand, sender);
 
       await replayDeposits(client, s);
       await settle(client, s);
 
-      const names = await client.appClient.appClient.getBoxNames();
+      expect(await client.pendingWithdrawals()).toBeUndefined();
+      await expect(
+        client.payWithdrawal(
+          sender,
+          sender.address.toString(),
+          100_000n,
+          Buffer.alloc(32),
+        ),
+      ).rejects.toThrow();
+
       // The inbox boxes are asserted alongside so this cannot pass by seeing no boxes at all.
+      const names = await client.appClient.appClient.getBoxNames();
       expect(
         names.filter((n) => n.nameRaw[0] === "i".charCodeAt(0)),
       ).toHaveLength(s.inbox.length);
@@ -877,7 +870,8 @@ describe("rollup verifier", () => {
     });
 
     // Value that already left L2 in a settled batch is not the rollup's to withhold, whatever
-    // happens to the rollup afterwards.
+    // happens to the rollup afterwards. Being permissionless, the drain needs nobody's cooperation
+    // either -- which is what stops an outstanding chain from becoming a hostage.
     it("still pays out after the rollup has escaped", async () => {
       const client = await RollupVerifier.create(
         algorand,
@@ -888,69 +882,47 @@ describe("rollup verifier", () => {
 
       const fixtureScenario = withdrawing();
       await replayDeposits(client, fixtureScenario);
-      const batchNumber = await client.batchNumber();
       const s = await settle(client, fixtureScenario);
 
-      // Strand a fresh deposit and pull the hatch.
+      // Strand a fresh deposit and pull the hatch, with the chain still outstanding.
       await client.deposit(sender, hex(s.deposits[0].recipient), 1_000n);
       await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
 
-      const withdrawal = s.withdrawals[2];
-      const recipient = algosdk.encodeAddress(hex(withdrawal.recipient));
-      const before = await balanceOf(recipient);
+      expect(await client.pendingWithdrawals()).toBeDefined();
 
-      await client.claimWithdrawal(
-        sender,
-        batchNumber,
-        BigInt(withdrawal.index),
-        hex(s.batchCommitment),
-        recipient,
-        BigInt(withdrawal.amount),
-        withdrawal.siblings.map(hex),
-      );
-
-      expect((await balanceOf(recipient)) - before).toBe(
-        BigInt(withdrawal.amount),
-      );
-    });
-
-    // Queues are keyed by batch number and anchored at genesis independently, so one batch's
-    // claims neither block nor are blocked by another's.
-    it("keeps two batches' queues independent", async () => {
-      const s = withdrawing();
-      const client = await RollupVerifier.create(algorand, sender);
-
-      await replayDeposits(client, s);
-      const first = await client.batchNumber();
-      const bound = await settle(client, s);
-
-      // The same scenario cannot settle twice -- it starts from genesis -- so this only checks the
-      // keying, which is what the independence rests on.
-      expect(first).toBe(0n);
-      expect(await client.batchNumber()).toBe(1n);
-
-      const withdrawal = s.withdrawals[2];
-      await expect(
-        client.claimWithdrawal(
-          sender,
-          1n,
-          BigInt(withdrawal.index),
-          hex(bound.batchCommitment),
-          algosdk.encodeAddress(hex(withdrawal.recipient)),
-          BigInt(withdrawal.amount),
-          withdrawal.siblings.map(hex),
+      const outsider = await fundedOutsider();
+      const before = await Promise.all(
+        s.withdrawals.map((w) =>
+          balanceOf(algosdk.encodeAddress(hex(w.recipient))),
         ),
-      ).rejects.toThrow();
+      );
+
+      for (const w of s.withdrawals) {
+        await client.payWithdrawal(
+          outsider,
+          algosdk.encodeAddress(hex(w.recipient)),
+          BigInt(w.amount),
+          hex(w.tail),
+        );
+      }
+
+      for (const [index, w] of s.withdrawals.entries()) {
+        expect(
+          (await balanceOf(algosdk.encodeAddress(hex(w.recipient)))) -
+            before[index],
+        ).toBe(BigInt(w.amount));
+      }
+      expect(await client.pendingWithdrawals()).toBeUndefined();
     });
 
     // The round-trip scenario withdraws from an account that held nothing when the block opened.
     it("settles a batch that deposits, pays and withdraws at once", async () => {
-      const { client, batchNumber, s } = await settled(scenario("round-trip"));
+      const { client, s } = await settled(scenario("round-trip"));
 
-      await claimAll(client, s, batchNumber);
+      await drainAll(client, s);
 
       const state = await client.appClient.state.global.getAll();
       expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
@@ -1318,14 +1290,13 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(algorand, sender);
 
       await replayL1(client, s);
-      const batchNumber = await client.batchNumber();
       const bound = await settle(client, s);
 
       const payout = bound.withdrawals[0];
       const recipient = algosdk.encodeAddress(hex(payout.recipient));
       const before = await balanceOf(recipient);
 
-      await claimAll(client, bound, batchNumber);
+      await drainAll(client, bound);
 
       // The whole deposited balance, and no amount was ever named on L1 or on the wire.
       expect((await balanceOf(recipient)) - before).toBe(BigInt(payout.amount));
@@ -1497,7 +1468,9 @@ describe("rollup verifier", () => {
       newChain: Uint8Array,
       inboxCursor: bigint,
       scenarioName:
-        "genesis-empty-batch" | "forced-exit" = "genesis-empty-batch",
+        | "genesis-empty-batch"
+        | "forced-exit"
+        | "withdrawals" = "genesis-empty-batch",
     ) => {
       // Proof verification is still TODO, so these values intentionally isolate L1 FIFO watchdog
       // behavior without pretending the empty Rust batch produced the synthetic inbox transition.
@@ -1578,6 +1551,7 @@ describe("rollup verifier", () => {
       expect(state.settledInboxCursor).toBe(2n);
       expect(state.escapeInboxTarget).toBeUndefined();
       expect(state.escapeDeadline).toBeUndefined();
+      expect(state.escapeProgress).toBeUndefined();
     });
 
     it("extends exactly once for the first 256 of 257 FIFO entries, then clears", async () => {
@@ -1627,6 +1601,84 @@ describe("rollup verifier", () => {
       expect(state.settledInboxCursor).toBe(257n);
       expect(state.escapeInboxTarget).toBeUndefined();
       expect(state.escapeDeadline).toBeUndefined();
+      expect(state.escapeProgress).toBeUndefined();
+    }, 120_000);
+
+    // The point of counting both directions on one tranche. An outstanding payout chain closes
+    // `openBatch`, so a sequencer under accusation has to drain before it can settle again -- and
+    // without payouts earning credit, the drain the gate demands could itself be why the deadline
+    // was missed. Here 255 consumed inbox entries plus one payout make a tranche between them.
+    it("lets a settlement and a payout share one obligation tranche", async () => {
+      const grace = 20n;
+      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
+      const recipient = hex(scenario("deposits-only").deposits[0].recipient);
+      let chain = Buffer.alloc(32);
+      let shortOfTranche = Buffer.alloc(32);
+
+      for (let index = 0; index < 256; index++) {
+        expect(await client.deposit(sender, recipient, 1n)).toBe(BigInt(index));
+        chain = sha256(tag("INBOXD"), chain, recipient, bytes(1n));
+        if (index === 254) shortOfTranche = chain;
+      }
+
+      await client.signalEscape(sender);
+      const initialDeadline = (await client.appClient.state.global.getAll())
+        .escapeDeadline!;
+
+      // Consume 255 of the 256 pending entries: short of the fixed target, and one short of a
+      // tranche, so nothing is bought yet. This batch withdraws, so it leaves a chain outstanding.
+      const bound = await settleSyntheticPrefix(
+        client,
+        Buffer.alloc(32),
+        shortOfTranche,
+        255n,
+        "withdrawals",
+      );
+
+      let state = await client.appClient.state.global.getAll();
+      expect(state.settledInboxCursor).toBe(255n);
+      expect(state.escapeInboxTarget).toBe(256n);
+      expect(state.escapeProgress).toBe(255n);
+      expect(state.escapeDeadline).toBe(initialDeadline);
+      expect(await client.pendingWithdrawals()).toBeDefined();
+
+      // The prefix above is synthetic, so the deposit that would have funded these payouts never
+      // reached L1 and every microALGO the app holds is committed to an inbox box. Cover them
+      // directly -- this test is isolating the watchdog, not the accounting.
+      await algorand.send.payment({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        receiver: client.appClient.appAddress,
+        amount: microAlgo(1_000_000),
+      });
+
+      // An outsider's payout is real work, but it is not the sequencer's, and the accusation is
+      // against the sequencer -- so it moves the chain and buys nothing.
+      const outsider = await fundedOutsider();
+      await client.payWithdrawal(
+        outsider,
+        algosdk.encodeAddress(hex(bound.withdrawals[0].recipient)),
+        BigInt(bound.withdrawals[0].amount),
+        hex(bound.withdrawals[0].tail),
+      );
+
+      state = await client.appClient.state.global.getAll();
+      expect(state.escapeProgress).toBe(255n);
+      expect(state.escapeDeadline).toBe(initialDeadline);
+
+      // The sequencer's own payout completes the tranche the settlement started.
+      await client.payWithdrawal(
+        sender,
+        algosdk.encodeAddress(hex(bound.withdrawals[1].recipient)),
+        BigInt(bound.withdrawals[1].amount),
+        hex(bound.withdrawals[1].tail),
+      );
+
+      state = await client.appClient.state.global.getAll();
+      expect(state.escapeDeadline).toBe(initialDeadline + grace);
+      // Spent, not carried, so the next window costs a full tranche again.
+      expect(state.escapeProgress).toBe(0n);
+      expect(state.escapeInboxTarget).toBe(256n);
     }, 120_000);
 
     // A request arriving mid-batch lies beyond the selected checkpoint and belongs to a later
