@@ -4,6 +4,7 @@ import nacl from "tweetnacl";
 import {
   RollupVerifierFactory,
   RollupVerifierClient,
+  RollupVerifierComposer,
 } from "../contracts/clients/RollupVerifierClient";
 
 import { AlgorandClient, microAlgo } from "@algorandfoundation/algokit-utils";
@@ -240,7 +241,7 @@ export class RollupVerifier {
 
   async deploymentDomain(): Promise<Uint8Array> {
     const { genesisHash } = await this.algorand.getSuggestedParams();
-    return deploymentDomain(genesisHash, this.appClient.appId);
+    return deploymentDomain(genesisHash!, this.appClient.appId);
   }
 
   /**
@@ -380,7 +381,7 @@ export class RollupVerifier {
     });
 
     const senderSigner = { sender: sender.address, signer: sender.txnSigner };
-    let group = this.appClient.newGroup();
+    let group: RollupVerifierComposer<any> = this.appClient.newGroup();
     // One signature check and a couple of hashes, so a pair of fillers is ample.
     for (let i = 0; i < 3; i++) {
       group = group.opUp({ ...senderSigner, args: { nonce: BigInt(i) } });
@@ -530,7 +531,7 @@ export class RollupVerifier {
         forceExitOpcodeCost(exit.siblings.length) / OPCODE_BUDGET_PER_CALL,
       ) - 1;
 
-    let group = this.appClient.newGroup();
+    let group: RollupVerifierComposer<any> = this.appClient.newGroup();
     for (let i = 0; i < fillers; i++) {
       // The nonce only exists to keep two fillers from being the same transaction.
       group = group.opUp({ ...senderSigner, args: { nonce: BigInt(i) } });
