@@ -14,7 +14,15 @@ import { AlgorandClient, microAlgo } from "@algorandfoundation/algokit-utils";
  */
 export const CHUNK_SIZE = 4094;
 
-/** Minimum balance one inbox box costs. Mirrors `INBOX_BOX_MBR` in the contract. */
+/**
+ * Minimum balance one inbox box costs: `2500 + 400 * (key + value)`, over a 9-byte key (`"i"` and an
+ * 8-byte index) and a 145-byte record.
+ *
+ * Written out here and nowhere in the contract, which measures what a box charged it rather than
+ * naming a figure. A caller has no such option -- the payment has to be built before the box exists
+ * -- so this is a prediction of the contract's measurement, and one the contract will reject if it
+ * is wrong.
+ */
 export const INBOX_BOX_MBR = 64_100n;
 
 /**
@@ -28,11 +36,13 @@ export const INBOX_BOX_MBR = 64_100n;
 export const MIN_WITHDRAWAL = 100_000n;
 
 /**
- * Minimum balance for the permanent record that an account has been force-exited. Mirrors
- * `EXIT_BOX_MBR` in the contract.
+ * Minimum balance for the permanent record that an account has been force-exited, over a 33-byte key
+ * (`"e"` and a 32-byte rollup address) and an 8-byte value.
  *
  * Withheld from the exit rather than paid separately, and never returned: the record has to outlive
- * the payout or a frozen state root would keep authorizing the same one.
+ * the payout or a frozen state root would keep authorizing the same one. Like {@link INBOX_BOX_MBR}
+ * this only predicts what the contract measures for itself -- it is here to report what a caller will
+ * actually receive, not to tell the contract what to withhold.
  */
 export const EXIT_BOX_MBR = 18_900n;
 

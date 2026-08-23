@@ -74,16 +74,6 @@ export type Chunk = bytes;
 export type PublicValues = bytes<192>;
 
 /**
- * Minimum balance the network charges for one inbox box: `2500 + 400 * (key + value)`, over a
- * 9-byte key (`"i"` and an 8-byte index) and a 145-byte value.
- *
- * The depositor funds it as part of their payment and gets it back from `pruneDeposit` once the
- * deposit has settled, so a deposit costs nothing but fees in the end and the app never subsidises
- * one. Spam is paid for by the spammer for as long as it sits in the queue.
- */
-const INBOX_BOX_MBR = 64_100;
-
-/**
  * Obligations the rollup must discharge to earn one escape grace extension.
  *
  * An obligation is one unit of work L1 can see the sequencer owe and then see it do: one inbox entry
@@ -92,21 +82,6 @@ const INBOX_BOX_MBR = 64_100;
  * watchdog has no business caring which one the sequencer is currently discharging.
  */
 const ESCAPE_PROGRESS_TRANCHE = 256;
-
-/**
- * Minimum balance for one exit record: `2500 + 400 * (key + value)`, over a 33-byte key (`"e"` and
- * a 32-byte rollup address) and an 8-byte value.
- *
- * Unlike the refundable queues, this one is never returned. The box is a permanent record that an
- * account has been paid out, and it has to outlive the exit or the same account could be exited
- * twice against a state root that is frozen and will keep proving it.
- *
- * It is funded by withholding it from the exit itself rather than by a separate payment, which is
- * what makes the accounting close: the app pays out `amount - EXIT_BOX_MBR` and its own minimum
- * balance rises by exactly `EXIT_BOX_MBR`, so it ends up holding precisely what it is still
- * required to hold and not a microALGO more.
- */
-const EXIT_BOX_MBR = 18_900;
 
 /**
  * The one signature scheme a forced exit can check.
@@ -145,6 +120,28 @@ type InboxRecord = {
   /** Inbox-chain value immediately after this entry was appended. */
   chainAfter: bytes<32>;
 };
+
+/**
+ * The app account's own minimum balance, read either side of a box write to price the box.
+ *
+ * Every box in this contract is paid for by whoever caused it, and the amount is never written down:
+ * take this before and after creating the box and the difference *is* what the network charged.
+ * Take it before and after deleting one and the difference is what the network has just released,
+ * which is exactly what a refund owes.
+ *
+ * The alternative is `2500 + 400 * (key + value)` evaluated by hand into a constant, which is one
+ * fact about the network and two about a record's layout, all three silently wrong the moment any of
+ * them changes -- a field added to `InboxRecord`, a key prefix widened, or a consensus reprice. A
+ * mismatch there is not a compile error but a leak: too high and the app refunds more than the box
+ * ever locked, too low and it strands the difference forever.
+ *
+ * Measuring costs a `min_balance` read per side and, in `deposit`, forces the box to be allocated
+ * before its contents are computed. That is the whole price, and it buys arithmetic that cannot
+ * disagree with the ledger.
+ */
+function appMinBalance(): uint64 {
+  return Txn.applicationId.address.minBalance;
+}
 
 /** The network- and application-specific domain shared with the guest and signing clients. */
 function deploymentDomain(): bytes<32> {
@@ -357,8 +354,11 @@ export class RollupVerifier extends Contract {
    * the chain is copied at `openBatch` rather than reset -- so one arriving mid-batch simply
    * belongs to the next one. Refusing them would mean a stuck batch could block deposits forever.
    *
-   * The payment must exceed `INBOX_BOX_MBR`, and the excess is what gets credited. `rekeyTo` and
-   * `closeRemainderTo` are pinned to zero because either would hand the app away or drain it.
+   * The payment must exceed the box's own minimum balance and the excess is what gets credited, so
+   * the depositor advances that minimum balance and gets it back from `pruneDeposit` once the deposit
+   * has settled -- a deposit costs nothing but fees in the end, and the app never subsidises one.
+   * Spam is paid for by the spammer for as long as it sits in the queue. What that costs is measured
+   * rather than written down; see `appMinBalance`.
    *
    * **`recipient` is an L2 address, not an Algorand address.** It is `sha256("ADDR" || scheme ||
    * pub_key)`, the same derivation `address_from_public_key` performs; use the `l2Address` helper
@@ -381,19 +381,26 @@ export class RollupVerifier extends Contract {
   deposit(payment: gtxn.PaymentTxn, recipient: bytes<32>): uint64 {
     assert(!this.escaped.value, "the rollup has escaped");
 
+    const index = this.inboxCursor.value;
+
+    // The box is allocated before its contents are known, and has to be: the contents depend on
+    // what it cost. The credited amount is the payment less the box's minimum balance, and that
+    // amount is folded into the chain value the box itself stores. `create` allocates the record's
+    // full fixed width, so what it charges is what the finished record charges. See `appMinBalance`.
+    const preMbr = appMinBalance();
+    this.inbox(index).create();
+    const boxMbr: uint64 = appMinBalance() - preMbr;
+
     assertMatch(
       payment,
       {
         receiver: Global.currentApplicationAddress,
-        closeRemainderTo: Global.zeroAddress,
-        rekeyTo: Global.zeroAddress,
-        amount: { greaterThan: INBOX_BOX_MBR },
+        amount: { greaterThan: boxMbr },
       },
       "the deposit must pay this app more than the box minimum balance",
     );
 
-    const amount: uint64 = payment.amount - INBOX_BOX_MBR;
-    const index = this.inboxCursor.value;
+    const amount: uint64 = payment.amount - boxMbr;
 
     const chainAfter = sha256(
       Bytes("INBOXD")
@@ -459,13 +466,21 @@ export class RollupVerifier extends Contract {
     signature: bytes<64>,
   ): uint64 {
     assert(!this.escaped.value, "the rollup has escaped");
+
+    const index = this.inboxCursor.value;
+
+    // Allocated up front purely to price it, exactly as in `deposit`. Nothing here depends on the
+    // figure -- a request carries no amount -- but the payment does, and one measurement is what
+    // keeps the charge and the refund `pruneRequest` makes the same number by construction.
+    const preMbr = appMinBalance();
+    this.inbox(index).create();
+    const boxMbr: uint64 = appMinBalance() - preMbr;
+
     assertMatch(
       payment,
       {
         receiver: Global.currentApplicationAddress,
-        closeRemainderTo: Global.zeroAddress,
-        rekeyTo: Global.zeroAddress,
-        amount: INBOX_BOX_MBR,
+        amount: boxMbr,
       },
       "the request must cover its box minimum balance exactly",
     );
@@ -491,7 +506,6 @@ export class RollupVerifier extends Contract {
       "the request is not signed by the account's key",
     );
 
-    const index = this.inboxCursor.value;
     const chainAfter = sha256(
       Bytes("INBOXW")
         .concat(this.inboxChain.value)
@@ -535,11 +549,14 @@ export class RollupVerifier extends Contract {
       "a request cannot be pruned before the batch that answered it has settled",
     );
 
+    // Refund what the deletion actually released, not what a constant says it should have. The two
+    // cannot drift apart here the way a written-down figure can: the number being sent is read off
+    // the same ledger entry the deletion just moved. See `appMinBalance`.
+    const preMbr = appMinBalance();
     this.inbox(index).delete();
+    const boxMbr: uint64 = preMbr - appMinBalance();
 
-    itxn
-      .payment({ receiver: record.payer, amount: INBOX_BOX_MBR, fee: 0 })
-      .submit();
+    itxn.payment({ receiver: record.payer, amount: boxMbr, fee: 0 }).submit();
   }
 
   /**
@@ -554,9 +571,9 @@ export class RollupVerifier extends Contract {
    * Still callable after an escape: a deposit below `settledInboxCursor` was consumed by a batch
    * that settled, so its box is stale bookkeeping either way.
    *
-   * `INBOX_BOX_MBR` is below the network's own minimum balance, so this fails if `payer` has
-   * since closed their account. Self-healing rather than fatal -- the payer refunds their account
-   * and anyone can then prune -- and it costs the app nothing to leave the box sitting there.
+   * A box's minimum balance is below the network's own, so this fails if `payer` has since closed
+   * their account. Self-healing rather than fatal -- the payer refunds their account and anyone can
+   * then prune -- and it costs the app nothing to leave the box sitting there.
    */
   pruneDeposit(index: uint64): void {
     const record = clone(this.inbox(index).value);
@@ -566,12 +583,14 @@ export class RollupVerifier extends Contract {
       "a deposit cannot be pruned before the batch that consumed it has settled",
     );
 
+    const preMbr = appMinBalance();
     this.inbox(index).delete();
+    const boxMbr: uint64 = preMbr - appMinBalance();
 
     itxn
       .payment({
         receiver: record.payer,
-        amount: INBOX_BOX_MBR,
+        amount: boxMbr,
         fee: 0,
       })
       .submit();
@@ -610,12 +629,17 @@ export class RollupVerifier extends Contract {
 
     const record = clone(this.inbox(index).value);
     assert(record.kind === Bytes("d"), "the inbox entry is not a deposit");
+
+    // The deposit and the box's minimum balance travel back together, the second of them measured
+    // by the deletion that released it -- see `pruneDeposit`, which returns that half alone.
+    const preMbr = appMinBalance();
     this.inbox(index).delete();
+    const boxMbr: uint64 = preMbr - appMinBalance();
 
     itxn
       .payment({
         receiver: record.payer,
-        amount: record.amount + INBOX_BOX_MBR,
+        amount: record.amount + boxMbr,
         fee: 0,
       })
       .submit();
@@ -709,9 +733,12 @@ export class RollupVerifier extends Contract {
    * The signed message names this application and network through `deploymentDomain`, so a
    * signature cannot be carried to another deployment where the same key controls the same address.
    *
-   * `amount` must exceed `EXIT_BOX_MBR`, which is withheld to pay for the permanent record. An
-   * account holding less than that costs more to write off than it is worth and cannot be exited --
-   * the honest statement of a real limit, rather than a payout that quietly underflows.
+   * `amount` must exceed what the permanent record costs, which is withheld from the exit itself
+   * rather than funded by a separate payment. Unlike the refundable queues that minimum balance is
+   * never returned: the box has to outlive the exit, or the same account could be exited twice
+   * against a state root that is frozen and will keep proving it. An account holding less than the
+   * record costs is worth less than writing it off and cannot be exited -- the honest statement of a
+   * real limit, rather than a payout that quietly underflows.
    *
    * @param address The rollup address being exited, and the position in the tree being proven.
    * @param nonce Together with `amount` and `authAddress`, the account as the leaf commits to it.
@@ -732,10 +759,6 @@ export class RollupVerifier extends Contract {
   ): void {
     assert(this.escaped.value, "the rollup has not escaped");
     assert(!this.exits(address).exists, "this account has already exited");
-    assert(
-      amount > EXIT_BOX_MBR,
-      "the balance does not cover the cost of recording the exit",
-    );
 
     // Mirrors `address_from_public_key`. Checking the key against the account's own `auth_address`
     // -- rather than against `address` -- is what lets a rekeyed account still be exited by
@@ -790,12 +813,24 @@ export class RollupVerifier extends Contract {
       "the account does not prove against the settled root",
     );
 
+    // The record is written before the balance it records is checked against the cost of writing it,
+    // because the cost is what writing it reveals. The order is safe -- a failed assertion takes the
+    // box with it -- and it is what makes the accounting close exactly: the app's own minimum balance
+    // rises by `boxMbr` and it pays out `boxMbr` less than the balance, so it is left holding
+    // precisely what it is still required to hold. See `appMinBalance`.
+    const preMbr = appMinBalance();
     this.exits(address).value = amount;
+    const boxMbr: uint64 = appMinBalance() - preMbr;
+
+    assert(
+      amount > boxMbr,
+      "the balance does not cover the cost of recording the exit",
+    );
 
     itxn
       .payment({
         receiver: recipient,
-        amount: amount - EXIT_BOX_MBR,
+        amount: amount - boxMbr,
         fee: 0,
       })
       .submit();
