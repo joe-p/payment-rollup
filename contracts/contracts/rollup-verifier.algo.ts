@@ -295,12 +295,16 @@ export class RollupVerifier extends Contract {
    * Rounds the oldest pending inbox entry may age before it counts as evidence the sequencer has
    * stopped.
    *
+   * Applies to either kind of entry, which is the whole reason it is not named for deposits: a stale
+   * deposit means value is stuck outside the rollup, a stale withdrawal request means value is stuck
+   * inside it, and `signalEscape` reads the queue head without caring which it found.
+   *
    * Set at creation rather than compiled in, for two reasons. There is no `UpdateApplication`
    * handler, so a baked-in constant could never be retuned. And the e2e has to be able to cross
    * this threshold -- a production value is hundreds of thousands of rounds, which no test can
    * generate, so the test deploys with a handful.
    */
-  depositTimeout = GlobalState<uint64>();
+  inboxTimeout = GlobalState<uint64>();
 
   /**
    * Rounds between `signalEscape` and `executeEscape`.
@@ -321,9 +325,10 @@ export class RollupVerifier extends Contract {
    * The two escape parameters are arguments because they are the one thing about this contract a
    * deployment legitimately needs to choose. Both are measured in rounds; at roughly 2.8 seconds a
    * round, a week is about 216,000 and a day about 31,000. Setting them too low hands a griefer a
-   * halt; too high, and a depositor waits that long to get their money back.
+   * halt; too high, and whoever is stuck in the inbox -- a depositor waiting to be credited, or an
+   * account waiting to be let out -- waits that long for the hatch to open.
    */
-  createApplication(depositTimeout: uint64, escapeGrace: uint64): void {
+  createApplication(inboxTimeout: uint64, escapeGrace: uint64): void {
     this.stateRoot.value = bzero(32);
     this.inboxChain.value = bzero(32);
     this.settledInboxChain.value = bzero(32);
@@ -332,7 +337,7 @@ export class RollupVerifier extends Contract {
     this.requestCursor.value = 0;
 
     this.escaped.value = false;
-    this.depositTimeout.value = depositTimeout;
+    this.inboxTimeout.value = inboxTimeout;
     this.escapeGrace.value = escapeGrace;
   }
 
@@ -841,7 +846,7 @@ export class RollupVerifier extends Contract {
 
     const head = this.inbox(this.settledInboxCursor.value).value.round;
     assert(
-      Global.round > head + this.depositTimeout.value,
+      Global.round > head + this.inboxTimeout.value,
       "nothing has been waiting long enough",
     );
 
@@ -899,7 +904,7 @@ export class RollupVerifier extends Contract {
    * working afterwards, and being permissionless it needs nobody's cooperation either.
    *
    * Permissionless. There is nothing left to gate -- the deadline is the authorization, and it can
-   * only have been set by pending work that exceeded `depositTimeout`, plus any grace extensions
+   * only have been set by pending work that exceeded `inboxTimeout`, plus any grace extensions
    * earned by full FIFO tranches.
    */
   executeEscape(): void {

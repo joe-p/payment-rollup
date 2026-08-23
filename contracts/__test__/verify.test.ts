@@ -55,7 +55,7 @@ const accumulateWithdrawal = (
  * The production values are hundreds of thousands of rounds, which is precisely why they are
  * deployment arguments rather than contract constants -- no test could ever reach one.
  */
-const TEST_DEPOSIT_TIMEOUT = 5n;
+const TEST_INBOX_TIMEOUT = 5n;
 const TEST_ESCAPE_GRACE = 3n;
 
 /**
@@ -876,7 +876,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
 
@@ -886,7 +886,7 @@ describe("rollup verifier", () => {
 
       // Strand a fresh deposit and pull the hatch, with the chain still outstanding.
       await client.deposit(sender, hex(s.deposits[0].recipient), 1_000n);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -940,14 +940,14 @@ describe("rollup verifier", () => {
       RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
 
     /** Deposit, let it go stale, and signal. Leaves the contract one grace period from escape. */
     const signalOverStaleDeposit = async (client: RollupVerifier) => {
       await client.deposit(sender, recipient(), 1_000n);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
     };
 
@@ -970,7 +970,7 @@ describe("rollup verifier", () => {
       const client = await escapable();
 
       // The queue is empty, so there is no deposit to point at and no censorship to allege.
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
 
       await expect(client.signalEscape(sender)).rejects.toThrow();
     });
@@ -994,7 +994,7 @@ describe("rollup verifier", () => {
       const s = scenario("deposits-only");
 
       await replayDeposits(client, s);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
 
       await settle(client, s);
@@ -1019,7 +1019,7 @@ describe("rollup verifier", () => {
         boxReferences: [queueBox(2n)],
       });
       await client.deposit(sender, recipient(), 1_000n);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       const initialDeadline = (await client.appClient.state.global.getAll())
         .escapeDeadline;
@@ -1055,7 +1055,7 @@ describe("rollup verifier", () => {
       const s = scenario("deposits-only");
 
       await replayDeposits(client, s);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
 
@@ -1162,7 +1162,7 @@ describe("rollup verifier", () => {
       const stranded = await balanceOf(depositor.addr);
       const held = await balanceOf(app);
 
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -1222,7 +1222,7 @@ describe("rollup verifier", () => {
         await client.deposit(sender, recipient(), amount);
       }
 
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -1731,7 +1731,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
       const s = scenario("forced-exit");
@@ -1754,7 +1754,7 @@ describe("rollup verifier", () => {
       );
 
       // The only pending unified inbox entry is the request.
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -1766,7 +1766,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
       const { request, pair } = subject();
@@ -1788,7 +1788,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
       const { request, pair } = subject();
@@ -1801,7 +1801,7 @@ describe("rollup verifier", () => {
         pair.secretKey,
       );
 
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -1813,13 +1813,13 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
       const { request, pair } = subject();
 
       await client.deposit(sender, hex(request.address), 1_000n);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
@@ -1847,7 +1847,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(
         algorand,
         sender,
-        TEST_DEPOSIT_TIMEOUT,
+        TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
 
@@ -1856,7 +1856,7 @@ describe("rollup verifier", () => {
 
       // The rollup then stops. One stranded deposit is what lets anyone prove it.
       await client.deposit(sender, hex(s.deposits[0].recipient), 1_000n);
-      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await advanceRounds(Number(TEST_INBOX_TIMEOUT) + 1);
       await client.signalEscape(sender);
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);

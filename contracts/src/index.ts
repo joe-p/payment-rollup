@@ -40,15 +40,15 @@ export const EXIT_BOX_MBR = 18_900n;
 const MAX_GROUP_SIZE = 16;
 
 /**
- * Rounds a deposit may sit unsequenced before {@link RollupVerifier.signalEscape} will accept it as
- * evidence the sequencer has stopped, and rounds between that signal and
- * {@link RollupVerifier.executeEscape}.
+ * Rounds an inbox entry of either kind -- a deposit or a forced withdrawal request -- may sit
+ * unsequenced before {@link RollupVerifier.signalEscape} will accept it as evidence the sequencer has
+ * stopped, and rounds between that signal and {@link RollupVerifier.executeEscape}.
  *
  * A week and a day, at roughly 2.8 seconds a round. Deployment-time arguments rather than contract
  * constants because there is no `UpdateApplication` handler to retune them later -- and because the
  * e2e has to be able to actually cross the threshold, which it cannot do with numbers this size.
  */
-export const DEPOSIT_TIMEOUT_ROUNDS = 216_000n;
+export const INBOX_TIMEOUT_ROUNDS = 216_000n;
 export const ESCAPE_GRACE_ROUNDS = 31_000n;
 
 /**
@@ -242,7 +242,7 @@ export class RollupVerifier {
   static async create(
     algorand: AlgorandClient,
     creator: algosdk.AddressWithTransactionSigner,
-    depositTimeout: bigint = DEPOSIT_TIMEOUT_ROUNDS,
+    inboxTimeout: bigint = INBOX_TIMEOUT_ROUNDS,
     escapeGrace: bigint = ESCAPE_GRACE_ROUNDS,
   ) {
     const factory = algorand.client.getTypedAppFactory(RollupVerifierFactory);
@@ -251,7 +251,7 @@ export class RollupVerifier {
       sender: creator.address,
       signer: creator.txnSigner,
       note: `Created on ${Date.now()}`,
-      args: { depositTimeout, escapeGrace },
+      args: { inboxTimeout, escapeGrace },
     });
 
     const verifier = new RollupVerifier(algorand, result.appClient.appId);
