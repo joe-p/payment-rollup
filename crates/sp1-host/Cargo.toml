@@ -5,8 +5,37 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Reaching the prover network. Off by default, and it has to be: turning it on pulls in the whole
+# SP1 SDK and makes every build of this crate compile the guest for RISC-V. Two things have to be
+# installed for that to work at all --
+#
+#   the SP1 toolchain, which builds the guest:  curl -L https://sp1up.succinct.xyz | bash && sp1up
+#   protoc, which the SDK's network client needs: apt-get install protobuf-compiler
+#
+# -- and neither is needed to emit fixtures, which is the common case. `contracts`' `build:fixtures`
+# runs this binary with no features at all.
+prove = ["dep:sp1-sdk", "dep:sp1-build"]
+
 [dependencies]
 payment-rollup = { path = "../payment-rollup" }
 # Host-only, and deliberately so: nothing here is compiled into the guest, where every dependency
 # is paid for in cycles.
 serde_json = { workspace = true }
+# The signing halves of the two signing schemes, for the one scenario whose spends carry real
+# signatures. A fixture builder is the other place a private key belongs -- see the note on the
+# `sign` feature in `falcon-det1024`'s manifest -- and it belongs here rather than in
+# `payment-rollup` because the keys exist to build blocks, not to verify them.
+ed25519-dalek = { workspace = true }
+falcon-det1024 = { path = "../falcon-det1024", features = ["sign"] }
+# `blocking` because this is a CLI with no runtime of its own, `network` because the prover network
+# is the only prover it talks to -- local proving would want a GPU this is not written for.
+sp1-sdk = { version = "6.4.0", default-features = false, features = [
+    "blocking",
+    "network",
+], optional = true }
+
+[build-dependencies]
+# Compiles `sp1-guest` to a zkVM ELF and hands its path to `include_elf!`. Optional alongside the
+# `prove` feature so a default build never shells out to a toolchain it does not need.
+sp1-build = { version = "6.4.0", optional = true }

@@ -4,21 +4,31 @@
 //! Between them they cover what a settlement exercises: a batch that fits in one chunk, a batch
 //! that does not, a batch of nothing but deposits, and the transition being nothing at all.
 //!
-//! Every account that spends here is authorized by [`Scheme::Managed`], which is the one scheme
-//! with no key behind it: the replay checks that the presented key hashes to the account's
+//! Almost every account that spends here is authorized by [`Scheme::Managed`], which is the one
+//! scheme with no key behind it: the replay checks that the presented key hashes to the account's
 //! `auth_address` and has nothing else to check. That is deliberate rather than left over. These
 //! blocks exist to drive the settlement contract, and the contract never sees a signature -- the
-//! sidecar they live in stays with the prover -- so real keys would cost these fixtures a nonce
-//! ledger of their own and buy the contract nothing. What signature verification does is tested
-//! where it lives, in `payment-rollup`'s own suite.
+//! sidecar they live in stays with the prover -- so real keys would cost most of these fixtures a
+//! nonce ledger of their own and buy the contract nothing. What signature verification *means* is
+//! tested where it lives, in `payment-rollup`'s own suite.
 //!
-//! The forced-exit fixtures are the exception, and for the opposite reason: their accounts are
-//! [`Scheme::Ed25519`] because L1 *does* check a signature on that path. See `EXIT_KEYS`.
+//! Two scenarios are exceptions, for two different reasons.
+//!
+//! The forced-exit fixtures use [`Scheme::Ed25519`] accounts because L1 *does* check a signature on
+//! that path -- but they are funded by deposits and never spend, so nothing signs on this side. See
+//! `EXIT_KEYS`.
+//!
+//! `every-scheme` is the one block whose spends carry signatures the replay has to check, one
+//! account per scheme, holding real keys. It is here rather than in `payment-rollup` because what it
+//! is for is the *cost* of those checks: it is the only fixture whose proof pays for an Ed25519
+//! verification and a Falcon one, so it is the only one that says what a signature costs in the
+//! guest. See [`Key`].
 //!
 //! Every scenario starts from the empty ledger. Value gets in the way it does in production, with a
 //! deposit at the head of the block, so there is nothing here a contract has to be put into
 //! position to accept.
 
+use ed25519_dalek::{Signer, SigningKey};
 use payment_rollup::ForcedWithdrawal;
 use payment_rollup::{
     Address, Block, DeploymentDomain, Deposit, L1Address, Ledger, MIN_WITHDRAWAL, Payment, Scheme,
@@ -111,6 +121,15 @@ pub fn all() -> &'static [Scenario] {
                           Covers the inbox and withdrawal commitments moving together and a withdrawal \
                           spending what a payment delivered earlier in that same block.",
             build: round_trip,
+        },
+        Scenario {
+            name: "every-scheme",
+            description: "One account per signing scheme -- managed, Ed25519, and the \
+                          Falcon-1024/Ed25519 hybrid -- each funded by a deposit and each then \
+                          signing a payment and a withdrawal. The only scenario whose spends carry \
+                          signatures the replay has to check, so the only one whose proof pays for \
+                          a curve verification and a lattice one.",
+            build: every_scheme,
         },
     ]
 }
@@ -413,6 +432,166 @@ fn multi_chunk(domain: DeploymentDomain) -> Block {
     ledger.get_block(stxns)
 }
 
+/// The length of every seed below, which is the length Ed25519 fixes.
+///
+/// Falcon takes a seed of any length, so the two halves of a hybrid key can be -- and are -- grown
+/// from the same 32 bytes.
+const SEED_SIZE: usize = 32;
+
+/// A key pair for one [`Scheme`], and the only thing in this file that can sign.
+///
+/// Every key is grown from a fixed seed, so two runs of the emitter produce byte-identical
+/// fixtures. That holds for the Falcon half as well, whose key generation and signing are both
+/// deterministic -- see the note on determinism in `falcon-det1024` -- so "the same key" here means
+/// the same bytes rather than merely a key that works.
+///
+/// The seeds are written out in the calls below rather than hidden behind a counter for the reason
+/// [`EXIT_KEYS`] is written out: a fixture that anybody may have to reproduce should say what it was
+/// made from.
+// A Falcon key pair is 4098 bytes and an enum is as large as its largest variant. Nothing here holds
+// more than three of them.
+#[allow(clippy::large_enum_variant)]
+enum Key {
+    /// No key at all, in the sense that matters: the bytes are what the address hashes, and nothing
+    /// signs with them. Carried anyway so a managed account can be handled alongside the others.
+    Managed(&'static [u8; SEED_SIZE]),
+    Ed25519(SigningKey),
+    /// Both halves, in the order [`Scheme::Falcon1024HybridEd25519`] concatenates them.
+    Hybrid(SigningKey, falcon_det1024::SigningKey),
+}
+
+impl Key {
+    fn managed(seed: &'static [u8; SEED_SIZE]) -> Self {
+        Key::Managed(seed)
+    }
+
+    fn ed25519(seed: &[u8; SEED_SIZE]) -> Self {
+        Key::Ed25519(SigningKey::from_bytes(seed))
+    }
+
+    fn hybrid(seed: &[u8; SEED_SIZE]) -> Self {
+        Key::Hybrid(
+            SigningKey::from_bytes(seed),
+            falcon_det1024::SigningKey::from_seed(seed),
+        )
+    }
+
+    fn scheme(&self) -> Scheme {
+        match self {
+            Key::Managed(_) => Scheme::Managed,
+            Key::Ed25519(_) => Scheme::Ed25519,
+            Key::Hybrid(..) => Scheme::Falcon1024HybridEd25519,
+        }
+    }
+
+    /// The public key the account's address is derived from, in its scheme's layout.
+    fn pub_key(&self) -> Vec<u8> {
+        match self {
+            Key::Managed(seed) => seed.to_vec(),
+            Key::Ed25519(key) => key.verifying_key().to_bytes().to_vec(),
+            Key::Hybrid(ed25519, falcon) => {
+                let mut key = ed25519.verifying_key().to_bytes().to_vec();
+                key.extend_from_slice(falcon.public_key());
+
+                key
+            }
+        }
+    }
+
+    fn address(&self) -> Address {
+        address_from_public_key(self.scheme(), &self.pub_key())
+    }
+
+    /// This key's signature over `message`, in the layout its scheme calls for.
+    ///
+    /// The hybrid's two halves sign the same bytes and are concatenated Ed25519-first, which is the
+    /// order the verifier splits them at -- see `crypto::verify`. A managed key signs nothing at
+    /// all, which is not a special case so much as the whole of what the scheme is.
+    fn sign(&self, message: &[u8]) -> Signature {
+        let sig = match self {
+            Key::Managed(_) => Vec::new(),
+            Key::Ed25519(key) => key.sign(message).to_bytes().to_vec(),
+            Key::Hybrid(ed25519, falcon) => {
+                let mut sig = ed25519.sign(message).to_bytes().to_vec();
+                sig.extend_from_slice(&falcon.sign_compressed(message));
+
+                sig
+            }
+        };
+
+        Signature::new(self.scheme(), self.pub_key(), sig)
+    }
+}
+
+/// One key per scheme, in the order [`Scheme::identifier`] declares them.
+///
+/// A function rather than a constant because generating the Falcon half is real work, and no other
+/// scenario should pay for it.
+fn every_scheme_keys() -> [Key; 3] {
+    [
+        Key::managed(b"payment-rollup managed key!!!!!!"),
+        Key::ed25519(b"payment-rollup ed25519 key!!!!!!"),
+        Key::hybrid(b"payment-rollup hybrid key!!!!!!!"),
+    ]
+}
+
+/// What each of the three accounts is deposited, paid, and withdraws.
+///
+/// The payments are a cycle -- each account pays the next, the last pays the first -- so every
+/// account ends the payments holding exactly what it was deposited, and the withdrawal amounts can
+/// be chosen freely. They are chosen distinct so no two payouts in the emitted queue are
+/// interchangeable, the same reason the `withdrawals` scenario's are.
+const EVERY_SCHEME_DEPOSIT: u64 = 2_000_000;
+const EVERY_SCHEME_PAYMENT: u64 = 250_000;
+const EVERY_SCHEME_WITHDRAWALS: [u64; 3] = [300_000, 400_000, 500_000];
+
+/// A block in which all three schemes authorize a spend.
+///
+/// Each account is funded by a deposit, then signs a payment and a withdrawal -- both signing tags,
+/// under every scheme, in one batch. The nonces are written out because a deposit does not advance
+/// one and [`Ledger::debit`] advances before it checks: a fresh account's first spend signs nonce 1
+/// and its second signs nonce 2. Getting either wrong is a panic out of the ledger rather than a
+/// fixture that quietly proves nothing.
+///
+/// Both signing preimages commit to the deployment domain, so the signatures here are only valid
+/// for the `domain` they were built with. That is not a caveat for the settlement contract, which
+/// never sees them, but it does mean the sidecar of this scenario -- unlike every other -- cannot be
+/// rebound to another deployment after the fact. Emit it for the domain it will be proved under.
+fn every_scheme(domain: DeploymentDomain) -> Block {
+    let keys = every_scheme_keys();
+    let mut ledger = Ledger::with_domain(domain);
+
+    let mut stxns: Vec<_> = keys
+        .iter()
+        .map(|key| SignedTransaction::deposit(Deposit::new(key.address(), EVERY_SCHEME_DEPOSIT)))
+        .collect();
+
+    for (index, key) in keys.iter().enumerate() {
+        let receiver = keys[(index + 1) % keys.len()].address();
+        let payment = Payment::new(key.address(), receiver, EVERY_SCHEME_PAYMENT);
+
+        stxns.push(SignedTransaction::payment(
+            payment,
+            key.sign(&payment.bytes_to_sign(&domain, 1)),
+        ));
+    }
+
+    for (index, key) in keys.iter().enumerate() {
+        let withdrawal = Withdrawal::new(
+            key.address(),
+            l1_account(11 + index as u8),
+            EVERY_SCHEME_WITHDRAWALS[index],
+        );
+
+        stxns.push(SignedTransaction::withdrawal(
+            withdrawal,
+            key.sign(&withdrawal.bytes_to_sign(&domain, 2)),
+        ));
+    }
+
+    ledger.get_block(stxns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +821,76 @@ mod tests {
         }
         assert_ne!(proofs[0].amount, proofs[1].amount);
         assert_ne!(proofs[0].address, proofs[1].address);
+    }
+
+    // Every scheme, spending. Two transactions per account -- the payment and the withdrawal -- so
+    // both signing tags are covered under all three, and `every_scenario_is_a_block_that_verifies`
+    // above is what says the signatures over them check out.
+    #[test]
+    fn the_every_scheme_scenario_spends_under_every_scheme() {
+        let block = every_scheme(DOMAIN);
+        let senders: Vec<_> = block
+            .batch()
+            .txns()
+            .iter()
+            .map(|txn| txn.sender())
+            .collect();
+
+        let mut schemes = Vec::new();
+        for key in &every_scheme_keys() {
+            assert_eq!(
+                senders.iter().filter(|s| **s == key.address()).count(),
+                2,
+                "{:?} does not spend exactly twice",
+                key.scheme()
+            );
+            schemes.push(key.scheme());
+        }
+
+        assert_eq!(
+            schemes,
+            vec![
+                Scheme::Managed,
+                Scheme::Ed25519,
+                Scheme::Falcon1024HybridEd25519
+            ],
+            "a scheme was added or dropped without the scenario following"
+        );
+    }
+
+    // The claim the scenario exists for: the sidecar the prover reads names all three schemes, so
+    // replaying it is what costs a curve verification and a lattice one.
+    #[test]
+    fn the_every_scheme_sidecar_names_every_scheme() {
+        let sidecar = every_scheme(DOMAIN).sidecar().encode();
+
+        for key in &every_scheme_keys() {
+            let identifier = key.scheme().identifier();
+
+            assert!(
+                sidecar.windows(identifier.len()).any(|w| w == identifier),
+                "{:?} does not appear in the sidecar",
+                key.scheme()
+            );
+        }
+    }
+
+    // What makes the fixture's signatures load-bearing rather than decorative. The ledger checks
+    // every signature as it builds the block -- see `Ledger::debit` -- so a hybrid signature over
+    // the wrong nonce cannot be built into one at all. If this stopped panicking, the scenario would
+    // have stopped proving anything about Falcon.
+    #[test]
+    #[should_panic(expected = "InvalidSignature")]
+    fn an_every_scheme_signature_over_the_wrong_nonce_is_refused() {
+        let key = Key::hybrid(b"payment-rollup hybrid key!!!!!!!");
+        let mut ledger = Ledger::with_domain(DOMAIN);
+        let payment = Payment::new(key.address(), address_of(b"a key"), EVERY_SCHEME_PAYMENT);
+
+        ledger.get_block(vec![
+            SignedTransaction::deposit(Deposit::new(key.address(), EVERY_SCHEME_DEPOSIT)),
+            // Nonce 2, where a fresh account's first spend is at 1.
+            SignedTransaction::payment(payment, key.sign(&payment.bytes_to_sign(&DOMAIN, 2))),
+        ]);
     }
 
     // The round-trip scenario's third transaction spends from an account that held nothing when the

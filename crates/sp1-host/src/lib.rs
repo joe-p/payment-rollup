@@ -17,6 +17,10 @@ use payment_rollup::{
 
 pub mod scenarios;
 
+/// Groth16 proving, which is the one thing here that needs a zkVM and a network.
+#[cfg(feature = "prove")]
+pub mod prove;
+
 /// Re-exported so the binary, and anything else driving the contract, reads the chunk size and the
 /// public-values size from one place rather than from two crates.
 pub use payment_rollup::{CHUNK_SIZE, PUBLIC_VALUES_SIZE};
@@ -31,6 +35,30 @@ pub const GENESIS_ROOT: [u8; 32] = [0u8; 32];
 
 /// The unified L1 inbox chain a freshly deployed contract starts life holding.
 pub use payment_rollup::INBOX_CHAIN_GENESIS;
+
+/// A Groth16 proof of one settlement, reduced to what a fixture carries.
+///
+/// Plain data, and deliberately not behind the `prove` feature. The shape of the emitted JSON
+/// should not depend on how the binary was built, and keeping this type unconditional is what lets
+/// the emitter have one code path rather than two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofFixture {
+    /// The proof in the encoding an onchain verifier takes: a four-byte selector cut from
+    /// [`Self::verifier_hash`], then the proof itself.
+    pub bytes: Vec<u8>,
+    /// The program's verifying key, `0x`-prefixed. What the verifier is pinned to, and the same
+    /// for every scenario proved against one ELF.
+    pub vkey: String,
+    /// The five field elements the Groth16 circuit is checked against. The first two are the vkey
+    /// hash and the hash of the public values.
+    pub public_inputs: [String; 5],
+    /// The proof alone, hex and without the selector.
+    pub encoded_proof: String,
+    /// The Groth16 *verifier's* key hash -- not the program's. Its first four bytes are the
+    /// selector prefixed onto [`Self::bytes`], which is how a verifier holding several circuits
+    /// picks the right one.
+    pub verifier_hash: [u8; 32],
+}
 
 /// One L1 action, in the global order the settlement must submit it.
 #[derive(Clone, Debug, PartialEq, Eq)]

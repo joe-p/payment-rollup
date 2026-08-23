@@ -1,16 +1,25 @@
-//! Emits settlement fixtures as JSON, for driving the contract end to end before there is a proof.
+//! Emits settlement fixtures as JSON, for driving the contract end to end.
 //!
 //! Everything the contract's three methods take comes out of here: `batchLength` to open with,
 //! `chunks` to post, and `publicValues` to settle against. See [`sp1_host`] for how they are
 //! computed, which is by running the guest program natively.
+//!
+//! A native replay is enough for all of that, because the settlement contract does not check a
+//! proof yet. `--prove` produces one anyway, on the Succinct Prover Network -- see the `prove`
+//! module, and note that it is behind a cargo feature this binary is not built with by default.
 
 use std::process::ExitCode;
 
 use payment_rollup::{MIN_WITHDRAWAL, deployment_domain};
 use serde_json::{Value, json};
 use sp1_host::{
-    GENESIS_ROOT, INBOX_CHAIN_GENESIS, InboxItem, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
+    GENESIS_ROOT, INBOX_CHAIN_GENESIS, InboxItem, PUBLIC_VALUES_SIZE, ProofFixture, Settlement,
+    hex, scenarios,
 };
+
+/// The network names the SDK's `NetworkMode` parses, mirrored here so a typo is caught by a build
+/// that cannot prove as well as by one that can.
+const NETWORKS: [&str; 4] = ["mainnet", "auction", "reserved", "hosted"];
 
 const USAGE: &str = "\
 Emit settlement fixtures for the rollup verifier contract.
@@ -25,6 +34,12 @@ Options:
   --include-sidecar  include the prover-only sidecar bytes, which the contract does not need
   --genesis-hash <HEX>  32-byte settlement-chain genesis hash (default: zero)
   --app-id <U64>        settlement application ID (default: 0)
+  --prove            prove each named scenario on the Succinct Prover Network and emit the
+                     Groth16 proof alongside its fixture. Needs a binary built with
+                     `--features prove` (see this crate's Cargo.toml for what that needs
+                     installed) and NETWORK_PRIVATE_KEY in the environment. Scenarios must be
+                     named: each one is a paid request.
+  --network <NAME>   which network --prove talks to: mainnet (default) or reserved
   --list             list the scenarios and exit
   -h, --help         show this message
 ";
@@ -40,13 +55,28 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Default)]
 struct Args {
     out: Option<String>,
     include_sidecar: bool,
     names: Vec<String>,
     genesis_hash: [u8; 32],
     app_id: u64,
+    prove: bool,
+    network: String,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            out: None,
+            include_sidecar: false,
+            names: Vec::new(),
+            genesis_hash: [0u8; 32],
+            app_id: 0,
+            prove: false,
+            network: "mainnet".to_string(),
+        }
+    }
 }
 
 fn parse_hash(value: &str) -> Result<[u8; 32], String> {
@@ -80,6 +110,19 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "--include-sidecar" => args.include_sidecar = true,
+            "--prove" => args.prove = true,
+            "--network" => {
+                let name = remaining
+                    .next()
+                    .ok_or_else(|| "--network needs a name".to_string())?;
+                if !NETWORKS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "no network named {name} (one of {})",
+                        NETWORKS.join(", ")
+                    ));
+                }
+                args.network = name;
+            }
             "--genesis-hash" => {
                 args.genesis_hash = parse_hash(
                     &remaining
@@ -111,10 +154,52 @@ fn parse_args() -> Result<Option<Args>, String> {
     Ok(Some(args))
 }
 
+#[cfg(feature = "prove")]
+use sp1_host::prove::Groth16Prover;
+
+/// The stand-in a build without the `prove` feature gets.
+///
+/// Uninhabited on purpose: `new` is the only constructor and it always fails, so the compiler knows
+/// the other two methods are unreachable and [`run`] can call them without a `cfg` around every
+/// use. Same shape as the real thing, so there is one code path rather than two.
+#[cfg(not(feature = "prove"))]
+enum Groth16Prover {}
+
+#[cfg(not(feature = "prove"))]
+impl Groth16Prover {
+    fn new(_network: &str) -> Result<Self, String> {
+        Err(
+            "this binary was built without the `prove` feature, so it cannot reach the prover \
+             network -- rebuild with `cargo run -p sp1-host --features prove -- ...`, which needs \
+             the SP1 toolchain installed (`curl -L https://sp1up.succinct.xyz | bash && sp1up`)"
+                .to_string(),
+        )
+    }
+
+    fn vkey(&self) -> &str {
+        match *self {}
+    }
+
+    fn prove(&self, _settlement: &Settlement) -> Result<ProofFixture, String> {
+        match *self {}
+    }
+}
+
 fn run() -> Result<(), String> {
     let Some(args) = parse_args()? else {
         return Ok(());
     };
+
+    // A proof per scenario is a paid request to the network, so an unnamed run -- which means every
+    // scenario -- is far more likely to be a slip than an intention. Naming them is the whole
+    // guard: pass all eleven and it will prove all eleven.
+    if args.prove && args.names.is_empty() {
+        return Err(
+            "--prove needs the scenarios named, since each one is a paid request to the prover \
+             network (try `--prove payments`, or `--list` to see them all)"
+                .to_string(),
+        );
+    }
 
     // Named scenarios keep the order they were asked for; an unnamed run keeps declaration order.
     let selected: Vec<_> = if args.names.is_empty() {
@@ -127,6 +212,13 @@ fn run() -> Result<(), String> {
                     .ok_or_else(|| format!("no scenario named {name} (try --list)"))
             })
             .collect::<Result<_, _>>()?
+    };
+
+    // Once, before the loop: setup is a function of the ELF, and every scenario proves the same
+    // one. It is also the slow half, so paying for it per scenario would be minutes each.
+    let prover = match args.prove {
+        true => Some(Groth16Prover::new(&args.network)?),
+        false => None,
     };
 
     let mut emitted = Vec::with_capacity(selected.len());
@@ -157,10 +249,24 @@ fn run() -> Result<(), String> {
             settlement.chunk_count(),
         );
 
-        emitted.push(fixture(scenario, &settlement, args.include_sidecar));
+        let proof = match &prover {
+            Some(prover) => Some(
+                prover
+                    .prove(&settlement)
+                    .map_err(|error| format!("scenario {}: {error}", scenario.name))?,
+            ),
+            None => None,
+        };
+
+        emitted.push(fixture(
+            scenario,
+            &settlement,
+            args.include_sidecar,
+            proof.as_ref(),
+        ));
     }
 
-    let document = json!({
+    let mut document = json!({
         // Mirrors of the constants the contract hard-codes, so a test can assert the two sides
         // agree rather than hard-coding them a third time.
         "chunkSize": sp1_host::CHUNK_SIZE,
@@ -173,6 +279,14 @@ fn run() -> Result<(), String> {
         "inboxChainGenesis": hex(&INBOX_CHAIN_GENESIS),
         "scenarios": emitted,
     });
+
+    // One per ELF, not one per scenario, so it belongs beside the other deployment-wide values
+    // rather than repeated in every fixture. Absent entirely when nothing was proved, so a reader
+    // cannot mistake a stale key for the one these proofs verify under.
+    if let Some(prover) = &prover {
+        document["vkey"] = json!(prover.vkey());
+        document["network"] = json!(args.network);
+    }
 
     let mut json = serde_json::to_string_pretty(&document).map_err(|error| error.to_string())?;
     json.push('\n');
@@ -206,6 +320,7 @@ fn fixture(
     scenario: &scenarios::Scenario,
     settlement: &Settlement,
     include_sidecar: bool,
+    proof: Option<&ProofFixture>,
 ) -> Value {
     let mut fixture = json!({
         "name": scenario.name,
@@ -301,6 +416,21 @@ fn fixture(
 
     if include_sidecar {
         fixture["sidecar"] = json!(hex(settlement.sidecar_bytes()));
+    }
+
+    // Only present when `--prove` ran, so a fixture with no `proof` key is one nobody proved rather
+    // than one whose proof failed.
+    if let Some(proof) = proof {
+        // The single argument an onchain verifier takes, alongside the `publicValues` above.
+        fixture["proof"] = json!(hex(&proof.bytes));
+        // The same proof taken apart, for a test that wants to check the pieces rather than hand
+        // the whole thing to a verifier.
+        fixture["groth16"] = json!({
+            "publicInputs": proof.public_inputs,
+            "encodedProof": proof.encoded_proof,
+            "verifierHash": hex(&proof.verifier_hash),
+            "vkey": proof.vkey,
+        });
     }
 
     fixture
