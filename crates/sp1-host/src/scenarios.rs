@@ -11,11 +11,11 @@
 //! deposit at the head of the block, so there is nothing here a contract has to be put into
 //! position to accept.
 
-use payment_rollup::{
-    Address, Block, Deposit, L1Address, Ledger, MIN_WITHDRAWAL, Payment, Scheme, Signature,
-    SignedTransaction, Slot, Withdrawal, address_from_public_key,
-};
 use payment_rollup::ForcedWithdrawal;
+use payment_rollup::{
+    Address, Block, DeploymentDomain, Deposit, L1Address, Ledger, MIN_WITHDRAWAL, Payment, Scheme,
+    Signature, SignedTransaction, Slot, Withdrawal, address_from_public_key,
+};
 
 const SCHEME: Scheme = Scheme::Managed;
 
@@ -25,7 +25,7 @@ pub struct Scenario {
     /// What this scenario is for, carried through to the emitted JSON so a failing test says
     /// something about the case it was covering.
     pub description: &'static str,
-    pub build: fn() -> Block,
+    pub build: fn(DeploymentDomain) -> Block,
 }
 
 pub fn all() -> &'static [Scenario] {
@@ -64,10 +64,15 @@ pub fn all() -> &'static [Scenario] {
         Scenario {
             name: "withdrawals",
             description: "A deposit and then three withdrawals to distinct L1 accounts. The \
-                          cleanest test of the withdrawal chain: the contract stores the tip the \
-                          proof commits to and the queue is unwound one claim at a time, \
-                          newest-first, back to the genesis value.",
+                          cleanest test of the ordered withdrawal Merkle tree: each payout has a \
+                          distinct index and inclusion path under the root the proof commits.",
             build: withdrawals,
+        },
+        Scenario {
+            name: "duplicate-withdrawals",
+            description: "Two identical payouts at distinct transaction indices. Their indexed \
+                          leaves and claim bits must keep both withdrawals independently payable.",
+            build: duplicate_withdrawals,
         },
         Scenario {
             name: "forced-exit",
@@ -150,8 +155,8 @@ fn l1_account(index: u8) -> L1Address {
     address
 }
 
-fn genesis_empty_batch() -> Block {
-    Ledger::new().get_block(Vec::new())
+fn genesis_empty_batch(domain: DeploymentDomain) -> Block {
+    Ledger::with_domain(domain).get_block(Vec::new())
 }
 
 /// Three deposits, the first two identical, so the fixture covers a fresh dictionary entry and a
@@ -159,16 +164,16 @@ fn genesis_empty_batch() -> Block {
 ///
 /// Deliberately not a palindrome. A reversed copy of this list has to be a different list, or the
 /// end-to-end test for reordering would be asserting against the sequence it started with.
-fn deposits_only() -> Block {
-    Ledger::new().get_block(vec![
+fn deposits_only(domain: DeploymentDomain) -> Block {
+    Ledger::with_domain(domain).get_block(vec![
         deposit(b"a key", 1_000),
         deposit(b"a key", 1_000),
         deposit(b"b key", 500),
     ])
 }
 
-fn payments() -> Block {
-    let mut ledger = Ledger::new();
+fn payments(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
     let (a, b) = (address_of(b"a key"), address_of(b"b key"));
     let fresh = address_of(b"fresh key");
 
@@ -183,12 +188,12 @@ fn payments() -> Block {
 
 /// A deposit and three withdrawals, to three distinct L1 accounts for three distinct amounts.
 ///
-/// Distinct on both counts on purpose: the e2e unwinds this queue newest-first and checks each
+/// Distinct on both counts on purpose: the e2e claims this queue and checks each
 /// payout lands where it should, which only tests anything if no two claims are interchangeable.
 /// Every amount is at or above `MIN_WITHDRAWAL`, because a block containing one below it does not
 /// verify at all.
-fn withdrawals() -> Block {
-    let mut ledger = Ledger::new();
+fn withdrawals(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
 
     ledger.get_block(vec![
         deposit(b"a key", 1_000_000),
@@ -198,14 +203,24 @@ fn withdrawals() -> Block {
     ])
 }
 
+fn duplicate_withdrawals(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
+
+    ledger.get_block(vec![
+        deposit(b"a key", 500_000),
+        withdraw(b"a key", l1_account(6), MIN_WITHDRAWAL),
+        withdraw(b"a key", l1_account(6), MIN_WITHDRAWAL),
+    ])
+}
+
 /// Value in, value across, value out -- in one batch.
 ///
 /// The withdrawal spends from `b key`, which holds nothing until the payment two lines above
-/// delivers it. That is the interleaving that matters: the deposit chain and the withdrawal chain
+/// delivers it. That is the interleaving that matters: the deposit chain and withdrawal commitment
 /// both move, and the withdrawal is only affordable because the replay applies the transactions in
 /// order against a running root.
-fn round_trip() -> Block {
-    let mut ledger = Ledger::new();
+fn round_trip(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
     let b = address_of(b"b key");
 
     ledger.get_block(vec![
@@ -267,8 +282,8 @@ pub struct ExitProof {
 /// A deposit pins a created account to `Account::empty`, so each one ends up authorized by the very
 /// key its address was derived from -- which is what makes the deposit recipient and the exit
 /// signer the same party without anything having to say so.
-fn forced_exit() -> Block {
-    forced_exit_ledger().0
+fn forced_exit(domain: DeploymentDomain) -> Block {
+    forced_exit_ledger(domain).0
 }
 
 /// The same block, with the ledger that produced it, so the proofs can be read off the settled tree.
@@ -276,8 +291,8 @@ fn forced_exit() -> Block {
 /// Everything here is deterministic, so rebuilding the block rebuilds the identical tree. That is
 /// what lets `build` stay a plain `fn() -> Block` for every scenario instead of growing a second
 /// shape for the one that needs more.
-fn forced_exit_ledger() -> (Block, Ledger) {
-    let mut ledger = Ledger::new();
+fn forced_exit_ledger(domain: DeploymentDomain) -> (Block, Ledger) {
+    let mut ledger = Ledger::with_domain(domain);
 
     let block = ledger.get_block(
         EXIT_KEYS
@@ -300,8 +315,8 @@ fn forced_exit_ledger() -> (Block, Ledger) {
 /// Reuses the exit keys because the L1 side of a request has to check a signature by the key the
 /// account was derived from, and these are the only real Ed25519 keys the fixtures have. The second
 /// account is left alone so the e2e can tell an emptied account from an untouched one.
-fn forced_inclusion() -> Block {
-    let mut ledger = Ledger::new();
+fn forced_inclusion(domain: DeploymentDomain) -> Block {
+    let mut ledger = Ledger::with_domain(domain);
 
     let mut stxns: Vec<_> = EXIT_KEYS
         .iter()
@@ -327,8 +342,8 @@ fn forced_inclusion() -> Block {
 /// Only inclusion proofs are emitted, and the assertion below is the reason: `forceExit` accepts
 /// nothing else. An account that exists always proves through its own position, so a `Slot` of any
 /// other shape here would mean the tree had stopped holding what the scenario put in it.
-pub fn forced_exit_proofs() -> Vec<ExitProof> {
-    let (_, ledger) = forced_exit_ledger();
+pub fn forced_exit_proofs(domain: DeploymentDomain) -> Vec<ExitProof> {
+    let (_, ledger) = forced_exit_ledger(domain);
 
     EXIT_KEYS
         .iter()
@@ -358,11 +373,11 @@ pub fn forced_exit_proofs() -> Vec<ExitProof> {
 
 /// One payment per receiver, at the ~38 bytes a payment costs when the sender repeats and the
 /// receiver is new, which puts the batch a few chunks over the boundary.
-fn multi_chunk() -> Block {
+fn multi_chunk(domain: DeploymentDomain) -> Block {
     const PAYMENTS: u32 = 300;
     const AMOUNT: u64 = 1_000_000;
 
-    let mut ledger = Ledger::new();
+    let mut ledger = Ledger::with_domain(domain);
 
     let mut stxns = vec![deposit(b"spender", PAYMENTS as u64 * AMOUNT)];
     stxns.extend(
@@ -379,11 +394,13 @@ mod tests {
     use crate::Settlement;
     use payment_rollup::{CHUNK_SIZE, verify_block};
 
+    const DOMAIN: DeploymentDomain = [0x42; 32];
+
     #[test]
     fn every_scenario_is_a_block_that_verifies() {
         for scenario in all() {
             assert_eq!(
-                verify_block(&(scenario.build)()),
+                verify_block(&(scenario.build)(DOMAIN)),
                 Ok(()),
                 "{}",
                 scenario.name
@@ -393,7 +410,7 @@ mod tests {
 
     #[test]
     fn the_multi_chunk_scenario_spills_past_one_chunk() {
-        let bytes = multi_chunk().batch().encode();
+        let bytes = multi_chunk(DOMAIN).batch().encode();
 
         assert!(
             bytes.len() > CHUNK_SIZE,
@@ -407,7 +424,7 @@ mod tests {
 
     #[test]
     fn the_genesis_scenario_does_not_move_the_root() {
-        let block = genesis_empty_batch();
+        let block = genesis_empty_batch(DOMAIN);
 
         assert_eq!(block.old_root(), crate::GENESIS_ROOT);
         assert_eq!(block.new_root(), crate::GENESIS_ROOT);
@@ -420,7 +437,7 @@ mod tests {
     #[test]
     fn every_scenario_starts_from_the_empty_ledger() {
         for scenario in all() {
-            let block = (scenario.build)();
+            let block = (scenario.build)(DOMAIN);
 
             assert_eq!(block.old_root(), crate::GENESIS_ROOT, "{}", scenario.name);
             assert_eq!(
@@ -437,7 +454,7 @@ mod tests {
     // catch it.
     #[test]
     fn the_deposits_only_scenario_repeats_a_deposit() {
-        let block = deposits_only();
+        let block = deposits_only(DOMAIN);
 
         assert_ne!(block.new_deposit_chain(), block.old_deposit_chain());
         assert_eq!(
@@ -451,7 +468,7 @@ mod tests {
     // fail. That only tests anything if the reversed list is a different list.
     #[test]
     fn the_deposits_only_scenario_is_not_a_palindrome() {
-        let deposits: Vec<_> = deposits_only()
+        let deposits: Vec<_> = deposits_only(DOMAIN)
             .batch()
             .txns()
             .iter()
@@ -464,11 +481,10 @@ mod tests {
         assert_ne!(deposits, reversed);
     }
 
-    // The e2e unwinds this queue one claim at a time and asserts each payout landed where it was
-    // addressed. Two interchangeable claims would let a broken unwind pass.
+    // The e2e claims this queue one payout at a time and asserts each lands where it was addressed.
     #[test]
     fn the_withdrawals_scenario_has_no_two_alike() {
-        let settled = Settlement::for_block(&withdrawals()).unwrap();
+        let settled = Settlement::for_block(&withdrawals(DOMAIN)).unwrap();
         let payouts = settled.withdrawals();
 
         assert_eq!(payouts.len(), 3);
@@ -480,12 +496,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_duplicate_withdrawals_scenario_keeps_both_payouts() {
+        let settled = Settlement::for_block(&duplicate_withdrawals(DOMAIN)).unwrap();
+
+        assert_eq!(settled.withdrawals().len(), 2);
+        assert_eq!(settled.withdrawals()[0], settled.withdrawals()[1]);
+        assert_ne!(
+            settled.withdrawal_claims()[0].index,
+            settled.withdrawal_claims()[1].index
+        );
+    }
+
     // The one bound the guest enforces on a withdrawal, and the reason the settlement contract can
     // pay a claim out without worrying whether the payment will go through.
     #[test]
     fn no_scenario_withdraws_below_the_minimum() {
         for scenario in all() {
-            let settled = Settlement::for_block(&(scenario.build)()).unwrap();
+            let settled = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
 
             for (recipient, amount) in settled.withdrawals() {
                 assert!(
@@ -500,15 +528,15 @@ mod tests {
     // Every block folds its withdrawals from genesis, so a block with none has to land exactly
     // there -- that is how the contract knows not to open a payout queue.
     #[test]
-    fn only_the_withdrawing_scenarios_move_the_withdrawal_chain() {
+    fn only_the_withdrawing_scenarios_have_a_withdrawal_root() {
         for scenario in all() {
-            let settled = Settlement::for_block(&(scenario.build)()).unwrap();
-            let moved = settled.withdrawal_chain() != payment_rollup::WITHDRAWAL_CHAIN_GENESIS;
+            let settled = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
+            let moved = settled.withdrawal_root() != payment_rollup::EMPTY_WITHDRAWAL_ROOT;
 
             assert_eq!(
                 moved,
                 !settled.withdrawals().is_empty(),
-                "{}: the withdrawal chain moved iff the batch withdrew something",
+                "{}: the withdrawal root is nonzero iff the batch withdrew something",
                 scenario.name
             );
         }
@@ -519,9 +547,9 @@ mod tests {
     // end-to-end test would be ambiguous between a broken AVM verifier and a broken fixture.
     #[test]
     fn every_forced_exit_proof_verifies_against_the_settled_root() {
-        let root = forced_exit().new_root();
+        let root = forced_exit(DOMAIN).new_root();
 
-        for exit in forced_exit_proofs() {
+        for exit in forced_exit_proofs(DOMAIN) {
             let account = payment_rollup::Account::new(exit.nonce, exit.amount, exit.auth_address);
             let proof = payment_rollup::MerkleProof::from_parts(exit.siblings.clone(), Slot::Own);
 
@@ -538,7 +566,7 @@ mod tests {
     // person, and what the contract's `sha256("ADDR" || scheme || pubKey)` check relies on.
     #[test]
     fn a_forced_exit_account_is_authorized_by_the_key_it_was_derived_from() {
-        for exit in forced_exit_proofs() {
+        for exit in forced_exit_proofs(DOMAIN) {
             assert_eq!(
                 exit.auth_address,
                 address_from_public_key(Scheme::Ed25519, &exit.pub_key)
@@ -552,7 +580,7 @@ mod tests {
     // exercises the fold rather than the degenerate case where the root *is* the leaf.
     #[test]
     fn the_forced_exit_proofs_are_not_degenerate() {
-        let proofs = forced_exit_proofs();
+        let proofs = forced_exit_proofs(DOMAIN);
 
         assert_eq!(proofs.len(), 2);
         for exit in &proofs {
@@ -570,7 +598,7 @@ mod tests {
     // could not be afforded at all.
     #[test]
     fn the_round_trip_scenario_withdraws_what_a_payment_just_delivered() {
-        let block = round_trip();
+        let block = round_trip(DOMAIN);
         let b = address_of(b"b key");
 
         assert_eq!(verify_block(&block), Ok(()));

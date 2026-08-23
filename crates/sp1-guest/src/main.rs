@@ -1,7 +1,7 @@
 //! Proves one block: that `old_root` becomes `new_root`, and `deposit_anchor` becomes the deposit
 //! chain the batch folds to, by replaying the batch the chain records.
 //!
-//! Everything read here is prover-supplied and private. The only thing that escapes is the 160
+//! Everything read here is prover-supplied and private. The only thing that escapes is the 264
 //! bytes of [`public_values`], and the batch bytes are represented there by a commitment rather
 //! than in full -- public values are hashed into the proof and handed to the verifier, so carrying
 //! the batch in them would mean paying for it twice. The settlement contract is given the batch
@@ -21,6 +21,9 @@ pub fn main() {
     // The batch bytes are read exactly as the chain will record them and decoded with the same
     // decoder a replaying full node runs, so there is no separate encoding of the transactions for
     // the proof to disagree with.
+    let domain: [u8; 32] = sp1_zkvm::io::read_vec()
+        .try_into()
+        .expect("domain must be 32 bytes");
     let old_root: [u8; 32] = sp1_zkvm::io::read_vec()
         .try_into()
         .expect("old_root must be 32 bytes");
@@ -33,9 +36,10 @@ pub fn main() {
     let batch_bytes = sp1_zkvm::io::read_vec();
     let sidecar_bytes = sp1_zkvm::io::read_vec();
 
-    // Everything the proof asserts lives in `execute`, so the host can compute these same 256 bytes
+    // Everything the proof asserts lives in `execute`, so the host can compute these same 264 bytes
     // without a zkVM. This is only the io.
     let values = execute(
+        domain,
         old_root,
         deposit_anchor,
         request_anchor,

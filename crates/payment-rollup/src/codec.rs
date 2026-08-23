@@ -18,10 +18,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::{
-    Account, Address, Batch, Deposit, DepositSidecar, ENCODED_ACCOUNT_SIZE, LeafWitness,
-    MerkleProof, Payment, PaymentSidecar, SCHEME_SIZE, Scheme, Sidecar, Signature, Slot,
-    ForcedWithdrawal, ForcedWithdrawalSidecar, Transaction, TransactionHeader, TxnSidecar,
-    Withdrawal, WithdrawalSidecar, merkle::DEPTH,
+    Account, Address, Batch, Deposit, DepositSidecar, ENCODED_ACCOUNT_SIZE, ForcedWithdrawal,
+    ForcedWithdrawalSidecar, LeafWitness, MerkleProof, Payment, PaymentSidecar, SCHEME_SIZE,
+    Scheme, Sidecar, Signature, Slot, Transaction, TransactionHeader, TxnSidecar, Withdrawal,
+    WithdrawalSidecar, merkle::DEPTH,
 };
 
 const BATCH_VERSION: u8 = 0;
@@ -405,11 +405,7 @@ impl Batch {
                     let sender = dictionary.take(&mut reader)?;
                     let recipient = reader.array::<32>()?;
 
-                    Transaction::Withdrawal(Withdrawal::new(
-                        sender,
-                        recipient,
-                        reader.varint()?,
-                    ))
+                    Transaction::Withdrawal(Withdrawal::new(sender, recipient, reader.varint()?))
                 }
                 KIND_FORCED_WITHDRAWAL => {
                     let address = dictionary.take(&mut reader)?;
@@ -716,6 +712,8 @@ mod tests {
 
         assert_eq!(
             verify_batch(
+                &block.domain,
+                &batch_bytes,
                 block.old_root,
                 block.old_deposit_chain,
                 block.old_request_chain,
@@ -725,8 +723,9 @@ mod tests {
             Ok((
                 block.new_root,
                 block.new_deposit_chain,
-                block.withdrawal_chain,
-                block.new_request_chain
+                block.withdrawal_root,
+                block.new_request_chain,
+                block.withdrawal_count
             ))
         );
     }
@@ -805,6 +804,8 @@ mod tests {
 
         assert_eq!(
             verify_batch(
+                &block.domain,
+                &block.batch.encode(),
                 block.old_root,
                 block.old_deposit_chain,
                 block.old_request_chain,
@@ -1241,7 +1242,10 @@ mod tests {
         }
 
         let block = ledger.get_block(stxns);
-        assert_eq!(Batch::decode(&block.batch.encode()), Ok(block.batch.clone()));
+        assert_eq!(
+            Batch::decode(&block.batch.encode()),
+            Ok(block.batch.clone())
+        );
         assert_eq!(
             Sidecar::decode(&block.sidecar.encode(), &block.batch),
             Ok(block.sidecar)

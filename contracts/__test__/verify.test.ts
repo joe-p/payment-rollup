@@ -7,18 +7,36 @@ import {
   REQUEST_BOX_MBR,
   RollupVerifier,
   WITHDRAWAL_BOX_MBR,
+  deploymentDomain,
   exitMessage,
   l2Address,
+  paymentMessage,
+  withdrawalMessage,
   withdrawalRequestMessage,
 } from "../src";
 import { AlgorandClient, microAlgo } from "@algorandfoundation/algokit-utils";
 import algosdk from "algosdk";
 import nacl from "tweetnacl";
+import { createHash } from "node:crypto";
 import fixture from "../fixtures/settlements.json";
 
 type Scenario = (typeof fixture.scenarios)[number];
 
 const hex = (value: string) => Buffer.from(value, "hex");
+
+const bytes = (value: bigint) => {
+  const result = Buffer.alloc(8);
+  result.writeBigUInt64BE(value);
+  return result;
+};
+
+const sha256 = (...parts: Uint8Array[]) => {
+  const hash = createHash("sha256");
+  for (const part of parts) hash.update(part);
+  return hash.digest();
+};
+
+const tag = (value: string) => new TextEncoder().encode(value);
 
 /**
  * Escape parameters small enough for a test to wait out.
@@ -48,7 +66,10 @@ const keyPair = (index: number) =>
 const keyPairFor = (addressHex: string) => {
   for (let index = 0; index < EXIT_SEEDS.length; index++) {
     const pair = keyPair(index);
-    if (Buffer.from(l2Address("edd", pair.publicKey)).toString("hex") === addressHex) {
+    if (
+      Buffer.from(l2Address("edd", pair.publicKey)).toString("hex") ===
+      addressHex
+    ) {
       return pair;
     }
   }
@@ -93,8 +114,86 @@ describe("rollup verifier", () => {
   const balanceOf = async (address: algosdk.Address | string) =>
     (await algorand.account.getInformation(address)).balance.microAlgo;
 
-  /** Whether a scenario's public values carry a withdrawal chain, and so open a payout queue. */
-  const withdraws = (s: Scenario) => s.withdrawals.length > 0;
+  const fundedOutsider = async () => {
+    const account = algorand.account.random();
+    await algorand.send.payment({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      receiver: account.addr,
+      amount: microAlgo(5_000_000),
+    });
+    return { address: account.addr, txnSigner: account.signer };
+  };
+
+  const bindScenarioToDomain = (s: Scenario, domain: Uint8Array): Scenario => {
+    const batch = hex(s.batch);
+    let batchCommitment = sha256(
+      tag("BATCH"),
+      domain,
+      bytes(BigInt(batch.length)),
+    );
+    for (let offset = 0; offset < batch.length; offset += CHUNK_SIZE) {
+      const chunk = batch.subarray(offset, offset + CHUNK_SIZE);
+      batchCommitment = sha256(tag("CHUNK"), batchCommitment, sha256(chunk));
+    }
+
+    const withdrawals = s.withdrawals.map((withdrawal, index) => ({
+      ...withdrawal,
+      index,
+      siblings: [] as string[],
+    }));
+    let withdrawalRoot = Buffer.alloc(32);
+    if (withdrawals.length > 0) {
+      const width = 2 ** Math.ceil(Math.log2(withdrawals.length));
+      const leaves = withdrawals.map((withdrawal) =>
+        sha256(
+          tag("WLEAF"),
+          batchCommitment,
+          bytes(BigInt(withdrawal.index)),
+          hex(withdrawal.recipient),
+          bytes(BigInt(withdrawal.amount)),
+        ),
+      );
+      while (leaves.length < width) leaves.push(sha256(tag("WEMPTY")));
+
+      let level = leaves;
+      let positions = withdrawals.map((_, index) => index);
+      while (level.length > 1) {
+        for (const [claim, position] of positions.entries()) {
+          withdrawals[claim].siblings.push(level[position ^ 1].toString("hex"));
+        }
+        const next = [];
+        for (let index = 0; index < level.length; index += 2) {
+          next.push(sha256(tag("WNODE"), level[index], level[index + 1]));
+        }
+        level = next;
+        positions = positions.map((position) => Math.floor(position / 2));
+      }
+      withdrawalRoot = level[0];
+    }
+
+    const publicValues = Buffer.from(hex(s.publicValues));
+    batchCommitment.copy(publicValues, 64);
+    withdrawalRoot.copy(publicValues, 160);
+    bytes(BigInt(withdrawals.length)).copy(publicValues, 256);
+
+    return {
+      ...s,
+      deploymentDomain: Buffer.from(domain).toString("hex"),
+      batchCommitment: batchCommitment.toString("hex"),
+      withdrawalRoot: withdrawalRoot.toString("hex"),
+      withdrawalCount: withdrawals.length,
+      withdrawals,
+      publicValues: publicValues.toString("hex"),
+    };
+  };
+
+  /** Rebind the fixture-generator deployment to the fresh application deployed by a test. */
+  const bindScenario = async (
+    client: RollupVerifier,
+    s: Scenario,
+  ): Promise<Scenario> =>
+    bindScenarioToDomain(s, await client.deploymentDomain());
 
   /**
    * File a scenario's L1 withdrawal requests, in the order the batch answers them.
@@ -122,27 +221,31 @@ describe("rollup verifier", () => {
   };
 
   /** Settle a scenario, funding the withdrawal queue box when the batch needs one. */
-  const settle = (client: RollupVerifier, s: Scenario) =>
-    client.verifyBatch(sender, hex(s.batch), hex(s.publicValues), withdraws(s));
+  const settle = async (client: RollupVerifier, s: Scenario) => {
+    const bound = await bindScenario(client, s);
+    await client.verifyBatch(sender, hex(bound.batch), hex(bound.publicValues));
+    return bound;
+  };
 
   /**
    * Drain a settled batch's payout queue.
    *
-   * Newest-first, which is the only direction a hash chain can be followed: the fixture lists the
-   * withdrawals in batch order, so the claims run through it backwards.
+   * Claims are independently proven, so callers may submit them in any order.
    */
   const claimAll = async (
     client: RollupVerifier,
     s: Scenario,
     batchNumber: bigint,
   ) => {
-    for (const w of [...s.withdrawals].reverse()) {
+    for (const w of s.withdrawals) {
       await client.claimWithdrawal(
         sender,
         batchNumber,
+        BigInt(w.index),
+        hex(s.batchCommitment),
         algosdk.encodeAddress(hex(w.recipient)),
         BigInt(w.amount),
-        hex(w.chainBefore),
+        w.siblings.map(hex),
       );
     }
   };
@@ -168,6 +271,55 @@ describe("rollup verifier", () => {
     expect(MIN_WITHDRAWAL).toBe(BigInt(fixture.minWithdrawal));
   });
 
+  it("derives the same deployment domain as the Rust core", () => {
+    expect(
+      Buffer.from(deploymentDomain(new Uint8Array(32), 7n)).toString("hex"),
+    ).toBe("459115f1be8e477f1e200d702ac5f9c5643ff430c310d3ff44b06273cb5daa15");
+
+    const domain = new Uint8Array(32).fill(0x42);
+    const senderAddress = new Uint8Array(32).fill(1);
+    const destination = new Uint8Array(32).fill(2);
+    const message = paymentMessage(domain, senderAddress, 3n, destination, 4n);
+    expect(Buffer.from(message.subarray(0, 3)).toString()).toBe("PAY");
+    expect(message.subarray(3, 35)).toEqual(domain);
+    expect(message.subarray(35, 67)).toEqual(senderAddress);
+    expect(Buffer.from(message.subarray(67, 75))).toEqual(bytes(3n));
+    expect(message.subarray(75, 107)).toEqual(destination);
+    expect(Buffer.from(message.subarray(107))).toEqual(bytes(4n));
+    expect(message).not.toEqual(
+      withdrawalMessage(
+        domain,
+        senderAddress,
+        3n,
+        algosdk.decodeAddress(algosdk.encodeAddress(destination)),
+        4n,
+      ),
+    );
+    expect(
+      paymentMessage(domain, senderAddress, 3n, destination, 4n),
+    ).not.toEqual(
+      paymentMessage(
+        new Uint8Array(32).fill(0x43),
+        senderAddress,
+        3n,
+        destination,
+        4n,
+      ),
+    );
+  });
+
+  it("reproduces the Rust fixture commitments and withdrawal proofs", () => {
+    const domain = deploymentDomain(
+      hex(fixture.genesisHash),
+      BigInt(fixture.appId),
+    );
+    expect(Buffer.from(domain).toString("hex")).toBe(fixture.deploymentDomain);
+
+    for (const s of fixture.scenarios) {
+      expect(bindScenarioToDomain(s, domain)).toEqual(s);
+    }
+  });
+
   for (const s of fixture.scenarios) {
     it(`should verify with scenario ${s.name}`, async () => {
       const client = await RollupVerifier.create(algorand, sender);
@@ -186,6 +338,174 @@ describe("rollup verifier", () => {
     });
   }
 
+  describe("batch posting", () => {
+    it("rejects a settlement committed for another application", async () => {
+      const first = await RollupVerifier.create(algorand, sender);
+      const second = await RollupVerifier.create(algorand, sender);
+      const fixtureScenario = scenario("genesis-empty-batch");
+      const firstBound = await bindScenario(first, fixtureScenario);
+      const secondBound = await bindScenario(second, fixtureScenario);
+
+      expect(firstBound.deploymentDomain).not.toBe(
+        secondBound.deploymentDomain,
+      );
+      await expect(
+        second.verifyBatch(
+          sender,
+          hex(firstBound.batch),
+          hex(firstBound.publicValues),
+        ),
+      ).rejects.toThrow();
+      expect(secondBound.batchCommitment).not.toBe(firstBound.batchCommitment);
+    });
+
+    it("rejects a withdrawal root and count that disagree", async () => {
+      const emptyClient = await RollupVerifier.create(algorand, sender);
+      const empty = await bindScenario(
+        emptyClient,
+        scenario("genesis-empty-batch"),
+      );
+      const rootWithoutCount = hex(empty.publicValues);
+      rootWithoutCount.fill(1, 160, 192);
+      await expect(
+        emptyClient.verifyBatch(sender, hex(empty.batch), rootWithoutCount),
+      ).rejects.toThrow();
+
+      const countedClient = await RollupVerifier.create(algorand, sender);
+      const counted = await bindScenario(
+        countedClient,
+        scenario("withdrawals"),
+      );
+      await replayDeposits(countedClient, counted);
+      const countWithoutRoot = hex(counted.publicValues);
+      countWithoutRoot.fill(0, 160, 192);
+      await expect(
+        countedClient.verifyBatch(sender, hex(counted.batch), countWithoutRoot),
+      ).rejects.toThrow();
+    });
+
+    it("rejects more withdrawals than the claim bitmap can represent", async () => {
+      const client = await RollupVerifier.create(algorand, sender);
+      const empty = await bindScenario(client, scenario("genesis-empty-batch"));
+      const publicValues = hex(empty.publicValues);
+      publicValues.fill(1, 160, 192);
+      bytes(257n).copy(publicValues, 256);
+
+      await expect(
+        client.verifyBatch(sender, hex(empty.batch), publicValues),
+      ).rejects.toThrow();
+    });
+
+    it("restricts open, chunk, verify, and abandon to the creator", async () => {
+      const client = await RollupVerifier.create(algorand, sender);
+      const outsider = await fundedOutsider();
+      const s = await bindScenario(client, scenario("deposits-only"));
+      await replayDeposits(client, s);
+      const open = {
+        args: {
+          batchLength: s.batchLength,
+          expectedDepositCursor: await client.depositCursor(),
+          targetRequestCursor: await client.requestCursor(),
+        },
+      };
+
+      await expect(
+        client.appClient.send.openBatch({
+          sender: outsider.address,
+          signer: outsider.txnSigner,
+          ...open,
+        }),
+      ).rejects.toThrow();
+      await client.appClient.send.openBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        ...open,
+      });
+      await expect(
+        client.appClient.send.accumulateChunk({
+          sender: outsider.address,
+          signer: outsider.txnSigner,
+          args: { chunk: hex(s.chunks[0]) },
+        }),
+      ).rejects.toThrow();
+      for (const chunk of s.chunks) {
+        await client.appClient.send.accumulateChunk({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { chunk: hex(chunk) },
+          extraFee: microAlgo(531),
+        });
+      }
+      await expect(
+        client.appClient.send.verifyBatch({
+          sender: outsider.address,
+          signer: outsider.txnSigner,
+          args: { publicValues: hex(s.publicValues) },
+        }),
+      ).rejects.toThrow();
+      await expect(client.abandonBatch(outsider)).rejects.toThrow();
+      await client.abandonBatch(sender);
+    });
+
+    it("rejects an extra empty chunk after the declared batch is complete", async () => {
+      const client = await RollupVerifier.create(algorand, sender);
+      const s = await bindScenario(client, scenario("multi-chunk"));
+      await client.appClient.send.openBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: {
+          batchLength: s.batchLength,
+          expectedDepositCursor: 0n,
+          targetRequestCursor: 0n,
+        },
+      });
+      for (const chunk of s.chunks) {
+        await client.appClient.send.accumulateChunk({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { chunk: hex(chunk) },
+          extraFee: microAlgo(531),
+        });
+      }
+
+      await expect(
+        client.appClient.send.accumulateChunk({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { chunk: new Uint8Array() },
+          extraFee: microAlgo(531),
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("chains a second settlement from the first settled root and inboxes", async () => {
+      const client = await RollupVerifier.create(algorand, sender);
+      const firstFixture = scenario("deposits-only");
+      await replayDeposits(client, firstFixture);
+      const first = await settle(client, firstFixture);
+
+      const second = await bindScenario(
+        client,
+        scenario("genesis-empty-batch"),
+      );
+      const publicValues = hex(second.publicValues);
+      hex(first.newRoot).copy(publicValues, 0);
+      hex(first.newRoot).copy(publicValues, 32);
+      hex(first.depositChainTo).copy(publicValues, 96);
+      hex(first.depositChainTo).copy(publicValues, 128);
+      hex(first.requestChainTo).copy(publicValues, 192);
+      hex(first.requestChainTo).copy(publicValues, 224);
+
+      await client.verifyBatch(sender, hex(second.batch), publicValues);
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.batchNumber).toBe(2n);
+      expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
+        first.newRoot,
+      );
+    });
+  });
+
   describe("deposit inclusion", () => {
     // Every case below settles a batch whose deposits do not match what L1 saw. The chain is what
     // catches each one, and it catches all of them the same way: the fold lands somewhere the
@@ -196,8 +516,9 @@ describe("rollup verifier", () => {
       client: RollupVerifier,
       s: Scenario,
     ) => {
+      const bound = await bindScenario(client, s);
       await expect(
-        client.verifyBatch(sender, hex(s.batch), hex(s.publicValues)),
+        client.verifyBatch(sender, hex(bound.batch), hex(bound.publicValues)),
       ).rejects.toThrow();
     };
 
@@ -278,7 +599,7 @@ describe("rollup verifier", () => {
     // is what the copy-don't-reset seal buys, and it has to keep working.
     it("accepts a deposit that lands while a batch is being posted", async () => {
       const client = await RollupVerifier.create(algorand, sender);
-      const s = depositsOnly();
+      const s = await bindScenario(client, depositsOnly());
 
       await replayDeposits(client, s);
 
@@ -288,7 +609,7 @@ describe("rollup verifier", () => {
         args: {
           batchLength: s.batchLength,
           expectedDepositCursor: await client.depositCursor(),
-          expectedRequestCursor: await client.requestCursor(),
+          targetRequestCursor: await client.requestCursor(),
         },
       });
 
@@ -330,7 +651,7 @@ describe("rollup verifier", () => {
           args: {
             batchLength: s.batchLength,
             expectedDepositCursor: stale,
-            expectedRequestCursor: await client.requestCursor(),
+            targetRequestCursor: await client.requestCursor(),
           },
         }),
       ).rejects.toThrow();
@@ -361,7 +682,7 @@ describe("rollup verifier", () => {
         credited + DEPOSIT_BOX_MBR * BigInt(s.deposits.length),
       );
 
-      await client.verifyBatch(sender, hex(s.batch), hex(s.publicValues));
+      await settle(client, s);
 
       await client.pruneDeposit(sender, 0n);
 
@@ -392,14 +713,13 @@ describe("rollup verifier", () => {
       await replayDeposits(client, s);
 
       const batchNumber = await client.batchNumber();
-      await settle(client, s);
+      const bound = await settle(client, s);
 
-      return { client, batchNumber };
+      return { client, batchNumber, s: bound };
     };
 
     it("pays every withdrawal out to the account the batch named", async () => {
-      const s = withdrawing();
-      const { client, batchNumber } = await settled(s);
+      const { client, batchNumber, s } = await settled(withdrawing());
 
       const before = await Promise.all(
         s.withdrawals.map((w) =>
@@ -409,76 +729,98 @@ describe("rollup verifier", () => {
 
       await claimAll(client, s, batchNumber);
 
-      // Each recipient got its own amount, which only holds if the unwind matched claims to
-      // positions rather than merely draining the right total.
+      // Each recipient got its own amount, proving each index independently.
       for (const [index, w] of s.withdrawals.entries()) {
         const after = await balanceOf(algosdk.encodeAddress(hex(w.recipient)));
         expect(after - before[index]).toBe(BigInt(w.amount));
       }
     });
 
-    // The queue is a chain, so it can only be followed backwards. Claiming the oldest first has to
-    // fail, or the tip is not doing the work it exists to do.
-    it("refuses a claim that is not the newest unclaimed one", async () => {
-      const s = withdrawing();
-      const { client, batchNumber } = await settled(s);
-      const oldest = s.withdrawals[0];
+    it("allows independent claims in arbitrary order", async () => {
+      const { client, batchNumber, s } = await settled(withdrawing());
+      await claimAll(
+        client,
+        { ...s, withdrawals: [...s.withdrawals].reverse() },
+        batchNumber,
+      );
+    });
 
-      await expect(
+    it("refuses altered index, recipient, amount, commitment, sibling, or proof length", async () => {
+      const { client, batchNumber, s } = await settled(withdrawing());
+      const withdrawal = s.withdrawals[0];
+      const claim = (
+        index = BigInt(withdrawal.index),
+        commitment = hex(s.batchCommitment),
+        recipient = algosdk.encodeAddress(hex(withdrawal.recipient)),
+        amount = BigInt(withdrawal.amount),
+        siblings = withdrawal.siblings.map(hex),
+      ) =>
         client.claimWithdrawal(
           sender,
           batchNumber,
-          algosdk.encodeAddress(hex(oldest.recipient)),
-          BigInt(oldest.amount),
-          hex(oldest.chainBefore),
-        ),
+          index,
+          commitment,
+          recipient,
+          amount,
+          siblings,
+        );
+
+      await expect(claim(1n)).rejects.toThrow();
+      await expect(
+        claim(undefined, undefined, sender.address.toString()),
+      ).rejects.toThrow();
+      await expect(
+        claim(undefined, undefined, undefined, BigInt(withdrawal.amount) + 1n),
+      ).rejects.toThrow();
+      const commitment = Buffer.from(hex(s.batchCommitment));
+      commitment[0] ^= 1;
+      await expect(claim(undefined, commitment)).rejects.toThrow();
+      const siblings = withdrawal.siblings.map(hex);
+      siblings[0] = Buffer.from(siblings[0]);
+      siblings[0][0] ^= 1;
+      await expect(
+        claim(undefined, undefined, undefined, undefined, siblings),
+      ).rejects.toThrow();
+      await expect(
+        claim(undefined, undefined, undefined, undefined, siblings.slice(1)),
       ).rejects.toThrow();
     });
 
-    it("refuses a claim with an altered amount or recipient", async () => {
-      const s = withdrawing();
-      const { client, batchNumber } = await settled(s);
-      const newest = s.withdrawals[s.withdrawals.length - 1];
-
-      await expect(
-        client.claimWithdrawal(
-          sender,
-          batchNumber,
-          algosdk.encodeAddress(hex(newest.recipient)),
-          BigInt(newest.amount) + 1n,
-          hex(newest.chainBefore),
-        ),
-      ).rejects.toThrow();
-
-      await expect(
-        client.claimWithdrawal(
-          sender,
-          batchNumber,
-          sender.address.toString(),
-          BigInt(newest.amount),
-          hex(newest.chainBefore),
-        ),
-      ).rejects.toThrow();
-    });
-
-    // Paying a claim consumes it: the tip moves past it and the fold no longer reproduces anything.
-    // That is the whole of the double-claim defence -- there is no nullifier to check.
-    it("cannot pay the same withdrawal twice", async () => {
-      const s = withdrawing();
-      const { client, batchNumber } = await settled(s);
-      const newest = s.withdrawals[s.withdrawals.length - 1];
+    it("rejects a duplicate withdrawal index", async () => {
+      const { client, batchNumber, s } = await settled(withdrawing());
+      const withdrawal = s.withdrawals[0];
 
       const claim = () =>
         client.claimWithdrawal(
           sender,
           batchNumber,
-          algosdk.encodeAddress(hex(newest.recipient)),
-          BigInt(newest.amount),
-          hex(newest.chainBefore),
+          BigInt(withdrawal.index),
+          hex(s.batchCommitment),
+          algosdk.encodeAddress(hex(withdrawal.recipient)),
+          BigInt(withdrawal.amount),
+          withdrawal.siblings.map(hex),
         );
 
       await claim();
       await expect(claim()).rejects.toThrow();
+    });
+
+    it("pays identical withdrawals at distinct indices independently", async () => {
+      const { client, batchNumber, s } = await settled(
+        scenario("duplicate-withdrawals"),
+      );
+      const recipient = algosdk.encodeAddress(hex(s.withdrawals[0].recipient));
+      const before = await balanceOf(recipient);
+
+      await claimAll(
+        client,
+        { ...s, withdrawals: [...s.withdrawals].reverse() },
+        batchNumber,
+      );
+
+      expect((await balanceOf(recipient)) - before).toBe(
+        BigInt(s.withdrawals[0].amount) * 2n,
+      );
     });
 
     it("returns the queue box minimum balance when the last claim lands", async () => {
@@ -487,7 +829,7 @@ describe("rollup verifier", () => {
       await replayDeposits(client, s);
 
       const batchNumber = await client.batchNumber();
-      await settle(client, s);
+      const bound = await settle(client, s);
 
       // The settler advanced the box's minimum balance out of their own pocket, so the app is
       // holding it on top of what it owes.
@@ -499,7 +841,7 @@ describe("rollup verifier", () => {
         );
       expect(await queues()).toHaveLength(1);
 
-      await claimAll(client, s, batchNumber);
+      await claimAll(client, bound, batchNumber);
 
       const paid = s.withdrawals.reduce((t, w) => t + BigInt(w.amount), 0n);
       // The app paid out exactly the withdrawals and gave the box minimum balance back.
@@ -521,18 +863,17 @@ describe("rollup verifier", () => {
       const names = await client.appClient.appClient.getBoxNames();
       // The deposit boxes are asserted alongside so that this cannot pass by seeing no boxes at
       // all -- the point is that the "w" prefix in particular is absent.
-      expect(names.filter((n) => n.nameRaw[0] === "d".charCodeAt(0))).toHaveLength(
-        s.deposits.length,
-      );
-      expect(names.filter((n) => n.nameRaw[0] === "w".charCodeAt(0))).toHaveLength(
-        0,
-      );
+      expect(
+        names.filter((n) => n.nameRaw[0] === "d".charCodeAt(0)),
+      ).toHaveLength(s.deposits.length);
+      expect(
+        names.filter((n) => n.nameRaw[0] === "w".charCodeAt(0)),
+      ).toHaveLength(0);
     });
 
     // Value that already left L2 in a settled batch is not the rollup's to withhold, whatever
     // happens to the rollup afterwards.
     it("still pays out after the rollup has escaped", async () => {
-      const s = withdrawing();
       const client = await RollupVerifier.create(
         algorand,
         sender,
@@ -540,9 +881,10 @@ describe("rollup verifier", () => {
         TEST_ESCAPE_GRACE,
       );
 
-      await replayDeposits(client, s);
+      const fixtureScenario = withdrawing();
+      await replayDeposits(client, fixtureScenario);
       const batchNumber = await client.batchNumber();
-      await settle(client, s);
+      const s = await settle(client, fixtureScenario);
 
       // Strand a fresh deposit and pull the hatch.
       await client.deposit(sender, hex(s.deposits[0].recipient), 1_000n);
@@ -551,19 +893,23 @@ describe("rollup verifier", () => {
       await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
       await client.executeEscape(sender);
 
-      const newest = s.withdrawals[s.withdrawals.length - 1];
-      const recipient = algosdk.encodeAddress(hex(newest.recipient));
+      const withdrawal = s.withdrawals[2];
+      const recipient = algosdk.encodeAddress(hex(withdrawal.recipient));
       const before = await balanceOf(recipient);
 
       await client.claimWithdrawal(
         sender,
         batchNumber,
+        BigInt(withdrawal.index),
+        hex(s.batchCommitment),
         recipient,
-        BigInt(newest.amount),
-        hex(newest.chainBefore),
+        BigInt(withdrawal.amount),
+        withdrawal.siblings.map(hex),
       );
 
-      expect((await balanceOf(recipient)) - before).toBe(BigInt(newest.amount));
+      expect((await balanceOf(recipient)) - before).toBe(
+        BigInt(withdrawal.amount),
+      );
     });
 
     // Queues are keyed by batch number and anchored at genesis independently, so one batch's
@@ -574,29 +920,30 @@ describe("rollup verifier", () => {
 
       await replayDeposits(client, s);
       const first = await client.batchNumber();
-      await settle(client, s);
+      const bound = await settle(client, s);
 
       // The same scenario cannot settle twice -- it starts from genesis -- so this only checks the
       // keying, which is what the independence rests on.
       expect(first).toBe(0n);
       expect(await client.batchNumber()).toBe(1n);
 
-      const newest = s.withdrawals[s.withdrawals.length - 1];
+      const withdrawal = s.withdrawals[2];
       await expect(
         client.claimWithdrawal(
           sender,
           1n,
-          algosdk.encodeAddress(hex(newest.recipient)),
-          BigInt(newest.amount),
-          hex(newest.chainBefore),
+          BigInt(withdrawal.index),
+          hex(bound.batchCommitment),
+          algosdk.encodeAddress(hex(withdrawal.recipient)),
+          BigInt(withdrawal.amount),
+          withdrawal.siblings.map(hex),
         ),
       ).rejects.toThrow();
     });
 
     // The round-trip scenario withdraws from an account that held nothing when the block opened.
     it("settles a batch that deposits, pays and withdraws at once", async () => {
-      const s = scenario("round-trip");
-      const { client, batchNumber } = await settled(s);
+      const { client, batchNumber, s } = await settled(scenario("round-trip"));
 
       await claimAll(client, s, batchNumber);
 
@@ -608,7 +955,8 @@ describe("rollup verifier", () => {
   });
 
   describe("escape hatch", () => {
-    const recipient = () => hex(scenario("deposits-only").deposits[0].recipient);
+    const recipient = () =>
+      hex(scenario("deposits-only").deposits[0].recipient);
 
     /** A rollup whose escape parameters are small enough to actually cross. */
     const escapable = () =>
@@ -672,12 +1020,91 @@ describe("rollup verifier", () => {
       await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
       await client.signalEscape(sender);
 
-      await client.verifyBatch(sender, hex(s.batch), hex(s.publicValues));
+      await settle(client, s);
 
-      expect(
-        (await client.appClient.state.global.getAll()).escapeDeadline,
-      ).toBeUndefined();
+      const state = await client.appClient.state.global.getAll();
+      expect(state.escapeDeadline).toBeUndefined();
+      expect(state.escapeDepositTarget).toBeUndefined();
+      expect(state.escapeRequestTarget).toBeUndefined();
       await expect(client.executeEscape(sender)).rejects.toThrow();
+    });
+
+    it("does not clear a deposit target created after an old batch opened", async () => {
+      const client = await escapable();
+      const s = await bindScenario(client, scenario("deposits-only"));
+      await replayDeposits(client, s);
+      await client.appClient.send.openBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: {
+          batchLength: s.batchLength,
+          expectedDepositCursor: await client.depositCursor(),
+          targetRequestCursor: await client.requestCursor(),
+        },
+      });
+      await client.deposit(sender, recipient(), 1_000n);
+      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await client.signalEscape(sender);
+      for (const chunk of s.chunks) {
+        await client.appClient.send.accumulateChunk({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { chunk: hex(chunk) },
+        });
+      }
+      await client.appClient.send.verifyBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: { publicValues: hex(s.publicValues) },
+      });
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.settledDepositCursor).toBe(3n);
+      expect(state.escapeDepositTarget).toBe(4n);
+      expect(state.escapeDeadline).toBeGreaterThan(0n);
+    });
+
+    it("does not clear a request target created after an old batch opened", async () => {
+      const client = await escapable();
+      const s = await bindScenario(client, scenario("forced-exit"));
+      const request = scenario("forced-inclusion").requests[0];
+      const pair = keyPairFor(request.address)!;
+      await replayDeposits(client, s);
+      await client.appClient.send.openBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: {
+          batchLength: s.batchLength,
+          expectedDepositCursor: await client.depositCursor(),
+          targetRequestCursor: await client.requestCursor(),
+        },
+      });
+      await client.requestWithdrawal(
+        sender,
+        hex(request.address),
+        pair.publicKey,
+        algosdk.encodeAddress(hex(request.recipient)),
+        pair.secretKey,
+      );
+      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await client.signalEscape(sender);
+      for (const chunk of s.chunks) {
+        await client.appClient.send.accumulateChunk({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: { chunk: hex(chunk) },
+        });
+      }
+      await client.appClient.send.verifyBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: { publicValues: hex(s.publicValues) },
+      });
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(0n);
+      expect(state.escapeRequestTarget).toBe(1n);
+      expect(state.escapeDeadline).toBeGreaterThan(0n);
     });
 
     it("refuses to execute before the grace period has run out", async () => {
@@ -686,6 +1113,20 @@ describe("rollup verifier", () => {
       await signalOverStaleDeposit(client);
 
       await expect(client.executeEscape(sender)).rejects.toThrow();
+    });
+
+    it("refuses settlement after the escape deadline has expired", async () => {
+      const client = await escapable();
+      const s = scenario("deposits-only");
+
+      await replayDeposits(client, s);
+      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await client.signalEscape(sender);
+      await advanceRounds(Number(TEST_ESCAPE_GRACE) + 1);
+
+      await expect(settle(client, s)).rejects.toThrow();
+      await client.executeEscape(sender);
+      expect((await client.appClient.state.global.getAll()).escaped).toBe(1n);
     });
 
     it("refuses to execute with nothing signalled", async () => {
@@ -721,7 +1162,7 @@ describe("rollup verifier", () => {
         args: {
           batchLength: s.batchLength,
           expectedDepositCursor: await client.depositCursor(),
-          expectedRequestCursor: await client.requestCursor(),
+          targetRequestCursor: await client.requestCursor(),
         },
       });
 
@@ -744,7 +1185,9 @@ describe("rollup verifier", () => {
 
       await escape(client);
 
-      await expect(client.deposit(sender, recipient(), 1_000n)).rejects.toThrow();
+      await expect(
+        client.deposit(sender, recipient(), 1_000n),
+      ).rejects.toThrow();
       await expect(
         client.appClient.send.openBatch({
           sender: sender.address,
@@ -752,7 +1195,7 @@ describe("rollup verifier", () => {
           args: {
             batchLength: s.batchLength,
             expectedDepositCursor: 1n,
-            expectedRequestCursor: 0n,
+            targetRequestCursor: 0n,
           },
         }),
       ).rejects.toThrow();
@@ -760,7 +1203,9 @@ describe("rollup verifier", () => {
         client.appClient.send.verifyBatch({
           sender: sender.address,
           signer: sender.txnSigner,
-          args: { publicValues: hex(s.publicValues) },
+          args: {
+            publicValues: hex((await bindScenario(client, s)).publicValues),
+          },
         }),
       ).rejects.toThrow();
     });
@@ -815,7 +1260,7 @@ describe("rollup verifier", () => {
       const s = scenario("deposits-only");
 
       await replayDeposits(client, s);
-      await client.verifyBatch(sender, hex(s.batch), hex(s.publicValues));
+      await settle(client, s);
 
       // A fourth deposit, arriving after the only batch that will ever settle.
       await escape(client);
@@ -912,13 +1357,13 @@ describe("rollup verifier", () => {
 
       await replayL1(client, s);
       const batchNumber = await client.batchNumber();
-      await settle(client, s);
+      const bound = await settle(client, s);
 
-      const payout = s.withdrawals[0];
+      const payout = bound.withdrawals[0];
       const recipient = algosdk.encodeAddress(hex(payout.recipient));
       const before = await balanceOf(recipient);
 
-      await claimAll(client, s, batchNumber);
+      await claimAll(client, bound, batchNumber);
 
       // The whole deposited balance, and no amount was ever named on L1 or on the wire.
       expect((await balanceOf(recipient)) - before).toBe(BigInt(payout.amount));
@@ -944,7 +1389,9 @@ describe("rollup verifier", () => {
         before + REQUEST_BOX_MBR - 3_000n,
       );
       const names = await client.appClient.appClient.getBoxNames();
-      expect(names.filter((n) => n.nameRaw[0] === "r".charCodeAt(0))).toHaveLength(0);
+      expect(
+        names.filter((n) => n.nameRaw[0] === "r".charCodeAt(0)),
+      ).toHaveLength(0);
       expect(app).toBeDefined();
     });
 
@@ -1014,18 +1461,20 @@ describe("rollup verifier", () => {
       // Nonce 0's signature presented against nonce 1.
       const stale = nacl.sign.detached(
         withdrawalRequestMessage(
-          client.appClient.appId,
+          await client.deploymentDomain(),
           0n,
           hex(request.address),
           algosdk.decodeAddress(recipient),
         ),
         pair.secretKey,
       );
-      const payment = await client.appClient.algorand.createTransaction.payment({
-        sender: sender.address,
-        receiver: client.appClient.appAddress,
-        amount: microAlgo(REQUEST_BOX_MBR),
-      });
+      const payment = await client.appClient.algorand.createTransaction.payment(
+        {
+          sender: sender.address,
+          receiver: client.appClient.appAddress,
+          amount: microAlgo(REQUEST_BOX_MBR),
+        },
+      );
       const signerArgs = { sender: sender.address, signer: sender.txnSigner };
 
       await expect(
@@ -1045,15 +1494,13 @@ describe("rollup verifier", () => {
               pubKey: pair.publicKey,
               signature: stale,
             },
-            boxReferences: [
-              Buffer.concat([Buffer.from("r"), Buffer.alloc(8, 0).fill(0)]),
-            ],
+            boxReferences: [Buffer.concat([Buffer.from("r"), bytes(1n)])],
           })
           .send(),
       ).rejects.toThrow();
     });
 
-    it("refuses to open a batch built before a request landed", async () => {
+    it("allows an open batch to stop before a later pending request", async () => {
       const s = scenario("forced-exit");
       const client = await RollupVerifier.create(algorand, sender);
       const { request, pair } = subject();
@@ -1068,24 +1515,167 @@ describe("rollup verifier", () => {
         pair.secretKey,
       );
 
+      const bound = await bindScenario(client, s);
+      await client.verifyBatch(
+        sender,
+        hex(bound.batch),
+        hex(bound.publicValues),
+        stale,
+      );
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(0n);
+      expect(state.requestCursor).toBe(1n);
+    });
+
+    it("settles a signalled request frontier across multiple batches", async () => {
+      const client = await RollupVerifier.create(
+        algorand,
+        sender,
+        TEST_DEPOSIT_TIMEOUT,
+        20n,
+      );
+      const { request, pair } = subject();
+      const recipientAddress = algosdk.encodeAddress(hex(request.recipient));
+
+      await client.requestWithdrawal(
+        sender,
+        hex(request.address),
+        pair.publicKey,
+        recipientAddress,
+        pair.secretKey,
+      );
+      await client.requestWithdrawal(
+        sender,
+        hex(request.address),
+        pair.publicKey,
+        recipientAddress,
+        pair.secretKey,
+      );
+
+      const zero = Buffer.alloc(32);
+      const firstChain = sha256(
+        tag("REQUEST"),
+        zero,
+        hex(request.address),
+        hex(request.recipient),
+      );
+      const secondChain = sha256(
+        tag("REQUEST"),
+        firstChain,
+        hex(request.address),
+        hex(request.recipient),
+      );
+
+      await advanceRounds(Number(TEST_DEPOSIT_TIMEOUT) + 1);
+      await client.signalEscape(sender);
+      const initialDeadline = (await client.appClient.state.global.getAll())
+        .escapeDeadline;
+
+      const first = await bindScenario(client, scenario("genesis-empty-batch"));
+      const firstValues = hex(first.publicValues);
+      firstChain.copy(firstValues, 224);
+      await client.verifyBatch(sender, hex(first.batch), firstValues, 1n);
+
+      let state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(1n);
+      expect(state.escapeRequestTarget).toBe(2n);
+      expect(state.escapeDeadline).toBe(initialDeadline);
+
       await expect(
         client.appClient.send.openBatch({
           sender: sender.address,
           signer: sender.txnSigner,
           args: {
-            batchLength: s.batchLength,
-            expectedDepositCursor: await client.depositCursor(),
-            expectedRequestCursor: stale,
+            batchLength: first.batchLength,
+            expectedDepositCursor: 0n,
+            targetRequestCursor: 0n,
           },
         }),
       ).rejects.toThrow();
+
+      const second = await bindScenario(client, scenario("forced-exit"));
+      const secondValues = hex(second.publicValues);
+      zero.copy(secondValues, 0);
+      zero.copy(secondValues, 32);
+      zero.copy(secondValues, 96);
+      zero.copy(secondValues, 128);
+      zero.copy(secondValues, 160);
+      firstChain.copy(secondValues, 192);
+      secondChain.copy(secondValues, 224);
+      bytes(0n).copy(secondValues, 256);
+      await client.verifyBatch(sender, hex(second.batch), secondValues, 2n);
+
+      state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(2n);
+      expect(state.escapeRequestTarget).toBeUndefined();
+      expect(state.escapeDeadline).toBeUndefined();
     });
 
-    // A request arriving mid-batch belongs to the next one, exactly as a deposit does. The seal is
-    // a copy, so a batch in flight is not invalidated by somebody demanding an exit.
+    it("extends the deadline only after a full FIFO request tranche", async () => {
+      const grace = 20n;
+      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
+      const { request, pair } = subject();
+      const recipientAddress = algosdk.encodeAddress(hex(request.recipient));
+      let chain = Buffer.alloc(32);
+      let firstTrancheChain = Buffer.alloc(32);
+
+      for (let index = 0; index < 257; index++) {
+        await client.requestWithdrawal(
+          sender,
+          hex(request.address),
+          pair.publicKey,
+          recipientAddress,
+          pair.secretKey,
+        );
+        chain = sha256(
+          tag("REQUEST"),
+          chain,
+          hex(request.address),
+          hex(request.recipient),
+        );
+        if (index === 255) firstTrancheChain = chain;
+      }
+      const targetChain = chain;
+
+      await client.signalEscape(sender);
+      const initialDeadline = (await client.appClient.state.global.getAll())
+        .escapeDeadline!;
+
+      const first = await bindScenario(client, scenario("genesis-empty-batch"));
+      const firstValues = hex(first.publicValues);
+      firstTrancheChain.copy(firstValues, 224);
+      await client.verifyBatch(sender, hex(first.batch), firstValues, 256n);
+
+      let state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(256n);
+      expect(state.escapeRequestTarget).toBe(257n);
+      expect(state.escapeDeadline).toBe(initialDeadline + grace);
+
+      const second = await bindScenario(client, scenario("forced-exit"));
+      const secondValues = hex(second.publicValues);
+      const zero = Buffer.alloc(32);
+      zero.copy(secondValues, 0);
+      zero.copy(secondValues, 32);
+      zero.copy(secondValues, 96);
+      zero.copy(secondValues, 128);
+      zero.copy(secondValues, 160);
+      firstTrancheChain.copy(secondValues, 192);
+      targetChain.copy(secondValues, 224);
+      bytes(0n).copy(secondValues, 256);
+      await client.verifyBatch(sender, hex(second.batch), secondValues, 257n);
+
+      state = await client.appClient.state.global.getAll();
+      expect(state.settledRequestCursor).toBe(257n);
+      expect(state.escapeRequestTarget).toBeUndefined();
+      expect(state.escapeDeadline).toBeUndefined();
+    }, 120_000);
+
+    // A request arriving mid-batch lies beyond the selected checkpoint and belongs to a later
+    // batch, so a batch in flight is not invalidated by somebody demanding an exit.
     it("accepts a request that lands while a batch is being posted", async () => {
-      const s = scenario("forced-exit");
       const client = await RollupVerifier.create(algorand, sender);
+      const s = await bindScenario(client, scenario("forced-exit"));
       const { request, pair } = subject();
 
       await replayDeposits(client, s);
@@ -1095,7 +1685,7 @@ describe("rollup verifier", () => {
         args: {
           batchLength: s.batchLength,
           expectedDepositCursor: await client.depositCursor(),
-          expectedRequestCursor: await client.requestCursor(),
+          targetRequestCursor: await client.requestCursor(),
         },
       });
 
@@ -1391,7 +1981,7 @@ describe("rollup verifier", () => {
       const exit = exits()[0];
       const signature = nacl.sign.detached(
         exitMessage(
-          client.appClient.appId,
+          await client.deploymentDomain(),
           hex(exit.address),
           algorand.account.random().addr,
         ),
@@ -1401,9 +1991,21 @@ describe("rollup verifier", () => {
       await expect(
         client.appClient
           .newGroup()
-          .opUp({ sender: sender.address, signer: sender.txnSigner, args: { nonce: 0n } })
-          .opUp({ sender: sender.address, signer: sender.txnSigner, args: { nonce: 1n } })
-          .opUp({ sender: sender.address, signer: sender.txnSigner, args: { nonce: 2n } })
+          .opUp({
+            sender: sender.address,
+            signer: sender.txnSigner,
+            args: { nonce: 0n },
+          })
+          .opUp({
+            sender: sender.address,
+            signer: sender.txnSigner,
+            args: { nonce: 1n },
+          })
+          .opUp({
+            sender: sender.address,
+            signer: sender.txnSigner,
+            args: { nonce: 2n },
+          })
           .forceExit({
             sender: sender.address,
             signer: sender.txnSigner,
@@ -1513,13 +2115,13 @@ describe("rollup verifier", () => {
       args: {
         batchLength: s.batchLength + 1,
         expectedDepositCursor: await client.depositCursor(),
-        expectedRequestCursor: await client.requestCursor(),
+        targetRequestCursor: await client.requestCursor(),
       },
     });
 
     await client.abandonBatch(sender);
 
-    await client.verifyBatch(sender, hex(s.batch), hex(s.publicValues));
+    await settle(client, s);
 
     const state = await client.appClient.state.global.getAll();
     expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(

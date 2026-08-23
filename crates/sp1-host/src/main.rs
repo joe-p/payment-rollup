@@ -6,8 +6,8 @@
 
 use std::process::ExitCode;
 
+use payment_rollup::{MIN_WITHDRAWAL, REQUEST_CHAIN_GENESIS, deployment_domain};
 use serde_json::{Value, json};
-use payment_rollup::{MIN_WITHDRAWAL, REQUEST_CHAIN_GENESIS, WITHDRAWAL_CHAIN_GENESIS};
 use sp1_host::{
     DEPOSIT_CHAIN_GENESIS, GENESIS_ROOT, PUBLIC_VALUES_SIZE, Settlement, hex, scenarios,
 };
@@ -23,6 +23,8 @@ With no SCENARIO, every scenario is emitted.
 Options:
   --out <PATH>       write the JSON here instead of to stdout
   --include-sidecar  include the prover-only sidecar bytes, which the contract does not need
+  --genesis-hash <HEX>  32-byte settlement-chain genesis hash (default: zero)
+  --app-id <U64>        settlement application ID (default: 0)
   --list             list the scenarios and exit
   -h, --help         show this message
 ";
@@ -43,6 +45,20 @@ struct Args {
     out: Option<String>,
     include_sidecar: bool,
     names: Vec<String>,
+    genesis_hash: [u8; 32],
+    app_id: u64,
+}
+
+fn parse_hash(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("--genesis-hash must be exactly 64 hexadecimal characters".to_string());
+    }
+    let mut hash = [0u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "--genesis-hash contains non-hexadecimal characters".to_string())?;
+    }
+    Ok(hash)
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -64,6 +80,20 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "--include-sidecar" => args.include_sidecar = true,
+            "--genesis-hash" => {
+                args.genesis_hash = parse_hash(
+                    &remaining
+                        .next()
+                        .ok_or_else(|| "--genesis-hash needs a value".to_string())?,
+                )?;
+            }
+            "--app-id" => {
+                args.app_id = remaining
+                    .next()
+                    .ok_or_else(|| "--app-id needs a value".to_string())?
+                    .parse()
+                    .map_err(|_| "--app-id must be an unsigned 64-bit integer".to_string())?;
+            }
             "--out" => {
                 args.out = Some(
                     remaining
@@ -100,8 +130,9 @@ fn run() -> Result<(), String> {
     };
 
     let mut emitted = Vec::with_capacity(selected.len());
+    let domain = deployment_domain(&args.genesis_hash, args.app_id);
     for scenario in &selected {
-        let block = (scenario.build)();
+        let block = (scenario.build)(domain);
         let settlement = Settlement::for_block(&block)
             .map_err(|error| format!("scenario {}: {error}", scenario.name))?;
 
@@ -135,9 +166,11 @@ fn run() -> Result<(), String> {
         "chunkSize": sp1_host::CHUNK_SIZE,
         "publicValuesSize": PUBLIC_VALUES_SIZE,
         "minWithdrawal": MIN_WITHDRAWAL,
+        "deploymentDomain": hex(&domain),
+        "genesisHash": hex(&args.genesis_hash),
+        "appId": args.app_id,
         "genesisRoot": hex(&GENESIS_ROOT),
         "depositChainGenesis": hex(&DEPOSIT_CHAIN_GENESIS),
-        "withdrawalChainGenesis": hex(&WITHDRAWAL_CHAIN_GENESIS),
         "requestChainGenesis": hex(&REQUEST_CHAIN_GENESIS),
         "scenarios": emitted,
     });
@@ -187,9 +220,11 @@ fn fixture(
         "oldRoot": hex(&settlement.old_root()),
         "newRoot": hex(&settlement.new_root()),
         "batchCommitment": hex(&settlement.batch_commitment()),
+        "deploymentDomain": hex(&settlement.domain()),
         "depositChainFrom": hex(&settlement.deposit_chain_from()),
         "depositChainTo": hex(&settlement.deposit_chain_to()),
-        "withdrawalChain": hex(&settlement.withdrawal_chain()),
+        "withdrawalRoot": hex(&settlement.withdrawal_root()),
+        "withdrawalCount": settlement.withdrawal_count(),
         "requestChainFrom": hex(&settlement.request_chain_from()),
         "requestChainTo": hex(&settlement.request_chain_to()),
 
@@ -213,16 +248,15 @@ fn fixture(
             .map(|(recipient, amount)| json!({ "recipient": hex(recipient), "amount": amount }))
             .collect::<Vec<_>>(),
 
-        // One `claimWithdrawal(recipient, amount, chainBefore)` call each, after the batch has
-        // settled -- in the *reverse* of this order, because the queue unwinds newest-first. The
-        // first entry's `chainBefore` is the genesis value, which is where the queue drains.
+        // One ordered-Merkle claim per payout after the batch has settled.
         "withdrawals": settlement
             .withdrawal_claims()
             .iter()
-            .map(|(recipient, amount, chain_before)| json!({
-                "recipient": hex(recipient),
-                "amount": amount,
-                "chainBefore": hex(chain_before),
+            .map(|claim| json!({
+                "index": claim.index,
+                "recipient": hex(&claim.recipient),
+                "amount": claim.amount,
+                "siblings": claim.siblings.iter().map(|sibling| hex(sibling)).collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
 
@@ -230,7 +264,7 @@ fn fixture(
         // every scenario but the one built for it -- an exit proves against a frozen root, so it
         // has nothing to do with settling and is emitted alongside rather than as part of it.
         "exits": if scenario.name == "forced-exit" {
-            scenarios::forced_exit_proofs()
+            scenarios::forced_exit_proofs(settlement.domain())
                 .iter()
                 .map(|exit| json!({
                     "address": hex(&exit.address),

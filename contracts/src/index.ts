@@ -24,7 +24,8 @@ export const DEPOSIT_BOX_MBR = 38_100n;
  * Minimum balance one withdrawal queue box costs, advanced by whoever settles the batch and
  * returned when the queue drains. Mirrors `WITHDRAWAL_BOX_MBR` in the contract.
  */
-export const WITHDRAWAL_BOX_MBR = 31_700n;
+export const WITHDRAWAL_BOX_MBR = 50_900n;
+export const MAX_WITHDRAWALS = 256;
 
 /**
  * Smallest withdrawal the guest will prove, in microALGO. Mirrors `MIN_WITHDRAWAL` in the core
@@ -48,7 +49,7 @@ export const EXIT_BOX_MBR = 18_900n;
  * Minimum balance one pending withdrawal request costs, advanced by the requester and returned by
  * {@link RollupVerifier.pruneRequest}. Mirrors `REQUEST_BOX_MBR` in the contract.
  */
-export const REQUEST_BOX_MBR = 47_700n;
+export const REQUEST_BOX_MBR = 60_500n;
 
 /** Largest group the network will accept, and so the most chunks one send can carry. */
 const MAX_GROUP_SIZE = 16;
@@ -84,6 +85,65 @@ export function l2Address(scheme: string, pubKey: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(preimage).digest());
 }
 
+/** Network- and application-specific domain shared by signatures, the guest, and the contract. */
+export function deploymentDomain(
+  genesisHash: Uint8Array,
+  appId: bigint,
+): Uint8Array {
+  const tag = new TextEncoder().encode("PAYMENT_ROLLUP_V1");
+  const preimage = new Uint8Array(tag.length + 32 + 8);
+  preimage.set(tag);
+  preimage.set(genesisHash, tag.length);
+  new DataView(preimage.buffer).setBigUint64(tag.length + 32, appId);
+  return new Uint8Array(createHash("sha256").update(preimage).digest());
+}
+
+function l2TransactionMessage(
+  kind: "PAY" | "WDR",
+  domain: Uint8Array,
+  sender: Uint8Array,
+  nonce: bigint,
+  destination: Uint8Array,
+  amount: bigint,
+): Uint8Array {
+  const tag = new TextEncoder().encode(kind);
+  const message = new Uint8Array(3 + 32 + 32 + 8 + 32 + 8);
+  message.set(tag);
+  message.set(domain, 3);
+  message.set(sender, 35);
+  const view = new DataView(message.buffer);
+  view.setBigUint64(67, nonce);
+  message.set(destination, 75);
+  view.setBigUint64(107, amount);
+  return message;
+}
+
+/** Bytes an L2 payment signs, including its deployment and network domain. */
+export const paymentMessage = (
+  domain: Uint8Array,
+  sender: Uint8Array,
+  nonce: bigint,
+  receiver: Uint8Array,
+  amount: bigint,
+) => l2TransactionMessage("PAY", domain, sender, nonce, receiver, amount);
+
+/** Bytes an ordinary L2 withdrawal signs, including its deployment and network domain. */
+export const withdrawalMessage = (
+  domain: Uint8Array,
+  sender: Uint8Array,
+  nonce: bigint,
+  recipient: algosdk.Address,
+  amount: bigint,
+) =>
+  l2TransactionMessage(
+    "WDR",
+    domain,
+    sender,
+    nonce,
+    recipient.publicKey,
+    amount,
+  );
+
 /** A `BoxMap<uint64, _>` key: the map's one-character prefix and the key, big-endian. */
 function boxName(prefix: string, key: bigint): Uint8Array {
   const name = new Uint8Array(9);
@@ -105,25 +165,24 @@ const requestBoxName = (nonce: bigint) => boxName("r", nonce);
 /**
  * The bytes a holder signs to demand that their account be let out.
  *
- * Mirrors the preimage `requestWithdrawal` builds. The application id keeps the signature from being
- * carried to another deployment; the nonce makes it authorize one request rather than an unbounded
- * stream of replays of it.
+ * Mirrors the preimage `requestWithdrawal` builds. The deployment domain prevents cross-network
+ * and cross-application replay; the nonce authorizes exactly one request.
  */
 export function withdrawalRequestMessage(
-  appId: bigint,
+  domain: Uint8Array,
   nonce: bigint,
   address: Uint8Array,
   recipient: algosdk.Address,
 ): Uint8Array {
   const tag = new TextEncoder().encode("WREQ");
-  const message = new Uint8Array(tag.length + 8 + 8 + 32 + 32);
+  const message = new Uint8Array(tag.length + 32 + 8 + 32 + 32);
   const view = new DataView(message.buffer);
 
   message.set(tag);
-  view.setBigUint64(tag.length, appId);
-  view.setBigUint64(tag.length + 8, nonce);
-  message.set(address, tag.length + 16);
-  message.set(recipient.publicKey, tag.length + 16 + 32);
+  message.set(domain, tag.length);
+  view.setBigUint64(tag.length + 32, nonce);
+  message.set(address, tag.length + 40);
+  message.set(recipient.publicKey, tag.length + 40 + 32);
 
   return message;
 }
@@ -140,21 +199,21 @@ function exitBoxName(address: Uint8Array): Uint8Array {
 /**
  * The bytes a holder signs to authorize a forced exit of `address` to `recipient`.
  *
- * Mirrors the preimage `forceExit` builds. The application id is in there so a signature cannot be
- * carried to another deployment where the same key controls the same rollup address.
+ * Mirrors the preimage `forceExit` builds. The deployment domain prevents cross-network and
+ * cross-application replay.
  */
 export function exitMessage(
-  appId: bigint,
+  domain: Uint8Array,
   address: Uint8Array,
   recipient: algosdk.Address,
 ): Uint8Array {
   const tag = new TextEncoder().encode("EXIT");
-  const message = new Uint8Array(tag.length + 8 + 32 + 32);
+  const message = new Uint8Array(tag.length + 32 + 32 + 32);
 
   message.set(tag);
-  new DataView(message.buffer).setBigUint64(tag.length, appId);
-  message.set(address, tag.length + 8);
-  message.set(recipient.publicKey, tag.length + 8 + 32);
+  message.set(domain, tag.length);
+  message.set(address, tag.length + 32);
+  message.set(recipient.publicKey, tag.length + 32 + 32);
 
   return message;
 }
@@ -178,14 +237,21 @@ function forceExitOpcodeCost(depth: number): number {
 
 export class RollupVerifier {
   appClient: RollupVerifierClient;
+  private algorand: AlgorandClient;
 
   constructor(algorand: AlgorandClient, appId: bigint) {
+    this.algorand = algorand;
     this.appClient = algorand.client.getTypedAppClientById(
       RollupVerifierClient,
       {
         appId,
       },
     );
+  }
+
+  async deploymentDomain(): Promise<Uint8Array> {
+    const { genesisHash } = await this.algorand.getSuggestedParams();
+    return deploymentDomain(genesisHash, this.appClient.appId);
   }
 
   /**
@@ -279,6 +345,11 @@ export class RollupVerifier {
     return (await this.appClient.state.global.requestCursor()) ?? 0n;
   }
 
+  /** First forced-withdrawal request not yet answered by a settled batch. */
+  async settledRequestCursor(): Promise<bigint> {
+    return (await this.appClient.state.global.settledRequestCursor()) ?? 0n;
+  }
+
   /**
    * Demand from L1 that an account be emptied to `recipient`, whether the sequencer likes it or not.
    *
@@ -302,7 +373,7 @@ export class RollupVerifier {
     const nonce = await this.requestCursor();
     const signature = nacl.sign.detached(
       withdrawalRequestMessage(
-        this.appClient.appId,
+        await this.deploymentDomain(),
         nonce,
         address,
         algosdk.decodeAddress(recipient),
@@ -382,7 +453,8 @@ export class RollupVerifier {
    *
    * Permissionless. Both heads are referenced because either can be the stale one: a deposit left
    * uncredited, or a withdrawal request left unanswered. The contract reads their rounds and
-   * nothing else, and only reads a queue it has already found to be non-empty.
+   * snapshots the live cursors as fixed targets. Full 256-request FIFO advances may extend the
+   * deadline, but later arrivals never move the target.
    */
   async signalEscape(
     sender: algosdk.AddressWithTransactionSigner,
@@ -401,7 +473,8 @@ export class RollupVerifier {
   }
 
   /**
-   * Pull the escape hatch, once the grace period has run out with no settlement.
+   * Pull the escape hatch once the deadline, including any earned request-progress extensions, has
+   * run out.
    *
    * Permissionless and terminal: afterwards no deposit is accepted, no batch settles, the state
    * root is final, and every pending deposit is refundable through {@link reclaimDeposit}.
@@ -453,9 +526,8 @@ export class RollupVerifier {
     recipient: algosdk.Address,
     secretKey: Uint8Array,
   ): Promise<bigint> {
-    const appId = this.appClient.appId;
     const signature = nacl.sign.detached(
-      exitMessage(appId, exit.address, recipient),
+      exitMessage(await this.deploymentDomain(), exit.address, recipient),
       secretKey,
     );
 
@@ -505,24 +577,36 @@ export class RollupVerifier {
   /**
    * Pay out one withdrawal from a settled batch's queue.
    *
-   * Claims unwind the queue newest-first: `previousChain` is the chain value standing immediately
-   * before this withdrawal was folded in, and the last claim is the one whose `previousChain` is
-   * 32 zero bytes. Permissionless -- the payout goes to `recipient` whoever calls this.
+   * Claims are independent: `index` selects the nullifier bit and `siblings` proves the indexed
+   * payout against this batch's root. Permissionless -- the payout goes to `recipient` whoever
+   * calls this.
    */
   async claimWithdrawal(
     sender: algosdk.AddressWithTransactionSigner,
     batchNumber: bigint,
+    index: bigint,
+    batchCommitment: Uint8Array,
     recipient: string,
     amount: bigint,
-    previousChain: Uint8Array,
+    siblings: Uint8Array[],
   ): Promise<void> {
+    const proof = new Uint8Array(siblings.length * 32);
+    siblings.forEach((sibling, i) => proof.set(sibling, i * 32));
+
     // Draining the queue deletes the box and refunds its minimum balance, which is a second inner
     // transaction. Paying for both every time costs 1000 µALGO and avoids making the caller know
     // which claim is the last one.
     await this.appClient.send.claimWithdrawal({
       sender: sender.address,
       signer: sender.txnSigner,
-      args: { batchNumber, recipient, amount, previousChain },
+      args: {
+        batchNumber,
+        index,
+        batchCommitment,
+        recipient,
+        amount,
+        siblings: proof,
+      },
       boxReferences: [withdrawalBoxName(batchNumber)],
       extraFee: microAlgo(2_000),
     });
@@ -535,26 +619,35 @@ export class RollupVerifier {
    * they folded on L1 against the one the batch folds to, so a missing or out-of-order deposit
    * fails at the very end, after every chunk has been paid for.
    *
-   * `withdraws` says whether the batch's public values carry a non-genesis withdrawal chain. When
-   * they do, the settling call has to be preceded in its own group by a payment covering the queue
-   * box's minimum balance, and a box reference for the queue.
+   * A nonzero withdrawal count in the public values makes the settling call fund and reference the
+   * batch's claim-bitmap box.
+   *
+   * `targetRequestCursor` selects the exclusive end of the forced-request prefix this batch
+   * answers. It defaults to the current live cursor, preserving the all-pending behavior, but may
+   * stop earlier so a large forced-request backlog can be settled across several batches.
    */
   async verifyBatch(
     sender: algosdk.AddressWithTransactionSigner,
     batch: Uint8Array,
     publicValues: Uint8Array,
-    withdraws: boolean = false,
+    targetRequestCursor?: bigint,
   ): Promise<void> {
     const batchLength = batch.byteLength;
     const senderSigner = { sender: sender.address, signer: sender.txnSigner };
+    const settledRequestCursor = await this.settledRequestCursor();
+    const requestTarget = targetRequestCursor ?? (await this.requestCursor());
 
     await this.appClient.send.openBatch({
       ...senderSigner,
       args: {
         batchLength,
         expectedDepositCursor: await this.depositCursor(),
-        expectedRequestCursor: await this.requestCursor(),
+        targetRequestCursor: requestTarget,
       },
+      boxReferences:
+        requestTarget > settledRequestCursor
+          ? [requestBoxName(requestTarget - 1n)]
+          : [],
     });
 
     const chunks = [];
@@ -581,7 +674,16 @@ export class RollupVerifier {
 
     await composer.send();
 
-    if (!withdraws) {
+    if (publicValues.byteLength !== 264) {
+      throw new Error("public values must be exactly 264 bytes");
+    }
+    const withdrawalCount = new DataView(
+      publicValues.buffer,
+      publicValues.byteOffset + 256,
+      8,
+    ).getBigUint64(0);
+
+    if (withdrawalCount === 0n) {
       await this.appClient.send.verifyBatch({
         ...senderSigner,
         args: { publicValues },

@@ -1,8 +1,7 @@
 //! Everything a settlement transaction needs, produced without a zkVM.
 //!
 //! The guest is [`payment_rollup::execute`] wrapped in zkVM io, so running that function directly
-//! gives the exact 192 bytes a proof would commit -- the roots, the batch commitment, the two ends
-//! of the deposit chain, and the withdrawal chain -- for the cost of replaying the block. What is
+//! gives the exact 264 bytes a proof would commit for the cost of replaying the block. What is
 //! missing is only the proof that the replay happened, which is precisely the part the settlement
 //! contract does not check yet.
 //!
@@ -12,8 +11,8 @@
 //! built from.
 
 use payment_rollup::{
-    Address, Block, ExecutionError, L1Address, Transaction, VerificationError, accumulate_withdrawal,
-    chunk_count, execute,
+    Address, Block, DeploymentDomain, ExecutionError, L1Address, Transaction, VerificationError,
+    WithdrawalClaim, chunk_count, execute,
 };
 
 pub mod scenarios;
@@ -37,13 +36,15 @@ pub use payment_rollup::DEPOSIT_CHAIN_GENESIS;
 /// One block, reduced to the arguments the settlement contract takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settlement {
+    domain: DeploymentDomain,
     old_root: [u8; 32],
     new_root: [u8; 32],
     old_deposit_chain: [u8; 32],
     new_deposit_chain: [u8; 32],
     old_request_chain: [u8; 32],
     new_request_chain: [u8; 32],
-    withdrawal_chain: [u8; 32],
+    withdrawal_root: [u8; 32],
+    withdrawal_count: u64,
     deposits: Vec<(Address, u64)>,
     withdrawals: Vec<(L1Address, u64)>,
     requests: Vec<(Address, L1Address)>,
@@ -64,6 +65,7 @@ impl Settlement {
         let sidecar_bytes = block.sidecar().encode();
 
         let public_values = execute(
+            block.domain(),
             block.old_root(),
             block.old_deposit_chain(),
             block.old_request_chain(),
@@ -76,8 +78,9 @@ impl Settlement {
         // goes for every chain.
         if public_values[32..64] != block.new_root()
             || public_values[128..160] != block.new_deposit_chain()
-            || public_values[160..192] != block.withdrawal_chain()
-            || public_values[224..] != block.new_request_chain()
+            || public_values[160..192] != block.withdrawal_root()
+            || public_values[224..256] != block.new_request_chain()
+            || public_values[256..264] != block.withdrawal_count().to_be_bytes()
         {
             return Err(ExecutionError::Verification(
                 VerificationError::RootMismatch,
@@ -86,7 +89,7 @@ impl Settlement {
 
         // Read back off the wire rather than out of the in-memory block, so these are the lists a
         // replaying node would reconstruct -- which is what the e2e has to feed L1 to reach the
-        // chain the batch folds to, and what anyone claiming a withdrawal has to unwind.
+        // chain the batch folds to, and what anyone claiming a withdrawal has to prove.
         let txns = payment_rollup::Batch::decode(&batch_bytes)?;
 
         let deposits = txns
@@ -115,13 +118,15 @@ impl Settlement {
             .collect();
 
         Ok(Self {
+            domain: block.domain(),
             old_root: block.old_root(),
             new_root: block.new_root(),
             old_deposit_chain: block.old_deposit_chain(),
             new_deposit_chain: block.new_deposit_chain(),
             old_request_chain: block.old_request_chain(),
             new_request_chain: block.new_request_chain(),
-            withdrawal_chain: block.withdrawal_chain(),
+            withdrawal_root: block.withdrawal_root(),
+            withdrawal_count: block.withdrawal_count(),
             deposits,
             withdrawals,
             requests,
@@ -152,12 +157,16 @@ impl Settlement {
         &self.deposits
     }
 
-    /// The chain this block's withdrawals fold to, which the contract stores as a payout queue.
-    ///
-    /// Equal to [`payment_rollup::WITHDRAWAL_CHAIN_GENESIS`] when the block withdraws nothing, and
-    /// that is how the contract knows not to open a queue at all.
-    pub fn withdrawal_chain(&self) -> [u8; 32] {
-        self.withdrawal_chain
+    pub fn domain(&self) -> DeploymentDomain {
+        self.domain
+    }
+
+    pub fn withdrawal_root(&self) -> [u8; 32] {
+        self.withdrawal_root
+    }
+
+    pub fn withdrawal_count(&self) -> u64 {
+        self.withdrawal_count
     }
 
     /// The request chain the batch anchors to: what the contract must have settled last time.
@@ -182,35 +191,13 @@ impl Settlement {
 
     /// Every withdrawal the batch makes, in the order it makes them.
     ///
-    /// Claimed on L1 in the *reverse* of this order: the contract holds the tip of the chain and
-    /// each claim hands back the value before it, so the queue unwinds newest-first. See
-    /// [`payment_rollup::accumulate_withdrawal`].
     pub fn withdrawals(&self) -> &[(L1Address, u64)] {
         &self.withdrawals
     }
 
-    /// Every withdrawal paired with the chain value standing immediately before it was folded in.
-    ///
-    /// That third value is the whole of what a claim needs beyond the recipient and the amount: the
-    /// contract holds the tip, and `claimWithdrawal` checks that folding the claim onto the value
-    /// supplied here reproduces it. Emitted in batch order; claims are made in the reverse, so the
-    /// last entry is the first claimable and the first entry's chain value is
-    /// [`payment_rollup::WITHDRAWAL_CHAIN_GENESIS`], where the queue drains.
-    ///
-    /// Recomputed by folding rather than captured during the replay, so it is derived the same way
-    /// anyone reading the batch bytes off L1 would derive it.
-    pub fn withdrawal_claims(&self) -> Vec<(L1Address, u64, [u8; 32])> {
-        let mut chain = payment_rollup::WITHDRAWAL_CHAIN_GENESIS;
-
-        self.withdrawals
-            .iter()
-            .map(|(recipient, amount)| {
-                let before = chain;
-                chain = accumulate_withdrawal(&chain, recipient, *amount);
-
-                (*recipient, *amount, before)
-            })
-            .collect()
+    pub fn withdrawal_claims(&self) -> Vec<WithdrawalClaim> {
+        payment_rollup::withdrawal_claims(&self.batch_commitment(), &self.withdrawals)
+            .expect("a settled block has at most MAX_WITHDRAWALS payouts")
     }
 
     pub fn old_root(&self) -> [u8; 32] {
@@ -236,7 +223,7 @@ impl Settlement {
         &self.sidecar_bytes
     }
 
-    /// The 192 bytes a proof would commit, and the single argument `verifyBatch` takes.
+    /// The 264 bytes a proof would commit, and the single argument `verifyBatch` takes.
     pub fn public_values(&self) -> &[u8; PUBLIC_VALUES_SIZE] {
         &self.public_values
     }
@@ -285,11 +272,14 @@ mod tests {
         accumulate_chunk, accumulate_deposit, chunk_accumulator_seed, chunk_digest,
     };
 
+    const DOMAIN: DeploymentDomain = [0x42; 32];
+
     /// The contract's side of the fold: seed from the declared length, then one step per posted
     /// chunk. If this does not land on the commitment in the public values, the chunks being
     /// emitted are not the ones the contract needs.
     fn accumulate_as_the_contract_would(settlement: &Settlement) -> [u8; 32] {
-        let mut accumulator = chunk_accumulator_seed(settlement.batch_length());
+        let mut accumulator =
+            chunk_accumulator_seed(&settlement.domain(), settlement.batch_length());
         for chunk in settlement.chunks() {
             accumulator = accumulate_chunk(&accumulator, &chunk_digest(chunk));
         }
@@ -300,7 +290,7 @@ mod tests {
     #[test]
     fn every_scenario_produces_a_settlement() {
         for scenario in scenarios::all() {
-            let settlement = Settlement::for_block(&(scenario.build)())
+            let settlement = Settlement::for_block(&(scenario.build)(DOMAIN))
                 .unwrap_or_else(|error| panic!("{}: {error}", scenario.name));
 
             assert_eq!(&settlement.public_values[..32], &settlement.old_root());
@@ -315,15 +305,19 @@ mod tests {
             );
             assert_eq!(
                 &settlement.public_values[160..192],
-                &settlement.withdrawal_chain()
+                &settlement.withdrawal_root()
             );
             assert_eq!(
                 &settlement.public_values[192..224],
                 &settlement.request_chain_from()
             );
             assert_eq!(
-                &settlement.public_values[224..],
+                &settlement.public_values[224..256],
                 &settlement.request_chain_to()
+            );
+            assert_eq!(
+                &settlement.public_values[256..264],
+                &settlement.withdrawal_count().to_be_bytes()
             );
             assert_eq!(
                 accumulate_as_the_contract_would(&settlement),
@@ -339,7 +333,7 @@ mod tests {
     #[test]
     fn every_scenario_deposit_chain_folds_from_its_anchor() {
         for scenario in scenarios::all() {
-            let settlement = Settlement::for_block(&(scenario.build)()).unwrap();
+            let settlement = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
 
             let mut chain = settlement.deposit_chain_from();
             for (receiver, amount) in settlement.deposits() {
@@ -359,9 +353,10 @@ mod tests {
     // case need no distinguishing seed: "unchanged" is already a distinguishable commitment.
     #[test]
     fn a_scenario_without_deposits_leaves_the_chain_alone() {
-        let settlement =
-            Settlement::for_block(&(scenarios::find("genesis-empty-batch").unwrap().build)())
-                .unwrap();
+        let settlement = Settlement::for_block(&(scenarios::find("genesis-empty-batch")
+            .unwrap()
+            .build)(DOMAIN))
+        .unwrap();
 
         assert!(settlement.deposits().is_empty());
         assert_eq!(
@@ -375,7 +370,7 @@ mod tests {
     fn a_deposit_bearing_scenario_exists() {
         assert!(
             scenarios::all().iter().any(|scenario| {
-                !Settlement::for_block(&(scenario.build)())
+                !Settlement::for_block(&(scenario.build)(DOMAIN))
                     .unwrap()
                     .deposits()
                     .is_empty()
@@ -387,7 +382,7 @@ mod tests {
     #[test]
     fn chunks_are_full_until_the_last_one() {
         for scenario in scenarios::all() {
-            let settlement = Settlement::for_block(&(scenario.build)()).unwrap();
+            let settlement = Settlement::for_block(&(scenario.build)(DOMAIN)).unwrap();
             let chunks: Vec<_> = settlement.chunks().collect();
 
             assert_eq!(chunks.len(), settlement.chunk_count());
@@ -409,7 +404,7 @@ mod tests {
     fn every_scenario_settles_against_a_fresh_contract() {
         for scenario in scenarios::all() {
             assert!(
-                Settlement::for_block(&(scenario.build)())
+                Settlement::for_block(&(scenario.build)(DOMAIN))
                     .unwrap()
                     .settles_from_genesis(),
                 "{} does not start from genesis, and there is no longer a way to seed a contract \
@@ -423,7 +418,7 @@ mod tests {
     fn a_multi_chunk_scenario_exists() {
         assert!(
             scenarios::all().iter().any(|scenario| {
-                Settlement::for_block(&(scenario.build)())
+                Settlement::for_block(&(scenario.build)(DOMAIN))
                     .unwrap()
                     .chunk_count()
                     > 1
