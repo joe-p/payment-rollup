@@ -15,3 +15,21 @@ license.workspace = true
 # with the tag matching the SP1 version in use. Only SHA-256 is accelerated -- SHA-512/256 has no
 # precompile and runs its 64-bit arithmetic in software on a 32-bit VM, so it is not used anywhere.
 sha2 = { workspace = true }
+# The two halves of `Scheme::Falcon1024HybridEd25519`, and between them every signature this crate
+# checks. See `crypto.rs` for what each is asked to do, and the workspace manifest for why the
+# Ed25519 version is pinned where it is.
+#
+# Like sha2, the curve half has a precompile behind it, and like sha2 the guest workspace has to ask
+# for it -- the acceleration is in `curve25519-dalek`, which this depends on rather than names:
+#
+#   [patch.crates-io]
+#   curve25519-dalek = { git = "https://github.com/sp1-patches/curve25519-dalek", tag = "patch-4.1.3-sp1-6.2.0" }
+#
+# again with the tag matching the SP1 version in use. The Falcon half has no precompile and no
+# prospect of one: it is C, compiled for the target, and every cycle it costs is a cycle it runs.
+ed25519-dalek = { workspace = true }
+falcon-det1024 = { path = "../falcon-det1024" }
+
+[dev-dependencies]
+# Tests have to produce the signatures they check, which is the one place a private key belongs.
+falcon-det1024 = { path = "../falcon-det1024", features = ["sign"] }

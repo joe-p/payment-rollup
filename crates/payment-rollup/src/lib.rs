@@ -4,9 +4,14 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 
 mod codec;
+mod crypto;
 mod merkle;
 
 pub use codec::DecodeError;
+pub use crypto::{
+    ED25519_PUBLIC_KEY_SIZE, ED25519_SIGNATURE_SIZE, FALCON_PUBLIC_KEY_SIZE,
+    HYBRID_PUBLIC_KEY_SIZE, MAX_HYBRID_SIGNATURE_SIZE, MIN_HYBRID_SIGNATURE_SIZE,
+};
 pub use merkle::{MerkleProof, Slot, SparseMerkleTree, verify_proof};
 
 pub type Address = [u8; 32];
@@ -65,12 +70,35 @@ pub const ZERO_ADDRESS: Address = [0u8; 32];
 
 const SCHEME_SIZE: usize = 3;
 
+/// How an account proves a spend, and so what its key and signature bytes are.
+///
+/// The scheme is part of the address -- see [`address_from_public_key`] -- so it is fixed when the
+/// account is created and cannot be changed afterwards except by rekeying to an address that has a
+/// different one. See `crypto.rs` for what each scheme checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheme {
-    /// Signing authority for this account is granted via crypto signatures
-    /// Instead, it is directly managed by the sequencer
+    /// No signing authority is granted via crypto signatures at all: the account is managed
+    /// directly by the sequencer.
+    ///
+    /// There is no key behind the `auth_address` of a managed account, so nothing a verifier could
+    /// hold a signature to -- a spend from one is authorized by the fact that the sequencer built
+    /// the batch containing it. Everything else in the replay still applies: the pre-state is
+    /// witnessed, the nonce is derived, and the roots have to line up.
     Managed,
+    /// Ed25519, the scheme the settlement chain itself uses.
+    ///
+    /// A [`ED25519_PUBLIC_KEY_SIZE`]-byte key and a [`ED25519_SIGNATURE_SIZE`]-byte signature.
     Ed25519,
+    /// Falcon-1024 and Ed25519 together, both of which must sign.
+    ///
+    /// The post-quantum option, and hybrid rather than Falcon alone so that adopting it cannot make
+    /// an account *less* safe: forging a signature means breaking the lattice scheme and the curve
+    /// scheme, so a holder is never worse off than they were under [`Scheme::Ed25519`].
+    ///
+    /// The key is [`HYBRID_PUBLIC_KEY_SIZE`] bytes, Ed25519 first; the signature is the Ed25519
+    /// signature followed by a variable-length Falcon one. Falcon is the deterministic "det1024"
+    /// variant in its compressed format, which is what the AVM's `falcon_verify` accepts -- so a
+    /// signature that spends here is one the settlement contract can also be shown.
     Falcon1024HybridEd25519,
 }
 
@@ -166,6 +194,22 @@ pub(crate) const ENCODED_ACCOUNT_SIZE: usize = 8 + 8 + 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationError {
     InvalidAuthAddress,
+    /// A signature is not the signature of the account's key over the transaction it accompanies.
+    ///
+    /// The one error a signer's own mistake can produce: the wrong key, the wrong nonce, the wrong
+    /// domain, or a signature over a payment presented for a withdrawal. All of them are the same
+    /// thing to a verifier -- the bytes the account would have had to sign are not the bytes it
+    /// signed.
+    InvalidSignature,
+    /// A public key is not a key of the scheme its address commits to.
+    ///
+    /// Reachable only for an account nobody can spend from, since the address is a hash of these
+    /// very bytes: to hold an account whose key does not parse, its creator would have had to derive
+    /// the address from a key they could not sign with.
+    MalformedKey,
+    /// A signature is not the shape its scheme calls for -- the wrong length for the fixed-size
+    /// schemes, or outside the bounds the hybrid's variable-length Falcon half allows.
+    MalformedSignature,
     /// An account's nonce cannot be advanced any further.
     InvalidNonce,
     /// A transaction spends from an address the witness proves holds no account.
@@ -544,6 +588,25 @@ impl Signature {
         } else {
             Err(VerificationError::InvalidAuthAddress)
         }
+    }
+
+    /// Check that this authorizes `message` on behalf of `account`.
+    ///
+    /// Two questions, asked in this order because they are about different things and the first is
+    /// nearly free. Is this key allowed to spend from this account -- [`Signature::verify_auth`],
+    /// one hash and a comparison. And did that key actually sign these bytes -- the scheme's own
+    /// check, which is the expensive part of verifying a block.
+    ///
+    /// Asking the cheap question first is not only about cost. A signature that is perfectly valid
+    /// under the wrong account should say so, and it does: `InvalidAuthAddress` rather than
+    /// `InvalidSignature`.
+    ///
+    /// `message` is built by the caller, and what it commits to is the whole of what a signature
+    /// means here: see `bytes_to_sign`.
+    pub fn verify(&self, account: &Account, message: &[u8]) -> Result<(), VerificationError> {
+        self.verify_auth(account)?;
+
+        crypto::verify(self.scheme, &self.pub_key, &self.sig, message)
     }
 }
 
@@ -983,27 +1046,33 @@ fn expect_pre_state(
 /// from one that holds nothing is [`VerificationError::UnknownSender`] however good the proof of
 /// its absence is.
 ///
-/// On return the account's nonce has been bumped, and that bumped value is the only nonce a
-/// signature for this transaction could have been made over -- which is what lets the nonce stay
-/// off the wire entirely. See [`Account::bump_nonce`].
+/// The nonce is bumped before the signature is checked, and the bumped value is what
+/// `bytes_to_sign` is handed: it is the only nonce a signature for this transaction could have been
+/// made over, which is what lets the nonce stay off the wire entirely. See [`Account::bump_nonce`].
+/// A caller passes the message as a closure rather than a value for exactly that reason -- the nonce
+/// it commits to is not known until the witnessed pre-state has been read.
+///
+/// Authorization is settled before the balance is touched, so an unaffordable spend that nobody
+/// signed for is reported as the forgery it is rather than as a shortfall.
 fn debit(
     sender_addr: &Address,
     witness: &LeafWitness,
     sig: &Signature,
     amount: u64,
     root: [u8; 32],
+    bytes_to_sign: impl FnOnce(u64) -> [u8; ENCODED_TX_SIZE],
 ) -> Result<[u8; 32], VerificationError> {
     expect_pre_state(sender_addr, witness, root)?;
 
     let mut sender = witness
         .old_account
         .ok_or(VerificationError::UnknownSender)?;
-    sig.verify_auth(&sender)?;
+    sender.bump_nonce()?;
+    sig.verify(&sender, &bytes_to_sign(sender.nonce))?;
     sender.amount = sender
         .amount
         .checked_sub(amount)
         .ok_or(VerificationError::InsufficientFunds)?;
-    sender.bump_nonce()?;
 
     root_with(sender_addr, Some(&sender), &witness.proof)
 }
@@ -1081,9 +1150,14 @@ pub fn verify_batch(
                 let (sender_addr, receiver_addr, amt) =
                     (payment.header.sender, payment.receiver, payment.amount);
 
-                // TODO: crypto verification of `entry.sig` over
-                // `payment.bytes_to_sign(domain, nonce)`, where `nonce` is what `debit` derived.
-                root = debit(&sender_addr, &entry.sender_witness, &entry.sig, amt, root)?;
+                root = debit(
+                    &sender_addr,
+                    &entry.sender_witness,
+                    &entry.sig,
+                    amt,
+                    root,
+                    |nonce| payment.bytes_to_sign(domain, nonce),
+                )?;
 
                 // Read against the root the sender write just produced, so a self-payment sees the
                 // debited balance and the bumped nonce.
@@ -1108,9 +1182,14 @@ pub fn verify_batch(
                     return Err(VerificationError::WithdrawalTooSmall);
                 }
 
-                // TODO: crypto verification of `entry.sig` over
-                // `withdrawal.bytes_to_sign(domain, nonce)`, where `nonce` is what `debit` derived.
-                root = debit(&sender_addr, &entry.sender_witness, &entry.sig, amt, root)?;
+                root = debit(
+                    &sender_addr,
+                    &entry.sender_witness,
+                    &entry.sig,
+                    amt,
+                    root,
+                    |nonce| withdrawal.bytes_to_sign(domain, nonce),
+                )?;
 
                 payouts.push((recipient, amt));
             }
@@ -1528,6 +1607,9 @@ impl Ledger {
     /// gets its next one, in the order the transactions appear -- so the order the sequencer picks
     /// is what fixes which nonce each signature has to cover.
     pub fn get_block(&mut self, stxns: Vec<SignedTransaction>) -> Block {
+        // Copied out because the signature checks below run inside a mutable borrow of the ledger,
+        // and the domain is part of every message a signature covers.
+        let domain = self.domain;
         let old_root = self.state_root();
         let old_inbox_chain = self.inbox_chain;
         let mut payouts = Vec::new();
@@ -1537,7 +1619,10 @@ impl Ledger {
         for stxn in stxns {
             let txn = match stxn {
                 SignedTransaction::Payment { payment, sig } => {
-                    let sender_witness = self.debit(payment.header.sender, payment.amount, &sig);
+                    let sender_witness =
+                        self.debit(payment.header.sender, payment.amount, &sig, |nonce| {
+                            payment.bytes_to_sign(&domain, nonce)
+                        });
 
                     // Captured after the sender write, so a self-payment witnesses the debited balance.
                     let receiver_witness = self.credit(payment.receiver, payment.amount);
@@ -1567,7 +1652,9 @@ impl Ledger {
                     );
 
                     let sender_witness =
-                        self.debit(withdrawal.header.sender, withdrawal.amount, &sig);
+                        self.debit(withdrawal.header.sender, withdrawal.amount, &sig, |nonce| {
+                            withdrawal.bytes_to_sign(&domain, nonce)
+                        });
 
                     payouts.push((withdrawal.recipient, withdrawal.amount));
 
@@ -1631,22 +1718,30 @@ impl Ledger {
 
     /// Debit `amount` from `sender`, returning the witness for the slot as it stood beforehand.
     ///
-    /// Mirrors the free-standing [`debit`] on the verifying side, and like [`Ledger::credit`]
-    /// captures the witness before the write and after everything preceding it.
+    /// Mirrors the free-standing [`debit`] on the verifying side, down to the order the checks are
+    /// made in and the nonce the signature is checked against, and like [`Ledger::credit`] captures
+    /// the witness before the write and after everything preceding it.
     ///
     /// Panics rather than returning an error, as the rest of this path does: a sequencer is assumed
-    /// to only build blocks it has already decided are valid.
-    fn debit(&mut self, sender: Address, amount: u64, sig: &Signature) -> LeafWitness {
+    /// to only build blocks it has already decided are valid. Checking the signature here rather
+    /// than trusting the submitter is what makes that assumption true -- a block whose signatures do
+    /// not verify cannot be proved, so the useful place to find out is while it is being built.
+    fn debit(
+        &mut self,
+        sender: Address,
+        amount: u64,
+        sig: &Signature,
+        bytes_to_sign: impl FnOnce(u64) -> [u8; ENCODED_TX_SIZE],
+    ) -> LeafWitness {
         let witness = LeafWitness {
             old_account: self.accounts.get(&sender).copied(),
             proof: self.tree.proof(&sender),
         };
 
         let account = self.accounts.get_mut(&sender).unwrap();
-        sig.verify_auth(account).unwrap();
-        // TODO: crypto verification
-        account.amount = account.amount.checked_sub(amount).unwrap();
         account.bump_nonce().unwrap();
+        sig.verify(account, &bytes_to_sign(account.nonce)).unwrap();
+        account.amount = account.amount.checked_sub(amount).unwrap();
         let account = *account;
         self.tree.update(&sender, Some(&account));
 

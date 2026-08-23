@@ -1,0 +1,23 @@
+[package]
+name = "falcon-det1024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+# The C library is MIT, like this workspace, but it is somebody else's code: `falcon/` is a submodule
+# pinned at the commit go-algorand builds, not a vendored copy anybody here may edit.
+links = "falcon_det1024"
+
+[features]
+# Key generation and signing, which no verifying path needs.
+#
+# A verifier -- the guest, a replaying node, anyone replaying the chain -- only ever checks
+# signatures somebody else produced, so the default build exposes nothing that could hold a private
+# key. Tests and fixture builders that have to produce a signature ask for this.
+#
+# It gates the Rust surface, not the C: `falcon.c` holds `falcon_verify` alongside the signing
+# entry points and references the key generator, so the archive carries all of it either way.
+sign = []
+
+[build-dependencies]
+cc = { workspace = true }

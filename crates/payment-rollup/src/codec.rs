@@ -690,6 +690,27 @@ mod tests {
         assert_eq!(Sidecar::decode(&bytes, &block.batch), Ok(block.sidecar));
     }
 
+    // Every signature in the rest of this file is a managed account's, which is to say empty, and
+    // every key in it is short. A hybrid Falcon signature is neither: both its key and its
+    // signature run past 127 bytes, so their lengths take more than one varint byte each. That is
+    // the only part of the encoding a scheme can reach, and this is what exercises it.
+    #[test]
+    fn a_sidecar_round_trips_a_signature_too_long_to_length_in_one_byte() {
+        let mut block = block();
+        let entry = payment_entry(&mut block.sidecar, 0);
+
+        entry.sig = Signature {
+            scheme: Scheme::Falcon1024HybridEd25519,
+            pub_key: vec![0xab; crate::HYBRID_PUBLIC_KEY_SIZE],
+            sig: vec![0xcd; crate::MAX_HYBRID_SIGNATURE_SIZE],
+        };
+
+        let bytes = block.sidecar.encode();
+
+        assert!(bytes.len() > crate::HYBRID_PUBLIC_KEY_SIZE + crate::MAX_HYBRID_SIGNATURE_SIZE);
+        assert_eq!(Sidecar::decode(&bytes, &block.batch), Ok(block.sidecar));
+    }
+
     #[test]
     fn an_empty_block_round_trips() {
         let batch = Batch::default();

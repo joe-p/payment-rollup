@@ -88,9 +88,15 @@ const ESCAPE_PROGRESS_TRANCHE = 256;
  *
  * Mirrors `Scheme::identifier` in the core crate. `"man"` is deliberately absent: a managed account
  * is one the sequencer signs for, so there is no key behind its `auth_address` and nothing a holder
- * could present here. `"f1h"` is absent because the hybrid Falcon encoding is not yet defined on the
- * Rust side -- the AVM has `falcon_verify`, so this becomes a small addition once it is, rather
- * than something to guess at now.
+ * could present here.
+ *
+ * `"f1h"` is absent because nothing on this side checks it yet, not because it is undefined: the
+ * Rust side now fixes the hybrid layout -- a 32-byte Ed25519 key then a 1793-byte Falcon one, and a
+ * 64-byte Ed25519 signature then a variable-length Falcon one -- with both halves fixed-width at
+ * the front precisely so `extract` can split them at constant offsets. Adding it here is
+ * `ed25519verifyBare` over the first halves and `falconVerify` over the second, and the reason it
+ * has not been added is cost: a hybrid holder's forced exit would pay for a lattice verification in
+ * one application call, which is worth measuring before it is promised.
  */
 const SCHEME_ED25519 = "edd";
 

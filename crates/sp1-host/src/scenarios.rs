@@ -2,10 +2,18 @@
 //! ledger.
 //!
 //! Between them they cover what a settlement exercises: a batch that fits in one chunk, a batch
-//! that does not, a batch of nothing but deposits, and the transition being nothing at all. Every
-//! account here is authorized by [`Scheme::Managed`], because signature verification is still a
-//! `TODO` in the replay -- a scenario carries an empty signature and the replay checks only that
-//! its address matches the account's `auth_address`.
+//! that does not, a batch of nothing but deposits, and the transition being nothing at all.
+//!
+//! Every account that spends here is authorized by [`Scheme::Managed`], which is the one scheme
+//! with no key behind it: the replay checks that the presented key hashes to the account's
+//! `auth_address` and has nothing else to check. That is deliberate rather than left over. These
+//! blocks exist to drive the settlement contract, and the contract never sees a signature -- the
+//! sidecar they live in stays with the prover -- so real keys would cost these fixtures a nonce
+//! ledger of their own and buy the contract nothing. What signature verification does is tested
+//! where it lives, in `payment-rollup`'s own suite.
+//!
+//! The forced-exit fixtures are the exception, and for the opposite reason: their accounts are
+//! [`Scheme::Ed25519`] because L1 *does* check a signature on that path. See `EXIT_KEYS`.
 //!
 //! Every scenario starts from the empty ledger. Value gets in the way it does in production, with a
 //! deposit at the head of the block, so there is nothing here a contract has to be put into
@@ -244,9 +252,9 @@ fn round_trip(domain: DeploymentDomain) -> Block {
 /// Real keys, derived from the fixed seeds `"payment-rollup exit key one!!!!!"` and
 /// `"payment-rollup exit key two!!!!!"`. They have to be real because the contract runs
 /// `ed25519verify_bare` against a signature the end-to-end test produces from the matching secret,
-/// which no made-up 32 bytes could satisfy. They are written out rather than derived because this
-/// crate has no Ed25519 implementation -- the replay still checks only that a key hashes to an
-/// account's `auth_address`, so it has never needed one.
+/// which no made-up 32 bytes could satisfy. They are written out rather than derived because
+/// nothing on this side ever signs with them: the accounts they stand for are funded by deposits,
+/// which carry no signature, so all the rollup needs is the public key its address comes from.
 ///
 /// The seeds are the contract between the two sides. The end-to-end test re-derives these public
 /// keys from them and asserts they match what the fixture carries, so the two cannot drift apart in

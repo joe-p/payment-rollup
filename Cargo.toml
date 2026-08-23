@@ -13,3 +13,10 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 sha2 = "0.10.8"
 serde_json = "1.0"
+# 2.x, not 3.x, and the reason is the same one that pins sha2: SP1 accelerates Ed25519 through its
+# patched `curve25519-dalek` 4.x, which is what this depends on. ed25519-dalek 3.x moved to
+# curve25519-dalek 5.x and sha2 0.11, so it would lose the curve precompile and pull a second,
+# unpatched SHA-256 into the guest alongside the one this workspace already accelerates. See the
+# note beside it in `crates/payment-rollup/Cargo.toml` for the patch stanza itself.
+ed25519-dalek = "2.2"
+cc = "1.2"
