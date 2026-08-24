@@ -1,3 +1,5 @@
-| Scenario | Commit | Proof Time | Request Link |
-| --- | --- | --- | --- |
-| 10k FALCON+Ed25519 | [70e96b8](https://github.com/joe-p/payment-rollup/commit/70e96b8450d1b8617ef5453c40a4dc523d9f7fb2) | 6m 46s | [0xf32f72e71719b6d548b3825a472725978888540598ee9bf47eedcee659f08815](https://explorer.succinct.xyz/request/0xf32f72e71719b6d548b3825a472725978888540598ee9bf47eedcee659f08815) |
+| Scenario | Commit | Gas | Proof Time | Request Link |
+| --- | --- | --- | --- | --- |
+| 100 FALCON+Ed25519 | [f061738](https://github.com/joe-p/payment-rollup/commit/f0617389cc7e7ed55dc3769efd64bc53cdf7d382) | 108,334,578 PGUs | 36s | [0x3647587f7a18f38e5058a8c7249f8ee9a3712ae8b8cd1f7019582d994d06898a](https://explorer.succinct.xyz/request/0x3647587f7a18f38e5058a8c7249f8ee9a3712ae8b8cd1f7019582d994d06898a) |
+| 1,000 FALCON+Ed25519 | [f061738](https://github.com/joe-p/payment-rollup/commit/f0617389cc7e7ed55dc3769efd64bc53cdf7d382) | 1,083,957,598 PGUs | 1m 41s | [0xf0e58c2cf07a18b6213ef85945760df3507e7994cc062315501fa0c03b896842](https://explorer.succinct.xyz/request/0xf0e58c2cf07a18b6213ef85945760df3507e7994cc062315501fa0c03b896842) |
+| 10,000 FALCON+Ed25519 | [f061738](https://github.com/joe-p/payment-rollup/commit/f0617389cc7e7ed55dc3769efd64bc53cdf7d382) | 11,056,978,187 PGUs| 8m 50s | [0xeb765d152c05b02962a933823f2e5e2c2a35894c99223719410a1992a67ec711](https://explorer.succinct.xyz/request/0xeb765d152c05b02962a933823f2e5e2c2a35894c99223719410a1992a67ec711) |
