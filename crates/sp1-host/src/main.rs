@@ -27,7 +27,9 @@ Emit settlement fixtures for the rollup verifier contract.
 Usage:
   sp1-host [options] [SCENARIO...]
 
-With no SCENARIO, every scenario is emitted.
+With no SCENARIO, every scenario in --list is emitted. A few scenarios are too expensive to run
+by accident and so do not appear in --list or an unnamed run -- name one directly to reach it
+(see scenarios::heavy in sp1-host's source for what those are and why).
 
 Options:
   --out <PATH>       write the JSON here instead of to stdout
