@@ -141,10 +141,13 @@ pub fn all() -> &'static [Scenario] {
 /// selection itself rather than to the network call. [`find`] still reaches them, so naming one
 /// explicitly is all it takes.
 ///
-/// All three are the same block at three sizes, which is what makes them worth having as three
-/// scenarios rather than one: proving each says how the guest scales in the number of lattice
-/// verifications, and a decade of range is enough to tell a per-signature cost apart from a fixed
-/// one. Only [`falcon_hybrid_load`]'s payment count differs between them.
+/// Two series of three, one per signing scheme that has anything to verify -- `Managed` has
+/// nothing here for the same reason it has no key in [`Key`]. Within a series all three are the
+/// same block at three sizes, which is what makes them worth having as three scenarios rather than
+/// one: proving each says how the guest scales in the number of signature verifications, and a
+/// decade of range is enough to tell a per-signature cost apart from a fixed one. Only
+/// [`signed_load`]'s payment count differs between the sizes in a series; only the scheme its keys
+/// sign with differs between the two series.
 fn heavy() -> &'static [Scenario] {
     &[
         Scenario {
@@ -176,6 +179,37 @@ fn heavy() -> &'static [Scenario] {
                           which is minutes rather than milliseconds, so unlike every scenario in \
                           `all` it is reachable only by name.",
             build: falcon_10000,
+        },
+        Scenario {
+            name: "ed25519-100",
+            description: "One hundred plain-Ed25519 payments, almost all of them between accounts \
+                          that already exist. The cheap end of the curve's load series -- the same \
+                          block as ed25519-10000 at a hundredth the signature count, and the same \
+                          shape as falcon-100 with the hybrid's lattice half removed, so the two \
+                          series together separate what a curve verification costs from what a \
+                          lattice one adds on top. Reachable only by name, like the rest of the \
+                          series.",
+            build: ed25519_100,
+        },
+        Scenario {
+            name: "ed25519-1000",
+            description: "One thousand plain-Ed25519 payments, almost all of them between accounts \
+                          that already exist. The middle of the curve's load series, and the point \
+                          that says whether the cost between ed25519-100 and ed25519-10000 is \
+                          linear in the signature count. Reachable only by name.",
+            build: ed25519_1000,
+        },
+        Scenario {
+            name: "ed25519-10000",
+            description: "Ten thousand plain-Ed25519 payments, almost all of them between accounts \
+                          that already exist: a small pool is funded once and then spends from and \
+                          to itself in a round-robin, so the batch is dominated by warm accounts and \
+                          repeat signers rather than one-off receivers. What a lone curve \
+                          verification costs at a scale nothing else here reaches, with no lattice \
+                          half riding along the way it does in falcon-10000 -- replaying it signs \
+                          and verifies ten thousand Ed25519 signatures, so unlike every scenario in \
+                          `all` it is reachable only by name.",
+            build: ed25519_10000,
         },
     ]
 }
@@ -641,86 +675,121 @@ fn every_scheme(domain: DeploymentDomain) -> Block {
     ledger.get_block(stxns)
 }
 
-/// How many hybrid accounts [`falcon_hybrid_load`] keeps warm.
+/// How many accounts each load series keeps warm.
 ///
 /// Small enough that every account spends many times over the course of even the smallest of the
 /// three sizes, which is the whole point: `payments` payments among this many accounts means each
-/// one signs `payments / FALCON_LOAD_ACCOUNTS` times, so the batch exercises a hybrid signature
-/// over a warm, high-nonce account far more often than it exercises one over a fresh one. Held
-/// fixed across the three sizes so that what differs between them is only the number of
-/// signatures.
-const FALCON_LOAD_ACCOUNTS: usize = 25;
+/// one signs `payments / LOAD_ACCOUNTS` times, so the batch exercises a signature over a warm,
+/// high-nonce account far more often than it exercises one over a fresh one. Held fixed across the
+/// three sizes, and across both series, so that what differs between the scenarios in [`heavy`] is
+/// only the number of signatures and which scheme signs them.
+const LOAD_ACCOUNTS: usize = 25;
 
-/// The payment counts the three load scenarios carry -- and so how many Falcon verifications a
-/// replay of each pays for.
+/// The payment counts the load scenarios carry -- and so how many signature verifications a replay
+/// of each pays for. Shared by both series in [`heavy`], so `falcon-100` and `ed25519-100` differ
+/// in nothing but the scheme.
 ///
-/// A decade apart, which is what makes the series say something a single size could not: three
+/// A decade apart, which is what makes each series say something a single size could not: three
 /// proofs an order of magnitude apart in signature count separate the per-signature cost from the
 /// fixed cost of a batch.
-const FALCON_LOAD_PAYMENTS: [u32; 3] = [100, 1_000, 10_000];
+const LOAD_PAYMENTS: [u32; 3] = [100, 1_000, 10_000];
 
 /// What each load account is deposited, chosen so that the most any one account could ever pay
-/// out -- `payments / FALCON_LOAD_ACCOUNTS * FALCON_LOAD_AMOUNT`, at the largest of
-/// [`FALCON_LOAD_PAYMENTS`] -- is comfortably below it regardless of the order transfers land in,
-/// the same reasoning [`round_trip`] relies on for one payment instead of hundreds.
-/// [`falcon_hybrid_load`] asserts as much rather than leaving it to this comment.
-const FALCON_LOAD_DEPOSIT: u64 = 1_000_000;
-const FALCON_LOAD_AMOUNT: u64 = 1_000;
+/// out -- `payments / LOAD_ACCOUNTS * LOAD_AMOUNT`, at the largest of [`LOAD_PAYMENTS`] -- is
+/// comfortably below it regardless of the order transfers land in, the same reasoning
+/// [`round_trip`] relies on for one payment instead of hundreds. [`signed_load`] asserts as much
+/// rather than leaving it to this comment.
+const LOAD_DEPOSIT: u64 = 1_000_000;
+const LOAD_AMOUNT: u64 = 1_000;
 
 /// One payment in this many is redirected to a brand-new address instead of another load account.
 ///
-/// The scenarios are for the cost of a hybrid signature at scale, not for account creation, so new
+/// The scenarios are for the cost of a signature at scale, not for account creation, so new
 /// accounts are the exception here rather than the rule `multi_chunk` follows -- but a handful
 /// keep them from claiming to be "mostly existing accounts" while secretly being "entirely
 /// existing accounts", which is a different fixture. Small enough that the shortest of the three
 /// sizes still redirects some: at 500, `falcon-100` would redirect none at all.
-const FALCON_LOAD_NEW_ACCOUNT_STRIDE: u32 = 50;
+const LOAD_NEW_ACCOUNT_STRIDE: u32 = 50;
 
-/// The seed for load account `index`, distinct only in its last byte.
+/// The seed for load account `index`, distinct from every other account only in its last byte, and
+/// from the other series' seed at the same index in the rest of `base`.
 ///
-/// One byte is all [`FALCON_LOAD_ACCOUNTS`] needs, and unlike [`EXIT_KEYS`] or the seeds in
+/// One byte per account is all [`LOAD_ACCOUNTS`] needs, and unlike [`EXIT_KEYS`] or the seeds in
 /// [`every_scheme_keys`] nothing outside this file ever has to reproduce one of these keys on its
 /// own, so there is no reason to write two dozen of them out by hand.
-fn falcon_load_seed(index: usize) -> [u8; SEED_SIZE] {
-    let mut seed = *b"payment-rollup falcon load key!!";
-    seed[SEED_SIZE - 1] = u8::try_from(index).expect("FALCON_LOAD_ACCOUNTS fits in a byte");
+fn load_seed(base: &[u8; SEED_SIZE], index: usize) -> [u8; SEED_SIZE] {
+    let mut seed = *base;
+    seed[SEED_SIZE - 1] = u8::try_from(index).expect("LOAD_ACCOUNTS fits in a byte");
 
     seed
 }
 
-fn falcon_load_keys() -> Vec<Key> {
-    (0..FALCON_LOAD_ACCOUNTS)
-        .map(|index| Key::hybrid(&falcon_load_seed(index)))
+/// The base seed each load account's key for a series is grown from, before [`load_seed`] pins
+/// down which account.
+const FALCON_LOAD_SEED: &[u8; SEED_SIZE] = b"payment-rollup falcon load key!!";
+const ED25519_LOAD_SEED: &[u8; SEED_SIZE] = b"payment-rollup ed25519 load key!";
+
+fn load_keys(base: &[u8; SEED_SIZE], make: fn(&[u8; SEED_SIZE]) -> Key) -> Vec<Key> {
+    (0..LOAD_ACCOUNTS)
+        .map(|index| make(&load_seed(base, index)))
         .collect()
 }
 
+fn falcon_load_keys() -> Vec<Key> {
+    load_keys(FALCON_LOAD_SEED, Key::hybrid)
+}
+
+fn ed25519_load_keys() -> Vec<Key> {
+    load_keys(ED25519_LOAD_SEED, Key::ed25519)
+}
+
 fn falcon_100(domain: DeploymentDomain) -> Block {
-    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[0])
+    falcon_hybrid_load(domain, LOAD_PAYMENTS[0])
 }
 
 fn falcon_1000(domain: DeploymentDomain) -> Block {
-    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[1])
+    falcon_hybrid_load(domain, LOAD_PAYMENTS[1])
 }
 
 fn falcon_10000(domain: DeploymentDomain) -> Block {
-    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[2])
+    falcon_hybrid_load(domain, LOAD_PAYMENTS[2])
 }
 
-/// `payments` Falcon-hybrid payments, almost all of them between accounts that already exist.
+fn falcon_hybrid_load(domain: DeploymentDomain, payments: u32) -> Block {
+    signed_load(domain, &falcon_load_keys(), payments)
+}
+
+fn ed25519_100(domain: DeploymentDomain) -> Block {
+    ed25519_load(domain, LOAD_PAYMENTS[0])
+}
+
+fn ed25519_1000(domain: DeploymentDomain) -> Block {
+    ed25519_load(domain, LOAD_PAYMENTS[1])
+}
+
+fn ed25519_10000(domain: DeploymentDomain) -> Block {
+    ed25519_load(domain, LOAD_PAYMENTS[2])
+}
+
+fn ed25519_load(domain: DeploymentDomain, payments: u32) -> Block {
+    signed_load(domain, &ed25519_load_keys(), payments)
+}
+
+/// `payments` payments signed by `keys`, almost all of them between accounts that already exist.
 ///
 /// The load accounts are funded once at the head of the block, then pay each other in a
 /// round-robin -- account `n` to account `n + 1` -- for `payments` payments, so every payment but
 /// the rare redirected one both spends from and credits an account the scenario already created.
-/// The three sizes in [`FALCON_LOAD_PAYMENTS`] differ in nothing else, which is what lets their
-/// proofs be compared. See [`heavy`] for why none of them is in [`all`].
-fn falcon_hybrid_load(domain: DeploymentDomain, payments: u32) -> Block {
-    let keys = falcon_load_keys();
-
-    // What [`FALCON_LOAD_DEPOSIT`] is chosen against, asserted here so a fourth size cannot be
-    // added that outspends it and fails deep inside the ledger instead.
+/// The three sizes in [`LOAD_PAYMENTS`] differ in nothing else, which is what lets their proofs be
+/// compared -- and whichever series `keys` came from, [`falcon_load_keys`] or
+/// [`ed25519_load_keys`], is the only thing that differs between the two series. See [`heavy`] for
+/// why none of the six is in [`all`].
+fn signed_load(domain: DeploymentDomain, keys: &[Key], payments: u32) -> Block {
+    // What `LOAD_DEPOSIT` is chosen against, asserted here so a fourth size cannot be added that
+    // outspends it and fails deep inside the ledger instead.
     assert!(
-        u64::from(payments).div_ceil(keys.len() as u64) * FALCON_LOAD_AMOUNT <= FALCON_LOAD_DEPOSIT,
-        "{payments} payments could overdraw a load account's deposit of {FALCON_LOAD_DEPOSIT}",
+        u64::from(payments).div_ceil(keys.len() as u64) * LOAD_AMOUNT <= LOAD_DEPOSIT,
+        "{payments} payments could overdraw a load account's deposit of {LOAD_DEPOSIT}",
     );
 
     let mut ledger = Ledger::with_domain(domain);
@@ -728,20 +797,20 @@ fn falcon_hybrid_load(domain: DeploymentDomain, payments: u32) -> Block {
 
     let mut stxns: Vec<_> = keys
         .iter()
-        .map(|key| SignedTransaction::deposit(Deposit::new(key.address(), FALCON_LOAD_DEPOSIT)))
+        .map(|key| SignedTransaction::deposit(Deposit::new(key.address(), LOAD_DEPOSIT)))
         .collect();
 
     for index in 0..payments {
         let sender_index = index as usize % keys.len();
         let key = &keys[sender_index];
 
-        let receiver = if (index + 1) % FALCON_LOAD_NEW_ACCOUNT_STRIDE == 0 {
+        let receiver = if (index + 1) % LOAD_NEW_ACCOUNT_STRIDE == 0 {
             address_of(&index.to_be_bytes())
         } else {
             keys[(sender_index + 1) % keys.len()].address()
         };
 
-        let payment = Payment::new(key.address(), receiver, FALCON_LOAD_AMOUNT);
+        let payment = Payment::new(key.address(), receiver, LOAD_AMOUNT);
         nonces[sender_index] += 1;
 
         stxns.push(SignedTransaction::payment(
@@ -1069,10 +1138,10 @@ mod tests {
 
     // The guard `heavy` exists for: reachable by name, but not something an unnamed run or a loop
     // over `all` stumbles into. Asserted for every heavy scenario rather than one of them, so a
-    // size added to the series cannot quietly land in an unnamed run.
+    // size added to either series cannot quietly land in an unnamed run.
     #[test]
     fn every_heavy_scenario_is_reachable_by_name_but_absent_from_all() {
-        assert_eq!(heavy().len(), FALCON_LOAD_PAYMENTS.len());
+        assert_eq!(heavy().len(), LOAD_PAYMENTS.len() * 2);
 
         for scenario in heavy() {
             assert!(all().iter().all(|other| other.name != scenario.name));
@@ -1080,38 +1149,44 @@ mod tests {
         }
     }
 
-    // The three sizes are one block at three scales, so the series only says what it claims if
-    // nothing but the payment count moves between them.
+    // The three sizes in each series are one block at three scales, so a series only says what it
+    // claims if nothing but the payment count moves within it. `heavy` lists Falcon before
+    // Ed25519, so the first `LOAD_PAYMENTS.len()` entries are one series and the rest the other.
     #[test]
-    fn the_load_series_is_named_for_the_payments_it_carries() {
-        for (scenario, payments) in heavy().iter().zip(FALCON_LOAD_PAYMENTS) {
+    fn the_load_series_are_named_for_the_payments_they_carry() {
+        let (falcon, ed25519) = heavy().split_at(LOAD_PAYMENTS.len());
+
+        for (scenario, payments) in falcon.iter().zip(LOAD_PAYMENTS) {
             assert_eq!(scenario.name, format!("falcon-{payments}"));
+        }
+        for (scenario, payments) in ed25519.iter().zip(LOAD_PAYMENTS) {
+            assert_eq!(scenario.name, format!("ed25519-{payments}"));
         }
     }
 
-    /// What every size of the load scenario has to hold: the hybrid signatures verify, the spends
-    /// stay inside the load accounts, and only the rare redirected payment credits anything else.
-    fn falcon_load_holds_its_shape(payments: u32) {
-        let block = falcon_hybrid_load(DOMAIN, payments);
-        assert_eq!(verify_block(&block), Ok(()));
+    /// What every size of a load scenario has to hold, whichever scheme signed it: the signatures
+    /// verify, the spends stay inside the load accounts, and only the rare redirected payment
+    /// credits anything else.
+    fn load_holds_its_shape(block: &Block, keys: &[Key], payments: u32) {
+        assert_eq!(verify_block(block), Ok(()));
 
-        let addresses: Vec<_> = falcon_load_keys().iter().map(Key::address).collect();
+        let addresses: Vec<_> = keys.iter().map(Key::address).collect();
         let txns = block.batch().txns();
 
         let senders: Vec<_> = txns.iter().map(|txn| txn.sender()).collect();
-        assert_eq!(senders.len(), FALCON_LOAD_ACCOUNTS + payments as usize);
-        for sender in &senders[FALCON_LOAD_ACCOUNTS..] {
+        assert_eq!(senders.len(), LOAD_ACCOUNTS + payments as usize);
+        for sender in &senders[LOAD_ACCOUNTS..] {
             assert!(
                 addresses.contains(sender),
                 "a payment was signed by something other than a load account"
             );
         }
 
-        // Almost all of it: only the redirected payments -- one in
-        // `FALCON_LOAD_NEW_ACCOUNT_STRIDE` -- ever credit an address outside the load accounts.
+        // Almost all of it: only the redirected payments -- one in `LOAD_NEW_ACCOUNT_STRIDE` --
+        // ever credit an address outside the load accounts.
         let receivers: Vec<_> = txns
             .iter()
-            .skip(FALCON_LOAD_ACCOUNTS)
+            .skip(LOAD_ACCOUNTS)
             .filter_map(|txn| txn.receiver())
             .collect();
         let existing = receivers.iter().filter(|r| addresses.contains(r)).count();
@@ -1120,7 +1195,7 @@ mod tests {
         assert_eq!(receivers.len(), payments as usize);
         assert_eq!(
             redirected,
-            payments as usize / FALCON_LOAD_NEW_ACCOUNT_STRIDE as usize,
+            payments as usize / LOAD_NEW_ACCOUNT_STRIDE as usize,
             "the stride, not chance, is what decides how many receivers are new"
         );
         assert!(
@@ -1133,12 +1208,22 @@ mod tests {
         );
     }
 
+    fn falcon_load_holds_its_shape(payments: u32) {
+        let keys = falcon_load_keys();
+        load_holds_its_shape(&falcon_hybrid_load(DOMAIN, payments), &keys, payments);
+    }
+
+    fn ed25519_load_holds_its_shape(payments: u32) {
+        let keys = ed25519_load_keys();
+        load_holds_its_shape(&ed25519_load(DOMAIN, payments), &keys, payments);
+    }
+
     // The smallest of the three is cheap enough to check on every run, and it is the same code
     // path the other two take -- so what the ignored tests below buy is confidence at scale rather
     // than coverage of anything this one misses.
     #[test]
     fn the_falcon_100_scenario_verifies_and_stays_mostly_existing() {
-        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[0]);
+        falcon_load_holds_its_shape(LOAD_PAYMENTS[0]);
     }
 
     #[test]
@@ -1147,7 +1232,7 @@ mod tests {
     #[ignore = "signs and verifies 1,000 Falcon-hybrid signatures; run explicitly with \
                 `cargo test -p sp1-host falcon_1000_scenario -- --ignored`"]
     fn the_falcon_1000_scenario_verifies_and_stays_mostly_existing() {
-        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[1]);
+        falcon_load_holds_its_shape(LOAD_PAYMENTS[1]);
     }
 
     // The one thing worth the minutes this costs to check: ten thousand hybrid signatures verify,
@@ -1156,6 +1241,25 @@ mod tests {
     #[ignore = "signs and verifies 10,000 Falcon-hybrid signatures -- minutes, not milliseconds; \
                 run explicitly with `cargo test -p sp1-host falcon_10000_scenario -- --ignored`"]
     fn the_falcon_10000_scenario_verifies_and_stays_mostly_existing() {
-        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[2]);
+        falcon_load_holds_its_shape(LOAD_PAYMENTS[2]);
+    }
+
+    // Ed25519 signatures are far cheaper than the hybrid's, so even this series' largest size runs
+    // in milliseconds rather than the minutes `falcon-10000` costs -- but it still isn't in `all`,
+    // because the point of `heavy` is scenarios reachable only by name, not only slow ones.
+    #[test]
+    fn the_ed25519_100_scenario_verifies_and_stays_mostly_existing() {
+        ed25519_load_holds_its_shape(LOAD_PAYMENTS[0]);
+    }
+
+    #[test]
+    // As with `falcon_1000`, spelled out so the filter doesn't also pull in `ed25519_10000`.
+    fn the_ed25519_1000_scenario_verifies_and_stays_mostly_existing() {
+        ed25519_load_holds_its_shape(LOAD_PAYMENTS[1]);
+    }
+
+    #[test]
+    fn the_ed25519_10000_scenario_verifies_and_stays_mostly_existing() {
+        ed25519_load_holds_its_shape(LOAD_PAYMENTS[2]);
     }
 }
