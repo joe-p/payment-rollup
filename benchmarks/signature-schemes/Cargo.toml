@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["guest", "host"]
+# So `cargo run --release` means the host. Without it, `cargo run` sees two binaries -- the guest is
+# one too -- and refuses to choose. The guest is never run natively; the host's build script
+# cross-compiles it and `include_elf!` picks it up.
+default-members = ["host"]
+
+# A workspace of its own, deliberately outside the one at the repository root.
+#
+# It depends on two post-quantum crates the protocol does not use and never will -- `ml-dsa` and
+# `slh-dsa` -- and on a locally patched `keccak`. None of that belongs in the lockfile the guest is
+# built from, and a `[patch]` section here would otherwise apply to the guest too. Keeping it
+# separate means running this benchmark cannot change what `sp1-guest` compiles to.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# What makes the comparison fair: every scheme's hashing has to reach the precompile it would reach
+# in a real guest, or the measurement is of software hashing rather than of the scheme.
+[patch.crates-io]
+# `slh-dsa` reaches SHAKE through `sha3`, which sp1-patches publishes for.
+sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.11.0-sp1-6.0.0" }
+# `ml-dsa` reaches SHAKE through `shake` -> `keccak`, which sp1-patches does *not* publish for, so
+# the `sha3` patch never sees it. Without the vendored patch below, ML-DSA's ExpandA runs in
+# software and the comparison is unfair to it -- see `vendor/keccak-sp1` for the one-branch diff.
+keccak = { path = "vendor/keccak-sp1" }
+# Ed25519 is accelerated through curve25519-dalek, exactly as in the root workspace.
+curve25519-dalek = { git = "https://github.com/sp1-patches/curve25519-dalek", tag = "patch-4.1.3-sp1-6.2.0" }

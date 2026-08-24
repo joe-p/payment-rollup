@@ -21,6 +21,10 @@ pub mod scenarios;
 #[cfg(feature = "prove")]
 pub mod prove;
 
+/// What a block costs in the zkVM: the same guest, executed locally and counted rather than proved.
+#[cfg(feature = "prove")]
+pub mod report;
+
 /// Re-exported so the binary, and anything else driving the contract, reads the chunk size and the
 /// public-values size from one place rather than from two crates.
 pub use payment_rollup::{CHUNK_SIZE, PUBLIC_VALUES_SIZE};

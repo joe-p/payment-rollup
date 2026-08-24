@@ -1,4 +1,5 @@
 /target
+benchmarks/signature-schemes/target/
 node_modules/
 contracts/contracts/out/
 contracts/contracts/clients/

@@ -41,6 +41,10 @@ Options:
                      `--features prove` (see this crate's Cargo.toml for what that needs
                      installed) and NETWORK_PRIVATE_KEY in the environment. Scenarios must be
                      named: each one is a paid request.
+  --report           execute each scenario's block in the zkVM locally and report what it cost:
+                     instructions, gas, and the per-precompile syscall counts. Free, needs no
+                     network, and needs the same `--features prove` build as --prove, which is
+                     what puts a guest ELF in the binary.
   --network <NAME>   which network --prove talks to: mainnet (default) or reserved
   --list             list the scenarios and exit
   -h, --help         show this message
@@ -64,6 +68,7 @@ struct Args {
     genesis_hash: [u8; 32],
     app_id: u64,
     prove: bool,
+    report: bool,
     network: String,
 }
 
@@ -76,6 +81,7 @@ impl Default for Args {
             genesis_hash: [0u8; 32],
             app_id: 0,
             prove: false,
+            report: false,
             network: "mainnet".to_string(),
         }
     }
@@ -113,6 +119,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--include-sidecar" => args.include_sidecar = true,
             "--prove" => args.prove = true,
+            "--report" => args.report = true,
             "--network" => {
                 let name = remaining
                     .next()
@@ -157,7 +164,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 #[cfg(feature = "prove")]
-use sp1_host::prove::Groth16Prover;
+use sp1_host::{prove::Groth16Prover, report::Reporter};
 
 /// The stand-in a build without the `prove` feature gets.
 ///
@@ -183,6 +190,32 @@ impl Groth16Prover {
     }
 
     fn prove(&self, _settlement: &Settlement) -> Result<ProofFixture, String> {
+        match *self {}
+    }
+}
+
+/// The same stand-in, for the same reason, for the local executor behind `--report`.
+#[cfg(not(feature = "prove"))]
+enum Reporter {}
+
+#[cfg(not(feature = "prove"))]
+impl Reporter {
+    fn new() -> Result<Self, String> {
+        Err(
+            "this binary was built without the `prove` feature, so there is no guest ELF to \
+             execute -- rebuild with `cargo run -p sp1-host --features prove -- ...`, which needs \
+             the SP1 toolchain installed (`curl -L https://sp1up.succinct.xyz | bash && sp1up`)"
+                .to_string(),
+        )
+    }
+
+    /// Returns `Self` rather than a `Report`, which does not exist in a build without the feature.
+    /// Uninhabited either way, so the one call site reads the same in both builds.
+    fn report(&self, _settlement: &Settlement) -> Result<Self, String> {
+        match *self {}
+    }
+
+    fn print(&self) {
         match *self {}
     }
 }
@@ -223,6 +256,13 @@ fn run() -> Result<(), String> {
         false => None,
     };
 
+    // Unlike the prover, this costs nothing to build and nothing to run, so it needs no guard
+    // against an unnamed run -- `--report` on its own measures every scenario in `--list`.
+    let reporter = match args.report {
+        true => Some(Reporter::new()?),
+        false => None,
+    };
+
     let mut emitted = Vec::with_capacity(selected.len());
     let domain = deployment_domain(&args.genesis_hash, args.app_id);
     for scenario in &selected {
@@ -250,6 +290,15 @@ fn run() -> Result<(), String> {
             settlement.batch_length(),
             settlement.chunk_count(),
         );
+
+        // Before proving, so a run that does both measures the block even if the network then
+        // refuses it.
+        if let Some(reporter) = &reporter {
+            reporter
+                .report(&settlement)
+                .map_err(|error| format!("scenario {}: {error}", scenario.name))?
+                .print();
+        }
 
         let proof = match &prover {
             Some(prover) => Some(

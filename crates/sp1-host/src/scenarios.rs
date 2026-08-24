@@ -140,19 +140,44 @@ pub fn all() -> &'static [Scenario] {
 /// never touch them -- the same reason `--prove` refuses an unnamed run, applied here to scenario
 /// selection itself rather than to the network call. [`find`] still reaches them, so naming one
 /// explicitly is all it takes.
+///
+/// All three are the same block at three sizes, which is what makes them worth having as three
+/// scenarios rather than one: proving each says how the guest scales in the number of lattice
+/// verifications, and a decade of range is enough to tell a per-signature cost apart from a fixed
+/// one. Only [`falcon_hybrid_load`]'s payment count differs between them.
 fn heavy() -> &'static [Scenario] {
-    &[Scenario {
-        name: "falcon-hybrid-load",
-        description: "Ten thousand Falcon-1024/Ed25519 hybrid payments, almost all of them \
-                      between accounts that already exist: a small pool is funded once and then \
-                      spends from and to itself in a round-robin, so the batch is dominated by \
-                      warm accounts and repeat signers rather than one-off receivers. What the \
-                      Falcon half of the hybrid scheme costs at a scale nothing else here \
-                      reaches -- replaying it signs and verifies ten thousand lattice signatures, \
-                      which is minutes rather than milliseconds, so unlike every scenario above it \
-                      is reachable only by name.",
-        build: falcon_hybrid_load,
-    }]
+    &[
+        Scenario {
+            name: "falcon-100",
+            description: "One hundred Falcon-1024/Ed25519 hybrid payments, almost all of them \
+                          between accounts that already exist. The cheap end of the load series: \
+                          the same block as falcon-10000 at a hundredth the signature count, so \
+                          the three together separate what a lattice verification costs from what \
+                          the rest of a batch costs. Reachable only by name, like the rest of the \
+                          series.",
+            build: falcon_100,
+        },
+        Scenario {
+            name: "falcon-1000",
+            description: "One thousand Falcon-1024/Ed25519 hybrid payments, almost all of them \
+                          between accounts that already exist. The middle of the load series, and \
+                          the point that says whether the cost between falcon-100 and \
+                          falcon-10000 is linear in the signature count. Reachable only by name.",
+            build: falcon_1000,
+        },
+        Scenario {
+            name: "falcon-10000",
+            description: "Ten thousand Falcon-1024/Ed25519 hybrid payments, almost all of them \
+                          between accounts that already exist: a small pool is funded once and then \
+                          spends from and to itself in a round-robin, so the batch is dominated by \
+                          warm accounts and repeat signers rather than one-off receivers. What the \
+                          Falcon half of the hybrid scheme costs at a scale nothing else here \
+                          reaches -- replaying it signs and verifies ten thousand lattice signatures, \
+                          which is minutes rather than milliseconds, so unlike every scenario in \
+                          `all` it is reachable only by name.",
+            build: falcon_10000,
+        },
+    ]
 }
 
 pub fn find(name: &str) -> Option<&'static Scenario> {
@@ -618,31 +643,38 @@ fn every_scheme(domain: DeploymentDomain) -> Block {
 
 /// How many hybrid accounts [`falcon_hybrid_load`] keeps warm.
 ///
-/// Small enough that every account spends many times over the course of the scenario, which is
-/// the whole point: [`FALCON_LOAD_PAYMENTS`] payments among this many accounts means each one
-/// signs `FALCON_LOAD_PAYMENTS / FALCON_LOAD_ACCOUNTS` times, so the batch exercises a hybrid
-/// signature over a warm, high-nonce account far more often than it exercises one over a fresh
-/// one.
+/// Small enough that every account spends many times over the course of even the smallest of the
+/// three sizes, which is the whole point: `payments` payments among this many accounts means each
+/// one signs `payments / FALCON_LOAD_ACCOUNTS` times, so the batch exercises a hybrid signature
+/// over a warm, high-nonce account far more often than it exercises one over a fresh one. Held
+/// fixed across the three sizes so that what differs between them is only the number of
+/// signatures.
 const FALCON_LOAD_ACCOUNTS: usize = 25;
 
-/// How many signed payments the scenario carries -- and so how many Falcon verifications a
-/// replay pays for.
-const FALCON_LOAD_PAYMENTS: u32 = 10_000;
+/// The payment counts the three load scenarios carry -- and so how many Falcon verifications a
+/// replay of each pays for.
+///
+/// A decade apart, which is what makes the series say something a single size could not: three
+/// proofs an order of magnitude apart in signature count separate the per-signature cost from the
+/// fixed cost of a batch.
+const FALCON_LOAD_PAYMENTS: [u32; 3] = [100, 1_000, 10_000];
 
 /// What each load account is deposited, chosen so that the most any one account could ever pay
-/// out -- `FALCON_LOAD_PAYMENTS / FALCON_LOAD_ACCOUNTS * FALCON_LOAD_AMOUNT` -- is comfortably
-/// below it regardless of the order transfers land in, the same reasoning [`round_trip`] relies
-/// on for one payment instead of hundreds.
+/// out -- `payments / FALCON_LOAD_ACCOUNTS * FALCON_LOAD_AMOUNT`, at the largest of
+/// [`FALCON_LOAD_PAYMENTS`] -- is comfortably below it regardless of the order transfers land in,
+/// the same reasoning [`round_trip`] relies on for one payment instead of hundreds.
+/// [`falcon_hybrid_load`] asserts as much rather than leaving it to this comment.
 const FALCON_LOAD_DEPOSIT: u64 = 1_000_000;
 const FALCON_LOAD_AMOUNT: u64 = 1_000;
 
 /// One payment in this many is redirected to a brand-new address instead of another load account.
 ///
-/// The scenario is for the cost of a hybrid signature at scale, not for account creation, so new
+/// The scenarios are for the cost of a hybrid signature at scale, not for account creation, so new
 /// accounts are the exception here rather than the rule `multi_chunk` follows -- but a handful
-/// keep the scenario from claiming to be "mostly existing accounts" while secretly being
-/// "entirely existing accounts", which is a different fixture.
-const FALCON_LOAD_NEW_ACCOUNT_STRIDE: u32 = 500;
+/// keep them from claiming to be "mostly existing accounts" while secretly being "entirely
+/// existing accounts", which is a different fixture. Small enough that the shortest of the three
+/// sizes still redirects some: at 500, `falcon-100` would redirect none at all.
+const FALCON_LOAD_NEW_ACCOUNT_STRIDE: u32 = 50;
 
 /// The seed for load account `index`, distinct only in its last byte.
 ///
@@ -662,14 +694,35 @@ fn falcon_load_keys() -> Vec<Key> {
         .collect()
 }
 
-/// Ten thousand Falcon-hybrid payments, almost all of them between accounts that already exist.
+fn falcon_100(domain: DeploymentDomain) -> Block {
+    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[0])
+}
+
+fn falcon_1000(domain: DeploymentDomain) -> Block {
+    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[1])
+}
+
+fn falcon_10000(domain: DeploymentDomain) -> Block {
+    falcon_hybrid_load(domain, FALCON_LOAD_PAYMENTS[2])
+}
+
+/// `payments` Falcon-hybrid payments, almost all of them between accounts that already exist.
 ///
 /// The load accounts are funded once at the head of the block, then pay each other in a
-/// round-robin -- account `n` to account `n + 1` -- for [`FALCON_LOAD_PAYMENTS`] payments, so
-/// every payment but the rare redirected one both spends from and credits an account the scenario
-/// already created. See [`heavy`] for why this is not in [`all`].
-fn falcon_hybrid_load(domain: DeploymentDomain) -> Block {
+/// round-robin -- account `n` to account `n + 1` -- for `payments` payments, so every payment but
+/// the rare redirected one both spends from and credits an account the scenario already created.
+/// The three sizes in [`FALCON_LOAD_PAYMENTS`] differ in nothing else, which is what lets their
+/// proofs be compared. See [`heavy`] for why none of them is in [`all`].
+fn falcon_hybrid_load(domain: DeploymentDomain, payments: u32) -> Block {
     let keys = falcon_load_keys();
+
+    // What [`FALCON_LOAD_DEPOSIT`] is chosen against, asserted here so a fourth size cannot be
+    // added that outspends it and fails deep inside the ledger instead.
+    assert!(
+        u64::from(payments).div_ceil(keys.len() as u64) * FALCON_LOAD_AMOUNT <= FALCON_LOAD_DEPOSIT,
+        "{payments} payments could overdraw a load account's deposit of {FALCON_LOAD_DEPOSIT}",
+    );
+
     let mut ledger = Ledger::with_domain(domain);
     let mut nonces = vec![0u64; keys.len()];
 
@@ -678,7 +731,7 @@ fn falcon_hybrid_load(domain: DeploymentDomain) -> Block {
         .map(|key| SignedTransaction::deposit(Deposit::new(key.address(), FALCON_LOAD_DEPOSIT)))
         .collect();
 
-    for index in 0..FALCON_LOAD_PAYMENTS {
+    for index in 0..payments {
         let sender_index = index as usize % keys.len();
         let key = &keys[sender_index];
 
@@ -1015,35 +1068,38 @@ mod tests {
     }
 
     // The guard `heavy` exists for: reachable by name, but not something an unnamed run or a loop
-    // over `all` stumbles into.
+    // over `all` stumbles into. Asserted for every heavy scenario rather than one of them, so a
+    // size added to the series cannot quietly land in an unnamed run.
     #[test]
-    fn a_heavy_scenario_is_reachable_by_name_but_absent_from_all() {
-        assert!(
-            all()
-                .iter()
-                .all(|scenario| scenario.name != "falcon-hybrid-load")
-        );
-        assert!(find("falcon-hybrid-load").is_some());
+    fn every_heavy_scenario_is_reachable_by_name_but_absent_from_all() {
+        assert_eq!(heavy().len(), FALCON_LOAD_PAYMENTS.len());
+
+        for scenario in heavy() {
+            assert!(all().iter().all(|other| other.name != scenario.name));
+            assert!(find(scenario.name).is_some());
+        }
     }
 
-    // The one thing worth the minutes this costs to check: ten thousand hybrid signatures verify,
-    // and the scenario keeps the shape its name promises -- spends confined to the load accounts,
-    // and only the rare redirected payment reaching outside them.
+    // The three sizes are one block at three scales, so the series only says what it claims if
+    // nothing but the payment count moves between them.
     #[test]
-    #[ignore = "signs and verifies 10,000 Falcon-hybrid signatures -- minutes, not milliseconds; \
-                run explicitly with `cargo test -p sp1-host falcon_hybrid_load -- --ignored`"]
-    fn the_falcon_hybrid_load_scenario_verifies_and_stays_mostly_existing() {
-        let block = falcon_hybrid_load(DOMAIN);
+    fn the_load_series_is_named_for_the_payments_it_carries() {
+        for (scenario, payments) in heavy().iter().zip(FALCON_LOAD_PAYMENTS) {
+            assert_eq!(scenario.name, format!("falcon-{payments}"));
+        }
+    }
+
+    /// What every size of the load scenario has to hold: the hybrid signatures verify, the spends
+    /// stay inside the load accounts, and only the rare redirected payment credits anything else.
+    fn falcon_load_holds_its_shape(payments: u32) {
+        let block = falcon_hybrid_load(DOMAIN, payments);
         assert_eq!(verify_block(&block), Ok(()));
 
         let addresses: Vec<_> = falcon_load_keys().iter().map(Key::address).collect();
         let txns = block.batch().txns();
 
         let senders: Vec<_> = txns.iter().map(|txn| txn.sender()).collect();
-        assert_eq!(
-            senders.len(),
-            FALCON_LOAD_ACCOUNTS + FALCON_LOAD_PAYMENTS as usize
-        );
+        assert_eq!(senders.len(), FALCON_LOAD_ACCOUNTS + payments as usize);
         for sender in &senders[FALCON_LOAD_ACCOUNTS..] {
             assert!(
                 addresses.contains(sender),
@@ -1059,10 +1115,47 @@ mod tests {
             .filter_map(|txn| txn.receiver())
             .collect();
         let existing = receivers.iter().filter(|r| addresses.contains(r)).count();
-        assert_eq!(receivers.len(), FALCON_LOAD_PAYMENTS as usize);
-        assert!(
-            existing * 100 >= receivers.len() * 99,
-            "fewer than 99% of receivers were existing load accounts"
+        let redirected = receivers.len() - existing;
+
+        assert_eq!(receivers.len(), payments as usize);
+        assert_eq!(
+            redirected,
+            payments as usize / FALCON_LOAD_NEW_ACCOUNT_STRIDE as usize,
+            "the stride, not chance, is what decides how many receivers are new"
         );
+        assert!(
+            redirected > 0,
+            "no new accounts at all is a different fixture from mostly-existing ones"
+        );
+        assert!(
+            existing * 100 >= receivers.len() * 95,
+            "fewer than 95% of receivers were existing load accounts"
+        );
+    }
+
+    // The smallest of the three is cheap enough to check on every run, and it is the same code
+    // path the other two take -- so what the ignored tests below buy is confidence at scale rather
+    // than coverage of anything this one misses.
+    #[test]
+    fn the_falcon_100_scenario_verifies_and_stays_mostly_existing() {
+        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[0]);
+    }
+
+    #[test]
+    // The filter here spells out `_scenario` because `falcon_1000` alone is a prefix of
+    // `falcon_10000` too, and would pull the expensive one in with it.
+    #[ignore = "signs and verifies 1,000 Falcon-hybrid signatures; run explicitly with \
+                `cargo test -p sp1-host falcon_1000_scenario -- --ignored`"]
+    fn the_falcon_1000_scenario_verifies_and_stays_mostly_existing() {
+        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[1]);
+    }
+
+    // The one thing worth the minutes this costs to check: ten thousand hybrid signatures verify,
+    // and the scenario keeps the shape its name promises.
+    #[test]
+    #[ignore = "signs and verifies 10,000 Falcon-hybrid signatures -- minutes, not milliseconds; \
+                run explicitly with `cargo test -p sp1-host falcon_10000_scenario -- --ignored`"]
+    fn the_falcon_10000_scenario_verifies_and_stays_mostly_existing() {
+        falcon_load_holds_its_shape(FALCON_LOAD_PAYMENTS[2]);
     }
 }

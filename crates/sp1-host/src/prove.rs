@@ -24,6 +24,23 @@ pub const GUEST_ELF: Elf = include_elf!("sp1-guest");
 /// The credential the network authenticates with, read from the environment by the SDK.
 const PRIVATE_KEY_VAR: &str = "NETWORK_PRIVATE_KEY";
 
+/// Feed a settlement to the guest, in the order the guest reads it.
+///
+/// The five writes are the guest's five `sp1_zkvm::io::read_vec` calls, in that order -- the io is
+/// positional, so this function and `sp1-guest`'s `main` have to be read together. It lives here,
+/// shared by proving and by [`crate::report`], because two copies of a positional list are two
+/// things to keep in step with the guest instead of one.
+pub(crate) fn stdin_for(settlement: &Settlement) -> SP1Stdin {
+    let mut stdin = SP1Stdin::new();
+    stdin.write_slice(&settlement.domain());
+    stdin.write_slice(&settlement.old_root());
+    stdin.write_slice(&settlement.inbox_chain_from());
+    stdin.write_slice(settlement.batch_bytes());
+    stdin.write_slice(settlement.sidecar_bytes());
+
+    stdin
+}
+
 /// A network connection and a set-up proving key, held together so a run of several scenarios pays
 /// for the setup once.
 ///
@@ -78,16 +95,8 @@ impl Groth16Prover {
     }
 
     /// Prove one settlement, and check the proof agrees with the native replay before returning it.
-    ///
-    /// The five writes below are the guest's five `sp1_zkvm::io::read_vec` calls, in that order --
-    /// the io is positional, so this list and `sp1-guest`'s `main` have to be read together.
     pub fn prove(&self, settlement: &Settlement) -> Result<ProofFixture, String> {
-        let mut stdin = SP1Stdin::new();
-        stdin.write_slice(&settlement.domain());
-        stdin.write_slice(&settlement.old_root());
-        stdin.write_slice(&settlement.inbox_chain_from());
-        stdin.write_slice(settlement.batch_bytes());
-        stdin.write_slice(settlement.sidecar_bytes());
+        let stdin = stdin_for(settlement);
 
         let started = Instant::now();
         let proof = self

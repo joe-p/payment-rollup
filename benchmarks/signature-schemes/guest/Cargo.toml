@@ -1,0 +1,16 @@
+[package]
+name = "scheme-bench-guest"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The three post-quantum schemes and the one classical scheme being compared. `ml-dsa` and
+# `slh-dsa` are here and nowhere else in the repository: the protocol supports neither, and this
+# benchmark is the argument for why it does not need to.
+sp1-zkvm = "6.4.0"
+ml-dsa = "0.1.1"
+slh-dsa = "0.2.0-rc.5"
+falcon-det1024 = { path = "../../../crates/falcon-det1024" }
+signature = "3.0.0-rc.4"
+ed25519-dalek = { version = "2.2", default-features = false }
