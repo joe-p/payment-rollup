@@ -10,5 +10,9 @@
 NOTES:
 
 - There is a significant amount of variance on the prover network. For example, the same ed25519 scenario that took 37s above took 1m19s here: https://explorer.succinct.xyz/request/0x1f62bc9f74fbb00ff5fc1be94b00137fc21b6c6df5f14572cbe7ac7cde08f8f4
-- On a runpod H100 SXM (28 Intel(R) Xeon(R) Platinum 8480+ vCPUs with 251GB memory) the 100 ed25519 scenario took 253.424721643s to prove.
-  - This suggests a cluster of multiple 5090s or 4090s is probably the best bang/buck for self proving. This is what we commonly see for ETH proofs.
+- On a runpod L40S the 100 ed25519 scenario proved in 163.825639892s. As of the time of writing, L40S is $0.99/hr.
+  - This results in a proof cost of ~$0.05. Divide that by txns, and you get roughly $0.0005 / tx
+  - Similar compute on aws (g6e.4xlarge) is $3/hr, so on AWS it'd be roughly $0.0015 / tx
+  - This suggests a cluster of L40s, 5090s, or 4090s is probably the best bang/buck for self proving. This is what we commonly see for [ETH provers](https://ethproofs.org/provers).
+
+TODO: test 1,000 hybrid on L40S
