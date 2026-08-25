@@ -16,6 +16,7 @@ license.workspace = true
 # -- and neither is needed to emit fixtures, which is the common case. `contracts`' `build:fixtures`
 # runs this binary with no features at all.
 prove = ["dep:sp1-sdk", "dep:sp1-build", "dep:dotenvy"]
+default = ["prove"]
 
 [dependencies]
 payment-rollup = { path = "../payment-rollup" }
