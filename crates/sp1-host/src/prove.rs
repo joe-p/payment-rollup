@@ -12,7 +12,7 @@ use sp1_sdk::{
     Elf, HashableKey, ProvingKey, SP1ProvingKey, SP1Stdin,
     blocking::{NetworkProver, ProveRequest, Prover, ProverClient},
     include_elf,
-    network::NetworkMode,
+    network::{NetworkClient, NetworkMode},
 };
 use std::time::Instant;
 
@@ -71,7 +71,10 @@ impl Groth16Prover {
             ));
         }
 
-        let client = ProverClient::builder().network_for(mode).build();
+        let client = ProverClient::builder()
+            .network_for(NetworkMode::Reserved)
+            .rpc_url("http://127.0.0.1:50061")
+            .build();
 
         let started = Instant::now();
         let pk = client
