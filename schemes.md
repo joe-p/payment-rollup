@@ -10,7 +10,9 @@ close call.
 
 ## One verification, cold
 
-SP1 v6.4.0, `riscv64im-succinct-zkvm-elf`, 116-byte message (the length of `bytes_to_sign`). Every
+SP1 v6.4.0, `riscv64im-succinct-zkvm-elf`, using the then-current 116-byte `bytes_to_sign` message.
+The fee header has since increased that message to 124 bytes; these historical measurements have
+not been rerun. Every
 scheme's hashing reaches its precompile; instruction counts are exact.
 
 | Scheme | NIST level | Instructions | ≈ Gas | Signature | Public key |

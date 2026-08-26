@@ -68,6 +68,16 @@ pub const MIN_WITHDRAWAL: u64 = 100_000;
 /// namespace, this is an address. Do not unify the two constants.
 pub const ZERO_ADDRESS: Address = [0u8; 32];
 
+/// The protocol account that receives transaction fees.
+///
+/// This is `sha256("PAYMENT_ROLLUP_FEE_SINK")`, deliberately outside the address derivation
+/// namespace used by signing keys. Fees therefore accumulate in state without granting any
+/// transaction-signing authority over the sink account.
+pub const FEE_SINK: Address = [
+    0x3c, 0x59, 0x3f, 0x54, 0x58, 0xdd, 0x87, 0x8c, 0x42, 0x37, 0x9b, 0x05, 0xb2, 0xb3, 0x2f, 0xc2,
+    0x88, 0xb1, 0xff, 0x4a, 0x8e, 0x88, 0xf0, 0xa5, 0x09, 0x28, 0xe9, 0x9d, 0xb1, 0x8b, 0xed, 0x4d,
+];
+
 const SCHEME_SIZE: usize = 3;
 
 /// How an account proves a spend, and so what its key and signature bytes are.
@@ -142,7 +152,7 @@ pub fn address_from_public_key(scheme: Scheme, pub_key: &[u8]) -> Address {
 /// What a signed transaction is, written into the bytes its sender signs.
 ///
 /// Without these, a [`Payment`] and a [`Withdrawal`] over the same sender, nonce, 32-byte
-/// destination and amount produce byte-identical preimages -- so one signature would authorize
+/// destination, amount and fee produce byte-identical preimages -- so one signature would authorize
 /// either, and a signature meant to move funds inside the rollup would move them out of it. The tag
 /// is what makes the two unmistakable.
 const SIGN_TAG_PAYMENT: &[u8; 3] = b"PAY";
@@ -150,9 +160,10 @@ const SIGN_TAG_WITHDRAWAL: &[u8; 3] = b"WDR";
 
 const SIGN_TAG_SIZE: usize = 3;
 
-const ENCODED_TX_SIZE: usize = 32 + SIGN_TAG_SIZE + 32 + 8 + 32 + 8;
+const ENCODED_TX_SIZE: usize = 32 + SIGN_TAG_SIZE + 32 + 8 + 8 + 32 + 8;
 
-/// The bytes a sender signs to authorize moving `amount` to `destination` at `nonce`.
+/// The bytes a sender signs to authorize moving `amount` to `destination` and paying `fee` at
+/// `nonce`.
 ///
 /// Shared by [`Payment::bytes_to_sign`] and [`Withdrawal::bytes_to_sign`]. The transaction tag is
 /// first, followed by the deployment domain and fields, so neither transaction kinds nor
@@ -162,6 +173,7 @@ fn bytes_to_sign(
     tag: &[u8; SIGN_TAG_SIZE],
     sender: &Address,
     nonce: u64,
+    fee: u64,
     destination: &[u8; 32],
     amount: u64,
 ) -> [u8; ENCODED_TX_SIZE] {
@@ -180,6 +192,10 @@ fn bytes_to_sign(
     let nonce_bytes = nonce.to_be_bytes();
     buf[offset..offset + nonce_bytes.len()].copy_from_slice(&nonce_bytes);
     offset += nonce_bytes.len();
+
+    let fee_bytes = fee.to_be_bytes();
+    buf[offset..offset + fee_bytes.len()].copy_from_slice(&fee_bytes);
+    offset += fee_bytes.len();
 
     buf[offset..offset + destination.len()].copy_from_slice(destination);
     offset += destination.len();
@@ -342,6 +358,7 @@ impl Account {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionHeader {
     sender: Address,
+    fee: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,9 +369,9 @@ pub struct Payment {
 }
 
 impl Payment {
-    pub fn new(sender: Address, receiver: Address, amount: u64) -> Self {
+    pub fn new(sender: Address, receiver: Address, amount: u64, fee: u64) -> Self {
         Self {
-            header: TransactionHeader { sender },
+            header: TransactionHeader { sender, fee },
             receiver,
             amount,
         }
@@ -371,6 +388,7 @@ impl Payment {
             SIGN_TAG_PAYMENT,
             &self.header.sender,
             nonce,
+            self.header.fee,
             &self.receiver,
             self.amount,
         )
@@ -379,9 +397,10 @@ impl Payment {
 
 /// Value leaving the rollup for the settlement chain.
 ///
-/// The mirror of a [`Deposit`]: a deposit writes one slot and credits it, a withdrawal writes one
-/// slot and debits it. Total balances fall, and the settlement contract makes the holder whole in
-/// real ALGO once the batch settles -- see [`withdrawal_chain`] for how it learns to.
+/// The mirror of a [`Deposit`]: a deposit credits one slot, while a withdrawal debits its sender
+/// and, when its fee is nonzero, credits [`FEE_SINK`]. Total balances fall by the withdrawal amount,
+/// and the settlement contract makes the holder whole in real ALGO once the batch settles -- see
+/// [`withdrawal_chain`] for how it learns to.
 ///
 /// **`recipient` is an Algorand address, not a rollup address.** Everywhere else in this crate a
 /// 32-byte destination is an [`Address`], meaning a position in the state tree; here it is the raw
@@ -399,9 +418,9 @@ pub struct Withdrawal {
 }
 
 impl Withdrawal {
-    pub fn new(sender: Address, recipient: L1Address, amount: u64) -> Self {
+    pub fn new(sender: Address, recipient: L1Address, amount: u64, fee: u64) -> Self {
         Self {
-            header: TransactionHeader { sender },
+            header: TransactionHeader { sender, fee },
             recipient,
             amount,
         }
@@ -425,6 +444,7 @@ impl Withdrawal {
             SIGN_TAG_WITHDRAWAL,
             &self.header.sender,
             nonce,
+            self.header.fee,
             &self.recipient,
             self.amount,
         )
@@ -451,6 +471,7 @@ impl Deposit {
         Self {
             header: TransactionHeader {
                 sender: ZERO_ADDRESS,
+                fee: 0,
             },
             receiver,
             amount,
@@ -493,7 +514,10 @@ pub struct ForcedWithdrawal {
 impl ForcedWithdrawal {
     pub fn new(address: Address, recipient: L1Address) -> Self {
         Self {
-            header: TransactionHeader { sender: address },
+            header: TransactionHeader {
+                sender: address,
+                fee: 0,
+            },
             recipient,
         }
     }
@@ -557,6 +581,15 @@ impl Transaction {
             Transaction::Deposit(deposit) => Some(deposit.amount),
             Transaction::Withdrawal(withdrawal) => Some(withdrawal.amount),
             Transaction::ForcedWithdrawal(_) => None,
+        }
+    }
+
+    /// The fee paid to [`FEE_SINK`]. Deposits and forced withdrawals always return zero.
+    pub fn fee(&self) -> u64 {
+        match self {
+            Transaction::Payment(payment) => payment.header.fee,
+            Transaction::Withdrawal(withdrawal) => withdrawal.header.fee,
+            Transaction::Deposit(_) | Transaction::ForcedWithdrawal(_) => 0,
         }
     }
 }
@@ -686,7 +719,7 @@ pub struct LeafWitness {
 /// Everything about one transaction that the chain does not have to record.
 ///
 /// A sidecar entry can only make a transaction fail to prove; it can never change what the
-/// transaction does. The addresses and the amount come from the [`Batch`], the nonce is derived,
+/// transaction does. The addresses, amount and fee come from the [`Batch`], the nonce is derived,
 /// and post-states are computed -- so a doctored sidecar produces a rejected block, not a
 /// redirected payment.
 ///
@@ -712,6 +745,7 @@ pub struct PaymentSidecar {
     sig: Signature,
     sender_witness: LeafWitness,
     receiver_witness: LeafWitness,
+    fee_sink_witness: Option<LeafWitness>,
 }
 
 /// A deposit witnesses one slot, not two.
@@ -724,15 +758,16 @@ pub struct DepositSidecar {
     receiver_witness: LeafWitness,
 }
 
-/// A withdrawal witnesses one slot too, and the opposite one.
+/// A withdrawal witnesses its sender and, when its fee is nonzero, the fee sink.
 ///
-/// The deposit's missing half is the sender; the withdrawal's is the receiver, because the
-/// recipient is an [`L1Address`] and has no slot in this tree to witness. The signature is present
-/// -- unlike a deposit, a withdrawal spends from an account and has to be authorized by its key.
+/// The deposit's missing half is the sender; the withdrawal's recipient is an [`L1Address`] and has
+/// no slot in this tree to witness. The signature is present -- unlike a deposit, a withdrawal
+/// spends from an account and has to be authorized by its key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WithdrawalSidecar {
     sig: Signature,
     sender_witness: LeafWitness,
+    fee_sink_witness: Option<LeafWitness>,
 }
 
 /// A forced withdrawal witnesses one slot and carries no signature.
@@ -1035,16 +1070,16 @@ fn expect_pre_state(
 
 /// Credit `amount` to `receiver` against the running `root`, and return the root that produces.
 ///
-/// The second half of a payment and the whole of a deposit. A created account is pinned to
-/// [`Account::empty`], so a prover cannot choose the `auth_address` of an account it brings into
+/// Used for a payment receiver, a fee sink, and the whole of a deposit. A created account is pinned
+/// to [`Account::empty`], so a prover cannot choose the `auth_address` of an account it brings into
 /// existence -- which is also what lets a depositor spend immediately with the key their address
 /// was derived from.
-/// Debit `amount` from `sender_addr` against the running `root`, and return the root that produces.
+/// Debit `amount` and `fee` from `sender_addr` against the running `root`, and return the resulting
+/// root.
 ///
-/// The first half of a payment and the whole of a withdrawal. Unlike [`credit`] this refuses an
-/// empty slot outright: paying an address that holds nothing creates an account, but *spending*
-/// from one that holds nothing is [`VerificationError::UnknownSender`] however good the proof of
-/// its absence is.
+/// The sender write of a payment or withdrawal. Unlike [`credit`] this refuses an empty slot
+/// outright: paying an address that holds nothing creates an account, but *spending* from one that
+/// holds nothing is [`VerificationError::UnknownSender`] however good the proof of its absence is.
 ///
 /// The nonce is bumped before the signature is checked, and the bumped value is what
 /// `bytes_to_sign` is handed: it is the only nonce a signature for this transaction could have been
@@ -1059,6 +1094,7 @@ fn debit(
     witness: &LeafWitness,
     sig: &Signature,
     amount: u64,
+    fee: u64,
     root: [u8; 32],
     bytes_to_sign: impl FnOnce(u64) -> [u8; ENCODED_TX_SIZE],
 ) -> Result<[u8; 32], VerificationError> {
@@ -1072,6 +1108,7 @@ fn debit(
     sender.amount = sender
         .amount
         .checked_sub(amount)
+        .and_then(|balance| balance.checked_sub(fee))
         .ok_or(VerificationError::InsufficientFunds)?;
 
     root_with(sender_addr, Some(&sender), &witness.proof)
@@ -1102,10 +1139,10 @@ fn credit(
 /// settlement contract compares both returned values against what it has stored, so there is no
 /// prover-supplied answer for the replay to be checked against.
 ///
-/// A payment writes two slots -- sender then receiver -- and every write both checks the pre-state
-/// against the running root and advances it. Chaining the roots this way means a self-payment needs
-/// no special case: the receiver write reads the slot the sender write just produced, and the root
-/// comparison enforces that it agrees.
+/// A payment writes its sender, receiver, and, for a nonzero fee, [`FEE_SINK`]. Every write both
+/// checks the pre-state against the running root and advances it. Chaining the roots this way means
+/// overlapping addresses need no special case: each write reads the state the preceding write
+/// produced, and the root comparison enforces that it agrees.
 ///
 /// A deposit writes one. There is no sender to debit, so total balances rise -- the mint is backed
 /// by the settlement contract's own ALGO rather than by conservation inside the tree, and what
@@ -1113,16 +1150,16 @@ fn credit(
 /// deposits from inside the tree would only relocate the mint, since the reserve would have to be
 /// minted into as well, at the cost of a second write and witness on every deposit.
 ///
-/// A withdrawal writes one slot too, and it is the other one. There is no receiver to credit, so
-/// total balances fall -- the burn is matched by the settlement contract paying out real ALGO, and
-/// what tells it whom to pay is the withdrawal chain: see [`withdrawal_chain`]. This is the
-/// exact inverse of a deposit, down to which half of the payment is missing.
+/// A withdrawal writes its sender and, for a nonzero fee, [`FEE_SINK`]. There is no rollup receiver
+/// for the withdrawal amount, so total balances fall by that amount -- the burn is matched by the
+/// settlement contract paying out real ALGO, and what tells it whom to pay is the withdrawal chain:
+/// see [`withdrawal_chain`].
 ///
 /// Deposits, payments and withdrawals interleave freely. Their commitments preserve transaction
 /// order, which is what lets a payment spend a deposit credited earlier in the same batch, or a
 /// withdrawal spend what a payment just delivered.
 ///
-/// Nothing here trusts the sidecar. Addresses and amounts come from the batch, nonces are derived
+/// Nothing here trusts the sidecar. Addresses, amounts and fees come from the batch, nonces are derived
 /// from the witnessed account, and post-states are computed rather than supplied, so a doctored
 /// sidecar produces a rejected block rather than a redirected payment.
 ///
@@ -1155,6 +1192,7 @@ pub fn verify_batch(
                     &entry.sender_witness,
                     &entry.sig,
                     amt,
+                    payment.header.fee,
                     root,
                     |nonce| payment.bytes_to_sign(domain, nonce),
                 )?;
@@ -1162,6 +1200,13 @@ pub fn verify_batch(
                 // Read against the root the sender write just produced, so a self-payment sees the
                 // debited balance and the bumped nonce.
                 root = credit(&receiver_addr, &entry.receiver_witness, amt, root)?;
+                match (payment.header.fee, &entry.fee_sink_witness) {
+                    (0, None) => {}
+                    (fee, Some(witness)) if fee != 0 => {
+                        root = credit(&FEE_SINK, witness, fee, root)?;
+                    }
+                    _ => return Err(VerificationError::SidecarKindMismatch),
+                }
             }
             (Transaction::Deposit(deposit), TxnSidecar::Deposit(entry)) => {
                 let (receiver_addr, amt) = (deposit.receiver, deposit.amount);
@@ -1187,9 +1232,18 @@ pub fn verify_batch(
                     &entry.sender_witness,
                     &entry.sig,
                     amt,
+                    withdrawal.header.fee,
                     root,
                     |nonce| withdrawal.bytes_to_sign(domain, nonce),
                 )?;
+
+                match (withdrawal.header.fee, &entry.fee_sink_witness) {
+                    (0, None) => {}
+                    (fee, Some(witness)) if fee != 0 => {
+                        root = credit(&FEE_SINK, witness, fee, root)?;
+                    }
+                    _ => return Err(VerificationError::SidecarKindMismatch),
+                }
 
                 payouts.push((recipient, amt));
             }
@@ -1619,18 +1673,24 @@ impl Ledger {
         for stxn in stxns {
             let txn = match stxn {
                 SignedTransaction::Payment { payment, sig } => {
-                    let sender_witness =
-                        self.debit(payment.header.sender, payment.amount, &sig, |nonce| {
-                            payment.bytes_to_sign(&domain, nonce)
-                        });
+                    let sender_witness = self.debit(
+                        payment.header.sender,
+                        payment.amount,
+                        payment.header.fee,
+                        &sig,
+                        |nonce| payment.bytes_to_sign(&domain, nonce),
+                    );
 
                     // Captured after the sender write, so a self-payment witnesses the debited balance.
                     let receiver_witness = self.credit(payment.receiver, payment.amount);
+                    let fee_sink_witness = (payment.header.fee != 0)
+                        .then(|| self.credit(FEE_SINK, payment.header.fee));
 
                     entries.push(TxnSidecar::Payment(PaymentSidecar {
                         sig,
                         sender_witness,
                         receiver_witness,
+                        fee_sink_witness,
                     }));
 
                     Transaction::Payment(payment)
@@ -1651,16 +1711,22 @@ impl Ledger {
                         "a withdrawal below MIN_WITHDRAWAL could not be paid out on L1",
                     );
 
-                    let sender_witness =
-                        self.debit(withdrawal.header.sender, withdrawal.amount, &sig, |nonce| {
-                            withdrawal.bytes_to_sign(&domain, nonce)
-                        });
+                    let sender_witness = self.debit(
+                        withdrawal.header.sender,
+                        withdrawal.amount,
+                        withdrawal.header.fee,
+                        &sig,
+                        |nonce| withdrawal.bytes_to_sign(&domain, nonce),
+                    );
+                    let fee_sink_witness = (withdrawal.header.fee != 0)
+                        .then(|| self.credit(FEE_SINK, withdrawal.header.fee));
 
                     payouts.push((withdrawal.recipient, withdrawal.amount));
 
                     entries.push(TxnSidecar::Withdrawal(WithdrawalSidecar {
                         sig,
                         sender_witness,
+                        fee_sink_witness,
                     }));
 
                     Transaction::Withdrawal(withdrawal)
@@ -1730,6 +1796,7 @@ impl Ledger {
         &mut self,
         sender: Address,
         amount: u64,
+        fee: u64,
         sig: &Signature,
         bytes_to_sign: impl FnOnce(u64) -> [u8; ENCODED_TX_SIZE],
     ) -> LeafWitness {
@@ -1741,7 +1808,11 @@ impl Ledger {
         let account = self.accounts.get_mut(&sender).unwrap();
         account.bump_nonce().unwrap();
         sig.verify(account, &bytes_to_sign(account.nonce)).unwrap();
-        account.amount = account.amount.checked_sub(amount).unwrap();
+        account.amount = account
+            .amount
+            .checked_sub(amount)
+            .and_then(|balance| balance.checked_sub(fee))
+            .unwrap();
         let account = *account;
         self.tree.update(&sender, Some(&account));
 
@@ -1823,7 +1894,7 @@ mod tests {
     fn payment(key: &[u8], sender: Address, receiver: Address, amount: u64) -> SignedTransaction {
         SignedTransaction::payment(
             Payment {
-                header: TransactionHeader { sender },
+                header: TransactionHeader { sender, fee: 0 },
                 receiver,
                 amount,
             },
@@ -1847,7 +1918,7 @@ mod tests {
     /// A withdrawal of `amount` to `recipient` on L1, from the account for `key`, signed by `key`.
     fn withdrawal(key: &[u8], recipient: L1Address, amount: u64) -> SignedTransaction {
         SignedTransaction::withdrawal(
-            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount),
+            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount, 0),
             signature(key),
         )
     }
@@ -1896,6 +1967,49 @@ mod tests {
         assert_eq!(block.new_root(), ledger.state_root());
         assert_eq!(verify_block(&block), Ok(()));
         assert_eq!(ledger.account(&sender).unwrap().amount(), 750);
+    }
+
+    #[test]
+    fn fees_are_debited_from_the_sender_and_credited_to_the_sink() {
+        let mut ledger = Ledger::new();
+        let sender = fund(&mut ledger, b"sender key", 1_000_000);
+        let receiver = address_from_public_key(SCHEME, b"receiver key");
+        let payment = Payment::new(sender, receiver, 250_000, 7_000);
+        let withdrawal = Withdrawal::new(sender, l1(1), 100_000, 3_000);
+
+        let block = ledger.get_block(vec![
+            SignedTransaction::payment(payment, signature(b"sender key")),
+            SignedTransaction::withdrawal(withdrawal, signature(b"sender key")),
+        ]);
+
+        assert_eq!(verify_block(&block), Ok(()));
+        assert_eq!(block.batch.txns[0].fee(), 7_000);
+        assert_eq!(block.batch.txns[1].fee(), 3_000);
+        assert_eq!(ledger.account(&sender).unwrap().amount(), 640_000);
+        assert_eq!(ledger.account(&receiver).unwrap().amount(), 250_000);
+        assert_eq!(ledger.account(&FEE_SINK).unwrap().amount(), 10_000);
+    }
+
+    #[test]
+    fn a_sender_must_cover_the_amount_and_the_fee() {
+        let mut ledger = Ledger::new();
+        let sender = fund(&mut ledger, b"sender key", 1_000);
+        let receiver = address_from_public_key(SCHEME, b"receiver key");
+        let payment = Payment::new(sender, receiver, 999, 1);
+        let mut block = ledger.get_block(vec![SignedTransaction::payment(
+            payment,
+            signature(b"sender key"),
+        )]);
+
+        let Transaction::Payment(payment) = &mut block.batch.txns[0] else {
+            unreachable!()
+        };
+        payment.header.fee = 2;
+
+        assert_eq!(
+            verify_block(&block),
+            Err(VerificationError::InsufficientFunds)
+        );
     }
 
     #[test]
@@ -2039,6 +2153,13 @@ mod tests {
                 assert_ne!(address_from_public_key(scheme, key), ZERO_ADDRESS);
             }
         }
+    }
+
+    #[test]
+    fn the_fee_sink_is_the_protocol_domain_hash() {
+        let expected: [u8; 32] = Sha256::digest(b"PAYMENT_ROLLUP_FEE_SINK").into();
+
+        assert_eq!(FEE_SINK, expected);
     }
 
     #[test]
@@ -2191,6 +2312,7 @@ mod tests {
                 old_account: None,
                 proof: ledger.proof(&address_from_public_key(SCHEME, b"a key")),
             },
+            fee_sink_witness: None,
         });
 
         assert_eq!(
@@ -2433,16 +2555,17 @@ mod tests {
         let sender = address_from_public_key(SCHEME, b"a key");
         let destination = [9u8; 32];
 
-        let payment = Payment::new(sender, destination, 100_000);
-        let withdrawal = Withdrawal::new(sender, destination, 100_000);
+        let payment = Payment::new(sender, destination, 100_000, 0);
+        let withdrawal = Withdrawal::new(sender, destination, 100_000, 0);
         let payment_message = payment.bytes_to_sign(&TEST_DOMAIN, 3);
 
         assert_eq!(&payment_message[..3], b"PAY");
         assert_eq!(&payment_message[3..35], &TEST_DOMAIN);
         assert_eq!(&payment_message[35..67], &sender);
         assert_eq!(&payment_message[67..75], &3u64.to_be_bytes());
-        assert_eq!(&payment_message[75..107], &destination);
-        assert_eq!(&payment_message[107..], &100_000u64.to_be_bytes());
+        assert_eq!(&payment_message[75..83], &0u64.to_be_bytes());
+        assert_eq!(&payment_message[83..115], &destination);
+        assert_eq!(&payment_message[115..], &100_000u64.to_be_bytes());
 
         assert_ne!(payment_message, withdrawal.bytes_to_sign(&TEST_DOMAIN, 3));
         // And the nonce still separates two otherwise identical transactions of the same kind.

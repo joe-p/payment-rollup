@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use crate::{
         Account, Address, Block, DeploymentDomain, Deposit, L1Address, LeafWitness, Ledger,
-        Payment, PaymentSidecar, Signature, SignedTransaction, TxnSidecar, Withdrawal,
+        Payment, PaymentSidecar, Signature, SignedTransaction, Transaction, TxnSidecar, Withdrawal,
         verify_block,
     };
 
@@ -433,8 +433,8 @@ mod tests {
     fn signed_block(key: &TestKey, receiver: Address) -> Block {
         let mut ledger = Ledger::with_domain(TEST_DOMAIN);
 
-        let payment = Payment::new(key.address(), receiver, 400_000);
-        let withdrawal = Withdrawal::new(key.address(), l1(7), 500_000);
+        let payment = Payment::new(key.address(), receiver, 400_000, 0);
+        let withdrawal = Withdrawal::new(key.address(), l1(7), 500_000, 0);
 
         ledger.get_block(vec![
             SignedTransaction::deposit(Deposit::new(key.address(), 1_000_000)),
@@ -480,7 +480,7 @@ mod tests {
 
         for nonce in [0, 2, 3] {
             let mut block = signed_block(&key, receiver);
-            let payment = Payment::new(key.address(), receiver, 400_000);
+            let payment = Payment::new(key.address(), receiver, 400_000, 0);
             *payment_sig(&mut block) = key.sign(&payment.bytes_to_sign(&TEST_DOMAIN, nonce));
 
             assert_eq!(
@@ -499,7 +499,7 @@ mod tests {
         let receiver = TestKey::new(Scheme::Ed25519, b"a receiver").address();
 
         let mut block = signed_block(&key, receiver);
-        let payment = Payment::new(key.address(), receiver, 400_000);
+        let payment = Payment::new(key.address(), receiver, 400_000, 0);
         *payment_sig(&mut block) = key.sign(&payment.bytes_to_sign(&[0x43; 32], 1));
 
         assert_eq!(
@@ -508,8 +508,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_signature_commits_to_the_fee() {
+        let key = TestKey::new(Scheme::Ed25519, b"a signing key");
+        let receiver = TestKey::new(Scheme::Ed25519, b"a receiver").address();
+        let mut block = signed_block(&key, receiver);
+
+        let Transaction::Payment(payment) = &mut block.batch.txns[1] else {
+            unreachable!()
+        };
+        payment.header.fee = 1;
+
+        assert_eq!(
+            verify_block(&block),
+            Err(VerificationError::InvalidSignature)
+        );
+    }
+
     // What the transaction tag is for. The two preimages agree in every field -- sender, nonce, the
-    // 32-byte destination, the amount -- so without the tag this signature would authorize moving
+    // fee, 32-byte destination, and amount -- so without the tag this signature would authorize moving
     // the money out of the rollup instead of across it.
     #[test]
     fn a_withdrawal_signature_cannot_authorize_a_payment() {
@@ -517,7 +534,7 @@ mod tests {
         let receiver = TestKey::new(Scheme::Ed25519, b"a receiver").address();
 
         let mut block = signed_block(&key, receiver);
-        let same_by_another_name = Withdrawal::new(key.address(), receiver, 400_000);
+        let same_by_another_name = Withdrawal::new(key.address(), receiver, 400_000, 0);
         *payment_sig(&mut block) = key.sign(&same_by_another_name.bytes_to_sign(&TEST_DOMAIN, 1));
 
         assert_eq!(
@@ -536,7 +553,7 @@ mod tests {
         let attacker = TestKey::new(Scheme::Ed25519, b"an attacker");
 
         let mut block = signed_block(&key, receiver);
-        let payment = Payment::new(key.address(), receiver, 400_000);
+        let payment = Payment::new(key.address(), receiver, 400_000, 0);
         *payment_sig(&mut block) = attacker.sign(&payment.bytes_to_sign(&TEST_DOMAIN, 1));
 
         assert_eq!(
@@ -592,7 +609,7 @@ mod tests {
 
         // Hand-built, because the ledger would refuse to build it: the account holds one
         // microALGO and the payment spends four hundred thousand of them.
-        let payment = Payment::new(key.address(), receiver, 400_000);
+        let payment = Payment::new(key.address(), receiver, 400_000, 0);
         let block = ledger.get_block(vec![SignedTransaction::deposit(Deposit::new(
             key.address(),
             1,
@@ -615,6 +632,7 @@ mod tests {
                 sig: key.sign(b"something else entirely"),
                 sender_witness,
                 receiver_witness,
+                fee_sink_witness: None,
             })],
         };
 
@@ -639,7 +657,7 @@ mod tests {
         let receiver = TestKey::new(Scheme::Ed25519, b"a receiver").address();
         let mut ledger = Ledger::with_domain(TEST_DOMAIN);
 
-        let payment = Payment::new(key.address(), receiver, 400_000);
+        let payment = Payment::new(key.address(), receiver, 400_000, 0);
 
         ledger.get_block(vec![
             SignedTransaction::deposit(Deposit::new(key.address(), 1_000_000)),

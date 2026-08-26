@@ -37,6 +37,9 @@ use payment_rollup::{
 
 const SCHEME: Scheme = Scheme::Managed;
 
+/// Fee on every payment and ordinary withdrawal in the scenario suite.
+const SCENARIO_FEE: u64 = 10;
+
 /// A named block, built on demand so nothing is computed for scenarios that were not asked for.
 pub struct Scenario {
     pub name: &'static str,
@@ -242,7 +245,7 @@ fn deposit(key: &[u8], amount: u64) -> SignedTransaction {
 /// No nonce: the sequencer assigns each sender its next one in the order the block lists them.
 fn pay(key: &[u8], receiver: Address, amount: u64) -> SignedTransaction {
     SignedTransaction::payment(
-        Payment::new(address_of(key), receiver, amount),
+        Payment::new(address_of(key), receiver, amount, SCENARIO_FEE),
         Signature::new(SCHEME, key.to_vec(), Vec::new()),
     )
 }
@@ -254,7 +257,7 @@ fn pay(key: &[u8], receiver: Address, amount: u64) -> SignedTransaction {
 /// distinct and stable.
 fn withdraw(key: &[u8], recipient: L1Address, amount: u64) -> SignedTransaction {
     SignedTransaction::withdrawal(
-        Withdrawal::new(address_of(key), recipient, amount),
+        Withdrawal::new(address_of(key), recipient, amount, SCENARIO_FEE),
         Signature::new(SCHEME, key.to_vec(), Vec::new()),
     )
 }
@@ -499,7 +502,7 @@ pub fn forced_exit_proofs(domain: DeploymentDomain) -> Vec<ExitProof> {
         .collect()
 }
 
-/// One payment per receiver, at the ~38 bytes a payment costs when the sender repeats and the
+/// One payment per receiver, at the ~39 bytes a payment costs when the sender repeats and the
 /// receiver is new, which puts the batch a few chunks over the boundary.
 fn multi_chunk(domain: DeploymentDomain) -> Block {
     const PAYMENTS: u32 = 300;
@@ -507,7 +510,10 @@ fn multi_chunk(domain: DeploymentDomain) -> Block {
 
     let mut ledger = Ledger::with_domain(domain);
 
-    let mut stxns = vec![deposit(b"spender", PAYMENTS as u64 * AMOUNT)];
+    let mut stxns = vec![deposit(
+        b"spender",
+        PAYMENTS as u64 * (AMOUNT + SCENARIO_FEE),
+    )];
     stxns.extend(
         (0..PAYMENTS).map(|index| pay(b"spender", address_of(&index.to_be_bytes()), AMOUNT)),
     );
@@ -621,8 +627,8 @@ fn every_scheme_keys() -> [Key; 3] {
 /// What each of the three accounts is deposited, paid, and withdraws.
 ///
 /// The payments are a cycle -- each account pays the next, the last pays the first -- so every
-/// account ends the payments holding exactly what it was deposited, and the withdrawal amounts can
-/// be chosen freely. They are chosen distinct so no two payouts in the emitted queue are
+/// account ends the payments holding its deposit less one fee, and the withdrawal amounts can be
+/// chosen freely. They are chosen distinct so no two payouts in the emitted queue are
 /// interchangeable, the same reason the `withdrawals` scenario's are.
 const EVERY_SCHEME_DEPOSIT: u64 = 2_000_000;
 const EVERY_SCHEME_PAYMENT: u64 = 250_000;
@@ -651,7 +657,7 @@ fn every_scheme(domain: DeploymentDomain) -> Block {
 
     for (index, key) in keys.iter().enumerate() {
         let receiver = keys[(index + 1) % keys.len()].address();
-        let payment = Payment::new(key.address(), receiver, EVERY_SCHEME_PAYMENT);
+        let payment = Payment::new(key.address(), receiver, EVERY_SCHEME_PAYMENT, SCENARIO_FEE);
 
         stxns.push(SignedTransaction::payment(
             payment,
@@ -664,6 +670,7 @@ fn every_scheme(domain: DeploymentDomain) -> Block {
             key.address(),
             l1_account(11 + index as u8),
             EVERY_SCHEME_WITHDRAWALS[index],
+            SCENARIO_FEE,
         );
 
         stxns.push(SignedTransaction::withdrawal(
@@ -695,8 +702,8 @@ const LOAD_ACCOUNTS: usize = 25;
 const LOAD_PAYMENTS: [u32; 3] = [100, 1_000, 10_000];
 
 /// What each load account is deposited, chosen so that the most any one account could ever pay
-/// out -- `payments / LOAD_ACCOUNTS * LOAD_AMOUNT`, at the largest of [`LOAD_PAYMENTS`] -- is
-/// comfortably below it regardless of the order transfers land in, the same reasoning
+/// out -- `payments / LOAD_ACCOUNTS * (LOAD_AMOUNT + SCENARIO_FEE)`, at the largest of
+/// [`LOAD_PAYMENTS`] -- is comfortably below it regardless of the order transfers land in, the same reasoning
 /// [`round_trip`] relies on for one payment instead of hundreds. [`signed_load`] asserts as much
 /// rather than leaving it to this comment.
 const LOAD_DEPOSIT: u64 = 1_000_000;
@@ -788,7 +795,8 @@ fn signed_load(domain: DeploymentDomain, keys: &[Key], payments: u32) -> Block {
     // What `LOAD_DEPOSIT` is chosen against, asserted here so a fourth size cannot be added that
     // outspends it and fails deep inside the ledger instead.
     assert!(
-        u64::from(payments).div_ceil(keys.len() as u64) * LOAD_AMOUNT <= LOAD_DEPOSIT,
+        u64::from(payments).div_ceil(keys.len() as u64) * (LOAD_AMOUNT + SCENARIO_FEE)
+            <= LOAD_DEPOSIT,
         "{payments} payments could overdraw a load account's deposit of {LOAD_DEPOSIT}",
     );
 
@@ -810,7 +818,7 @@ fn signed_load(domain: DeploymentDomain, keys: &[Key], payments: u32) -> Block {
             keys[(sender_index + 1) % keys.len()].address()
         };
 
-        let payment = Payment::new(key.address(), receiver, LOAD_AMOUNT);
+        let payment = Payment::new(key.address(), receiver, LOAD_AMOUNT, SCENARIO_FEE);
         nonces[sender_index] += 1;
 
         stxns.push(SignedTransaction::payment(
@@ -827,7 +835,7 @@ mod tests {
     use super::*;
 
     use crate::Settlement;
-    use payment_rollup::{CHUNK_SIZE, verify_block};
+    use payment_rollup::{CHUNK_SIZE, Transaction, verify_block};
 
     const DOMAIN: DeploymentDomain = [0x42; 32];
 
@@ -840,6 +848,23 @@ mod tests {
                 "{}",
                 scenario.name
             );
+        }
+    }
+
+    #[test]
+    fn every_signed_scenario_transaction_pays_a_fee() {
+        let blocks = all()
+            .iter()
+            .map(|scenario| (scenario.build)(DOMAIN))
+            // The load scenarios share `signed_load`; one cheap member covers their fee path.
+            .chain(std::iter::once(ed25519_100(DOMAIN)));
+
+        for block in blocks {
+            for txn in block.batch().txns() {
+                if matches!(txn, Transaction::Payment(_) | Transaction::Withdrawal(_)) {
+                    assert_eq!(txn.fee(), SCENARIO_FEE);
+                }
+            }
         }
     }
 
@@ -1114,7 +1139,12 @@ mod tests {
     fn an_every_scheme_signature_over_the_wrong_nonce_is_refused() {
         let key = Key::hybrid(b"payment-rollup hybrid key!!!!!!!");
         let mut ledger = Ledger::with_domain(DOMAIN);
-        let payment = Payment::new(key.address(), address_of(b"a key"), EVERY_SCHEME_PAYMENT);
+        let payment = Payment::new(
+            key.address(),
+            address_of(b"a key"),
+            EVERY_SCHEME_PAYMENT,
+            SCENARIO_FEE,
+        );
 
         ledger.get_block(vec![
             SignedTransaction::deposit(Deposit::new(key.address(), EVERY_SCHEME_DEPOSIT)),

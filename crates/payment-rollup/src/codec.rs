@@ -24,8 +24,8 @@ use crate::{
     WithdrawalSidecar, merkle::DEPTH,
 };
 
-const BATCH_VERSION: u8 = 0;
-const SIDECAR_VERSION: u8 = 0;
+const BATCH_VERSION: u8 = 1;
+const SIDECAR_VERSION: u8 = 1;
 
 const KIND_PAYMENT: u8 = 0;
 const KIND_DEPOSIT: u8 = 1;
@@ -293,11 +293,12 @@ impl Batch {
     /// The bytes the settlement chain records.
     ///
     /// ```text
-    /// version    u8 = 0
+    /// version    u8 = 1
     /// count      varint
     /// count x, kind u8, then one of:
     ///   kind 0 (payment)
     ///     sender   address reference
+    ///     fee      varint
     ///     receiver address reference
     ///     amount   varint
     ///   kind 1 (deposit)
@@ -305,6 +306,7 @@ impl Batch {
     ///     amount   varint
     ///   kind 2 (withdrawal)
     ///     sender    address reference
+    ///     fee       varint
     ///     recipient 32 literal bytes, an L1 address
     ///     amount    varint
     ///   kind 3 (forced withdrawal)
@@ -319,7 +321,7 @@ impl Batch {
     /// No roots, no nonces, no signatures, no witnesses: a replaying node derives all of them. A
     /// deposit's sender is derived too -- it is always [`crate::ZERO_ADDRESS`], so writing it would
     /// be paying for a constant. A payment between two addresses the block has already mentioned
-    /// costs four bytes; a deposit to one costs three.
+    /// costs five bytes with a one-byte fee; a deposit to one costs three.
     ///
     /// Deposits share the address dictionary with payments, so a deposit and a later payment to the
     /// same account cost one reference between them.
@@ -342,6 +344,7 @@ impl Batch {
                 Transaction::Payment(payment) => {
                     buf.push(KIND_PAYMENT);
                     dictionary.put(&mut buf, &payment.header.sender);
+                    put_varint(&mut buf, payment.header.fee);
                     dictionary.put(&mut buf, &payment.receiver);
                     put_varint(&mut buf, payment.amount);
                 }
@@ -353,6 +356,7 @@ impl Batch {
                 Transaction::Withdrawal(withdrawal) => {
                     buf.push(KIND_WITHDRAWAL);
                     dictionary.put(&mut buf, &withdrawal.header.sender);
+                    put_varint(&mut buf, withdrawal.header.fee);
                     buf.extend_from_slice(&withdrawal.recipient());
                     put_varint(&mut buf, withdrawal.amount);
                 }
@@ -388,6 +392,7 @@ impl Batch {
                 KIND_PAYMENT => Transaction::Payment(Payment {
                     header: TransactionHeader {
                         sender: dictionary.take(&mut reader)?,
+                        fee: reader.varint()?,
                     },
                     receiver: dictionary.take(&mut reader)?,
                     amount: reader.varint()?,
@@ -403,9 +408,15 @@ impl Batch {
                 // address never enters it and can never be handed back as a rollup address.
                 KIND_WITHDRAWAL => {
                     let sender = dictionary.take(&mut reader)?;
+                    let fee = reader.varint()?;
                     let recipient = reader.array::<32>()?;
 
-                    Transaction::Withdrawal(Withdrawal::new(sender, recipient, reader.varint()?))
+                    Transaction::Withdrawal(Withdrawal::new(
+                        sender,
+                        recipient,
+                        reader.varint()?,
+                        fee,
+                    ))
                 }
                 KIND_FORCED_WITHDRAWAL => {
                     let address = dictionary.take(&mut reader)?;
@@ -504,7 +515,7 @@ impl Sidecar {
     /// The bytes handed to the prover alongside the batch, and to nobody else.
     ///
     /// ```text
-    /// version    u8 = 0
+    /// version    u8 = 1
     /// count      varint
     /// count x, in the shape the batch's transaction of the same index calls for:
     ///   payment
@@ -513,6 +524,7 @@ impl Sidecar {
     ///     sig      varint length, then bytes
     ///     sender   witness
     ///     receiver witness
+    ///     fee sink witness, only when fee is nonzero
     ///   deposit
     ///     receiver witness
     ///   withdrawal
@@ -520,6 +532,7 @@ impl Sidecar {
     ///     pub_key  varint length, then bytes
     ///     sig      varint length, then bytes
     ///     sender   witness
+    ///     fee sink witness, only when fee is nonzero
     ///   forced withdrawal
     ///     address  witness
     ///
@@ -551,6 +564,9 @@ impl Sidecar {
                     put_bytes(&mut buf, &entry.sig.sig);
                     put_witness(&mut buf, &entry.sender_witness);
                     put_witness(&mut buf, &entry.receiver_witness);
+                    if let Some(witness) = &entry.fee_sink_witness {
+                        put_witness(&mut buf, witness);
+                    }
                 }
                 TxnSidecar::Deposit(entry) => {
                     put_witness(&mut buf, &entry.receiver_witness);
@@ -560,6 +576,9 @@ impl Sidecar {
                     put_bytes(&mut buf, &entry.sig.pub_key);
                     put_bytes(&mut buf, &entry.sig.sig);
                     put_witness(&mut buf, &entry.sender_witness);
+                    if let Some(witness) = &entry.fee_sink_witness {
+                        put_witness(&mut buf, witness);
+                    }
                 }
                 TxnSidecar::ForcedWithdrawal(entry) => {
                     put_witness(&mut buf, &entry.sender_witness);
@@ -589,17 +608,23 @@ impl Sidecar {
         let mut entries = Vec::with_capacity(found);
         for txn in batch.txns() {
             entries.push(match txn {
-                Transaction::Payment(_) => TxnSidecar::Payment(PaymentSidecar {
+                Transaction::Payment(payment) => TxnSidecar::Payment(PaymentSidecar {
                     sig: take_signature(&mut reader)?,
                     sender_witness: take_witness(&mut reader)?,
                     receiver_witness: take_witness(&mut reader)?,
+                    fee_sink_witness: (payment.header.fee != 0)
+                        .then(|| take_witness(&mut reader))
+                        .transpose()?,
                 }),
                 Transaction::Deposit(_) => TxnSidecar::Deposit(DepositSidecar {
                     receiver_witness: take_witness(&mut reader)?,
                 }),
-                Transaction::Withdrawal(_) => TxnSidecar::Withdrawal(WithdrawalSidecar {
+                Transaction::Withdrawal(withdrawal) => TxnSidecar::Withdrawal(WithdrawalSidecar {
                     sig: take_signature(&mut reader)?,
                     sender_witness: take_witness(&mut reader)?,
+                    fee_sink_witness: (withdrawal.header.fee != 0)
+                        .then(|| take_witness(&mut reader))
+                        .transpose()?,
                 }),
                 Transaction::ForcedWithdrawal(_) => {
                     TxnSidecar::ForcedWithdrawal(ForcedWithdrawalSidecar {
@@ -627,6 +652,7 @@ mod tests {
             Payment {
                 header: TransactionHeader {
                     sender: address_from_public_key(SCHEME, key),
+                    fee: 0,
                 },
                 receiver,
                 amount,
@@ -752,15 +778,15 @@ mod tests {
     // comes to:
     //
     //   2   version and count
-    //  68   payment 1: kind, two fresh addresses, amount
-    //  36   payment 2: kind, a repeat, a fresh address, amount
-    //   4   payment 3: kind, two repeats, amount
+    //  69   payment 1: kind, sender, fee, receiver, amount
+    //  37   payment 2: kind, sender, fee, receiver, amount
+    //   5   payment 3: kind, sender, fee, receiver, amount
     #[test]
     fn a_batch_costs_what_the_format_says_it_does() {
         let block = block();
         let batch_bytes = block.batch.encode();
 
-        assert_eq!(batch_bytes.len(), 110);
+        assert_eq!(batch_bytes.len(), 113);
 
         // And the sidecar, which nobody pays for, is already an order of magnitude larger over a
         // three-account tree -- where proofs are about one level deep. The gap widens by 64 bytes
@@ -783,6 +809,7 @@ mod tests {
                 txns: vec![Transaction::Payment(Payment {
                     header: TransactionHeader {
                         sender: address_from_public_key(SCHEME, b"sender"),
+                        fee: 0,
                     },
                     receiver,
                     amount,
@@ -798,6 +825,44 @@ mod tests {
     }
 
     #[test]
+    fn fees_round_trip_and_carry_a_sink_witness() {
+        let mut ledger = Ledger::new();
+        let sender = fund(&mut ledger, b"sender", u64::MAX);
+        let receiver = address_from_public_key(SCHEME, b"receiver");
+        let payment = Payment::new(sender, receiver, 1, u32::MAX as u64);
+        let block = ledger.get_block(vec![SignedTransaction::payment(
+            payment,
+            Signature::new(SCHEME, b"sender".to_vec(), Vec::new()),
+        )]);
+
+        let batch = Batch::decode(&block.batch.encode()).unwrap();
+        let sidecar = Sidecar::decode(&block.sidecar.encode(), &batch).unwrap();
+
+        assert_eq!(batch.txns[0].fee(), u32::MAX as u64);
+        assert!(matches!(
+            &sidecar.entries[0],
+            TxnSidecar::Payment(PaymentSidecar {
+                fee_sink_witness: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            verify_batch(
+                &block.domain,
+                block.old_root,
+                block.old_inbox_chain,
+                &batch,
+                &sidecar,
+            ),
+            Ok((
+                block.new_root,
+                block.new_inbox_chain,
+                block.withdrawal_chain,
+            ))
+        );
+    }
+
+    #[test]
     fn a_repeated_address_decodes_to_the_same_address() {
         let block = block();
         let batch = Batch::decode(&block.batch.encode()).unwrap();
@@ -809,7 +874,7 @@ mod tests {
     }
 
     // A sidecar can only make a transaction fail to prove, never change what it does: the
-    // addresses and the amount come from the batch, which is untouched here.
+    // addresses, amount and fee come from the batch, which is untouched here.
     #[test]
     fn a_doctored_sidecar_cannot_redirect_a_payment() {
         let block = block();
@@ -834,11 +899,11 @@ mod tests {
     #[test]
     fn a_batch_with_the_wrong_version_is_rejected() {
         let mut bytes = block().batch.encode();
-        bytes[0] = 1;
+        bytes[0] = 2;
 
         assert_eq!(
             Batch::decode(&bytes),
-            Err(DecodeError::UnsupportedVersion(1))
+            Err(DecodeError::UnsupportedVersion(2))
         );
     }
 
@@ -932,7 +997,7 @@ mod tests {
             txns: pairs
                 .map(|(sender, receiver)| {
                     Transaction::Payment(Payment {
-                        header: TransactionHeader { sender },
+                        header: TransactionHeader { sender, fee: 0 },
                         receiver,
                         amount,
                     })
@@ -952,7 +1017,8 @@ mod tests {
 
     // What a payment actually costs, which is:
     //
-    //   1 (kind) + sender ref + receiver ref + amount varint + 32 * distinct addresses / txns
+    //   1 (kind) + sender ref + fee varint + receiver ref + amount varint
+    //     + 32 * distinct addresses / txns
     //
     // A reference is one byte for the first 127 addresses a block mentions and two after that. The
     // last term is the whole story: the dictionary only pays off within a block, so a workload
@@ -968,16 +1034,16 @@ mod tests {
             );
         };
 
-        // No reuse at all: 1 + 33 + 33 + 3. The realistic case for payments between strangers.
+        // No reuse at all: 1 + 33 + 1 + 33 + 3. The realistic case for payments between strangers.
         close(
             per_txn((0..1000).map(|i| (distinct_address(i * 2), distinct_address(i * 2 + 1)))),
-            70.00,
+            71.00,
         );
 
-        // A hot receiver -- an exchange or a merchant -- halves it: 1 + 33 + 1 + 3.
+        // A hot receiver -- an exchange or a merchant -- halves it: 1 + 33 + 1 + 1 + 3.
         close(
             per_txn((0..1000).map(|i| (distinct_address(i), distinct_address(usize::MAX)))),
-            38.03,
+            39.03,
         );
 
         // Churn among 128 addresses, where references have just spilled to two bytes.
@@ -985,13 +1051,13 @@ mod tests {
             per_txn(
                 (0..1000).map(|i| (distinct_address(i % 128), distinct_address((i + 1) % 128))),
             ),
-            10.11,
+            11.11,
         );
 
-        // Churn among 20: 1 + 1 + 1 + 3, plus 640 literal bytes spread over a thousand payments.
+        // Churn among 20: kind, sender, fee, receiver, amount, plus the literal addresses.
         close(
             per_txn((0..1000).map(|i| (distinct_address(i % 20), distinct_address((i + 1) % 20)))),
-            6.64,
+            7.64,
         );
     }
 
@@ -1001,11 +1067,11 @@ mod tests {
         let warm = || (0..1000).map(|i| (distinct_address(i % 20), distinct_address((i + 1) % 20)));
 
         for (amount, expected) in [
-            (0u64, 4.64),
-            (1_000, 5.64),
-            (1_000_000, 6.64),
-            (1_000_000_000, 8.64),
-            (u64::MAX, 13.64),
+            (0u64, 5.64),
+            (1_000, 6.64),
+            (1_000_000, 7.64),
+            (1_000_000_000, 9.64),
+            (u64::MAX, 14.64),
         ] {
             let actual = batch_of(warm(), amount).encode().len() as f64 / 1000.0;
             assert!(
@@ -1085,7 +1151,7 @@ mod tests {
 
     fn withdrawal(key: &[u8], recipient: [u8; 32], amount: u64) -> SignedTransaction {
         SignedTransaction::withdrawal(
-            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount),
+            Withdrawal::new(address_from_public_key(SCHEME, key), recipient, amount, 0),
             Signature {
                 scheme: SCHEME,
                 pub_key: key.to_vec(),
@@ -1159,15 +1225,16 @@ mod tests {
         );
     }
 
-    // A withdrawal is a kind tag, a sender reference, 32 literal recipient bytes, and an amount.
+    // A withdrawal is a kind tag, a sender reference, a fee, 32 literal recipient bytes, and an
+    // amount.
     #[test]
     fn a_withdrawal_costs_what_the_format_says_it_does() {
         let mut ledger = Ledger::new();
         fund(&mut ledger, b"a key", 10_000_000);
 
-        // 1 version + 1 count + 1 kind + 33 fresh sender + 32 literal recipient + 3 amount varint
+        // Version, count, kind, sender, zero fee, recipient, and amount.
         let cold = ledger.get_block(vec![withdrawal(b"a key", [9u8; 32], 250_000)]);
-        assert_eq!(cold.batch.encode().len(), 71);
+        assert_eq!(cold.batch.encode().len(), 72);
 
         // The sender reference warms up; the recipient never does, by design. So a second
         // withdrawal to the same L1 account costs 37 bytes where a second deposit costs 4 -- the
@@ -1176,7 +1243,7 @@ mod tests {
             withdrawal(b"a key", [9u8; 32], 250_000),
             withdrawal(b"a key", [9u8; 32], 250_000),
         ]);
-        assert_eq!(warm.batch.encode().len(), 71 + 1 + 1 + 32 + 3);
+        assert_eq!(warm.batch.encode().len(), 72 + 1 + 1 + 1 + 32 + 3);
     }
 
     fn forced(key: &[u8], recipient: [u8; 32]) -> SignedTransaction {
