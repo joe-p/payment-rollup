@@ -1,6 +1,13 @@
+# Proving Stats
+
+This page contains some stats for proving various batches of transactions. A few things to note:
+
+- It is possible to prove multiple batches in parallel, thus the proof time indicates latency but not throughput.
+- SP1 was used because it is the most commonly used in production today, but other pre-production zkVMs such as ZisK and OpenVM 2.1 would likely be faster and cheaper
+
 ## Prover Network
 
-Right now gas is very cheap on the prover network, so every proof essentially pays just the base fee which is about $0.07. The downside of the prover network is that there can be a lot of variance in proof times.
+Right now gas is very cheap on the prover network, so every proof essentially pays just the base fee which is about $0.07. The downside of the prover network is that there can be a lot of variance in proof times. Under times of congestion, the gas price could also increase.
 
 | Scenario | Commit | Proof Time | Request Link | Cost/Tx |
 | --- | --- | --- | --- | --- |
@@ -16,8 +23,9 @@ Right now gas is very cheap on the prover network, so every proof essentially pa
 | GPU | Scenario | Commit | Time | Proof Cost | Cost/Tx |
 | --- | --- | --- | --- | --- | -- |
 | L40S | 100 ed25519 | [5f52307](https://github.com/joe-p/payment-rollup/commit/5f5230796c20d111fef48e5d68560eb10b508a31) | 163s | $0.05 | $0.0005 |
-| L40S | 1000 FALCON-1024 + ed25519 | [5f52307](https://github.com/joe-p/payment-rollup/commit/5f5230796c20d111fef48e5d68560eb10b508a31) | 576s | $0.15 | $0.0001585 |
+| L40S | 1000 FALCON-1024 + ed25519 | [5f52307](https://github.com/joe-p/payment-rollup/commit/5f5230796c20d111fef48e5d68560eb10b508a31) | 576s | $0.15 | $0.00015 |
+| 5090 | 1000 FALCON-1024 + ed25519 | [5f52307](https://github.com/joe-p/payment-rollup/commit/5f5230796c20d111fef48e5d68560eb10b508a31) | 355s | $0.0975 | $0.0000975 |
 
-L40S was used because it was the most available and the most comparable to an AWS offering: `g6e.4xlarge`
+L40S was used because it was the most available and the most comparable to an AWS offering: `g6e.4xlarge`. It is $0.99/hr on runpod and ~$3.00/hr on AWS.
 
-TODO: Testing with 5090 and 4090
+5090 was used because it's generally the best price/performance. It is $0.99/hr on runpod but typically has limited availability.
