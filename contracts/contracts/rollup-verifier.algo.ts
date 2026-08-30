@@ -189,6 +189,21 @@ function withdrawalTerminal(): bytes<32> {
   return sha256(Bytes("WEND").concat(deploymentDomain()));
 }
 
+/** Commit every approval-program page without relying on a single page or hash preimage limit. */
+function approvalProgramCommitment(): bytes<32> {
+  let commitment = sha256(
+    Bytes("APROG").concat(itob(Txn.numApprovalProgramPages)),
+  );
+  for (let page: uint64 = 0; page < Txn.numApprovalProgramPages; page++) {
+    commitment = sha256(
+      Bytes("APAGE")
+        .concat(commitment)
+        .concat(sha256(Txn.approvalProgramPages(page))),
+    );
+  }
+  return commitment;
+}
+
 export class RollupVerifier extends Contract {
   /** LogicSig address compiled with SP1's Groth16 verification key. */
   verifierAddress = GlobalState<Account>();
@@ -345,6 +360,34 @@ export class RollupVerifier extends Contract {
   escapeGrace = GlobalState<uint64>();
 
   /**
+   * Address that has the ability to force an escape, update verifier information, or trigger an app update
+   *
+   * This address SHOULD be some sort of multisig (either a native one or contract-based) but that is not enforced
+   * in this application.
+   *
+   * All updates are on a time delay. Escapes are immediate
+   */
+  securityCouncil = GlobalState<Account>();
+
+  /** Rounds a scheduled verifier or application update must wait before execution. */
+  updateDelay = GlobalState<uint64>();
+
+  pendingVerifierAddress = GlobalState<Account>();
+  pendingProgramVkeyHash = GlobalState<bytes<32>>();
+  pendingRecursionVkeyRoot = GlobalState<bytes<32>>();
+  verifierUpdateAfter = GlobalState<uint64>();
+
+  applicationUpdateAfter = GlobalState<uint64>();
+  pendingApprovalProgramHash = GlobalState<bytes<32>>();
+
+  private assertSecurityCouncil(): void {
+    assert(
+      Txn.sender === this.securityCouncil.value,
+      "only the security council may call this method",
+    );
+  }
+
+  /**
    * Genesis: the empty ledger.
    *
    * `EMPTY_SUBTREE` in the tree is 32 zero bytes and an empty sparse tree hashes to it, so a
@@ -363,6 +406,8 @@ export class RollupVerifier extends Contract {
     recursionVkeyRoot: bytes<32>,
     inboxTimeout: uint64,
     escapeGrace: uint64,
+    securityCouncil: Account,
+    updateDelay: uint64,
   ): void {
     this.stateRoot.value = bzero(32);
     this.inboxChain.value = bzero(32);
@@ -370,6 +415,8 @@ export class RollupVerifier extends Contract {
     this.inboxCursor.value = 0;
     this.settledInboxCursor.value = 0;
     this.requestCursor.value = 0;
+    this.securityCouncil.value = securityCouncil;
+    this.updateDelay.value = updateDelay;
 
     this.escaped.value = false;
     this.verifierAddress.value = verifierAddress;
@@ -377,6 +424,95 @@ export class RollupVerifier extends Contract {
     this.recursionVkeyRoot.value = recursionVkeyRoot;
     this.inboxTimeout.value = inboxTimeout;
     this.escapeGrace.value = escapeGrace;
+  }
+
+  /** Permanently freeze the rollup so every user can use the existing escape paths immediately. */
+  securityCouncilEscape(): void {
+    this.assertSecurityCouncil();
+    assert(!this.escaped.value, "the rollup has already escaped");
+
+    this.escaped.value = true;
+    this.escapeDeadline.delete();
+    this.escapeInboxTarget.delete();
+    this.escapeProgress.delete();
+    this.pendingVerifierAddress.delete();
+    this.pendingProgramVkeyHash.delete();
+    this.pendingRecursionVkeyRoot.delete();
+    this.verifierUpdateAfter.delete();
+    this.applicationUpdateAfter.delete();
+    this.pendingApprovalProgramHash.delete();
+
+    if (this.batchLength.hasValue) {
+      this.chunkAccumulator.delete();
+      this.batchLength.delete();
+      this.postedLength.delete();
+      this.sealedInboxChain.delete();
+      this.sealedInboxCursor.delete();
+    }
+  }
+
+  /** Commit a verifier rotation and start its public delay. */
+  scheduleVerifierUpdate(
+    verifierAddress: Account,
+    programVkeyHash: bytes<32>,
+    recursionVkeyRoot: bytes<32>,
+  ): void {
+    this.assertSecurityCouncil();
+    assert(!this.escaped.value, "the rollup has escaped");
+    assert(!this.batchLength.hasValue, "a batch is being posted");
+
+    this.pendingVerifierAddress.value = verifierAddress;
+    this.pendingProgramVkeyHash.value = programVkeyHash;
+    this.pendingRecursionVkeyRoot.value = recursionVkeyRoot;
+    this.verifierUpdateAfter.value = Global.round + this.updateDelay.value;
+  }
+
+  /** Apply a verifier rotation once its delay has elapsed. */
+  executeVerifierUpdate(): void {
+    assert(!this.escaped.value, "the rollup has escaped");
+    assert(
+      this.verifierUpdateAfter.hasValue,
+      "no verifier update is scheduled",
+    );
+    assert(
+      Global.round >= this.verifierUpdateAfter.value,
+      "the verifier update delay has not elapsed",
+    );
+
+    this.verifierAddress.value = this.pendingVerifierAddress.value;
+    this.programVkeyHash.value = this.pendingProgramVkeyHash.value;
+    this.recursionVkeyRoot.value = this.pendingRecursionVkeyRoot.value;
+    this.pendingVerifierAddress.delete();
+    this.pendingProgramVkeyHash.delete();
+    this.pendingRecursionVkeyRoot.delete();
+    this.verifierUpdateAfter.delete();
+  }
+
+  /** Commit an approval program and start the public delay before updating to it. */
+  scheduleApplicationUpdate(approvalProgramHash: bytes<32>): void {
+    this.assertSecurityCouncil();
+    assert(!this.escaped.value, "the rollup has escaped");
+    this.pendingApprovalProgramHash.value = approvalProgramHash;
+    this.applicationUpdateAfter.value = Global.round + this.updateDelay.value;
+  }
+
+  /** Permit a separately reviewed contract update only after its delay elapses. */
+  updateApplication(): void {
+    assert(!this.escaped.value, "the rollup has escaped");
+    assert(
+      this.applicationUpdateAfter.hasValue,
+      "no application update is scheduled",
+    );
+    assert(
+      Global.round >= this.applicationUpdateAfter.value,
+      "the application update delay has not elapsed",
+    );
+    assert(
+      approvalProgramCommitment() === this.pendingApprovalProgramHash.value,
+      "the approval program does not match the scheduled update",
+    );
+    this.applicationUpdateAfter.delete();
+    this.pendingApprovalProgramHash.delete();
   }
 
   /**

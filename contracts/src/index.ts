@@ -67,6 +67,8 @@ const MAX_GROUP_SIZE = 16;
  */
 export const INBOX_TIMEOUT_ROUNDS = 216_000n;
 export const ESCAPE_GRACE_ROUNDS = 31_000n;
+/** Minimum public notice before the council can apply a verifier or application-code update. */
+export const UPDATE_DELAY_ROUNDS = 31_000n;
 
 /** SP1 6.4's recursion verification-key root. */
 export const SP1_RECURSION_VKEY_ROOT = Buffer.from(
@@ -90,8 +92,11 @@ export type RollupVerifierConfig = {
   recursionVkeyRoot?: Uint8Array;
   inboxTimeout?: bigint;
   escapeGrace?: bigint;
+  updateDelay?: bigint;
   /** Use the pre-generated Falcon fixture's zero-genesis, app-zero deployment domain. */
   testDeployment?: boolean;
+  /** Account authorized to trigger terminal escape, verifier rotation, and application updates. */
+  securityCouncil: algosdk.Address;
 };
 
 /** Decode SP1's `0x`-prefixed `SP1VerifyingKey::bytes32()` deployment value. */
@@ -101,6 +106,27 @@ export function decodeSp1VkeyHash(value: string): Uint8Array {
     throw new Error("SP1 program vkey must be exactly 32 hexadecimal bytes");
   }
   return new Uint8Array(Buffer.from(hex, "hex"));
+}
+
+/** Commit approval-program pages as `updateApplication` does before accepting an application update. */
+export function approvalProgramCommitment(pages: Uint8Array[]): Uint8Array {
+  const uint64 = (value: bigint) => {
+    const encoded = new Uint8Array(8);
+    new DataView(encoded.buffer).setBigUint64(0, value);
+    return encoded;
+  };
+  const hash = (...parts: Uint8Array[]) => {
+    const result = createHash("sha256");
+    parts.forEach((part) => result.update(part));
+    return new Uint8Array(result.digest());
+  };
+  const tag = (value: string) => new TextEncoder().encode(value);
+
+  let commitment = hash(tag("APROG"), uint64(BigInt(pages.length)));
+  for (const page of pages) {
+    commitment = hash(tag("APAGE"), commitment, hash(page));
+  }
+  return commitment;
 }
 
 interface BatchProofVerifier {
@@ -448,7 +474,9 @@ export class RollupVerifier {
       config.recursionVkeyRoot ?? SP1_RECURSION_VKEY_ROOT,
       config.inboxTimeout ?? INBOX_TIMEOUT_ROUNDS,
       config.escapeGrace ?? ESCAPE_GRACE_ROUNDS,
+      config.updateDelay ?? UPDATE_DELAY_ROUNDS,
       config.testDeployment ?? false,
+      config.securityCouncil,
     );
   }
 
@@ -458,6 +486,8 @@ export class RollupVerifier {
     creator: algosdk.AddressWithTransactionSigner,
     inboxTimeout: bigint = INBOX_TIMEOUT_ROUNDS,
     escapeGrace: bigint = ESCAPE_GRACE_ROUNDS,
+    securityCouncil: algosdk.Address = creator.address,
+    updateDelay: bigint = UPDATE_DELAY_ROUNDS,
   ) {
     if (process.env.NODE_ENV !== "test") {
       throw new Error("createForTesting is only available when NODE_ENV=test");
@@ -470,7 +500,9 @@ export class RollupVerifier {
       new Uint8Array(32),
       inboxTimeout,
       escapeGrace,
+      updateDelay,
       false,
+      securityCouncil,
     );
   }
 
@@ -482,7 +514,9 @@ export class RollupVerifier {
     recursionVkeyRoot: Uint8Array,
     inboxTimeout: bigint,
     escapeGrace: bigint,
+    updateDelay: bigint,
     testDeployment: boolean,
+    securityCouncil: algosdk.Address,
   ) {
     if (
       programVkeyHash.byteLength !== 32 ||
@@ -499,11 +533,13 @@ export class RollupVerifier {
       signer: creator.txnSigner,
       note: `Created on ${Date.now()}`,
       args: {
-        verifierAddress: await proofVerifier.address(),
+        verifierAddress: (await proofVerifier.address()).toString(),
         programVkeyHash,
         recursionVkeyRoot,
         inboxTimeout,
         escapeGrace,
+        securityCouncil: securityCouncil.toString(),
+        updateDelay,
       },
     });
 
@@ -739,6 +775,58 @@ export class RollupVerifier {
       sender: sender.address,
       signer: sender.txnSigner,
       args: {},
+    });
+  }
+
+  /** Immediately and permanently freeze the rollup. Only the security council may call it. */
+  async securityCouncilEscape(
+    sender: algosdk.AddressWithTransactionSigner,
+  ): Promise<void> {
+    await this.appClient.send.securityCouncilEscape({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      args: {},
+    });
+  }
+
+  /** Commit a verifier rotation and begin its configured public delay. */
+  async scheduleVerifierUpdate(
+    sender: algosdk.AddressWithTransactionSigner,
+    verifierAddress: algosdk.Address,
+    programVkeyHash: Uint8Array,
+    recursionVkeyRoot: Uint8Array,
+  ): Promise<void> {
+    await this.appClient.send.scheduleVerifierUpdate({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      args: {
+        verifierAddress: verifierAddress.toString(),
+        programVkeyHash,
+        recursionVkeyRoot,
+      },
+    });
+  }
+
+  /** Apply the pending verifier rotation after its configured public delay. */
+  async executeVerifierUpdate(
+    sender: algosdk.AddressWithTransactionSigner,
+  ): Promise<void> {
+    await this.appClient.send.executeVerifierUpdate({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      args: {},
+    });
+  }
+
+  /** Commit an approval program and begin the configured public delay before updating to it. */
+  async scheduleApplicationUpdate(
+    sender: algosdk.AddressWithTransactionSigner,
+    approvalProgramHash: Uint8Array,
+  ): Promise<void> {
+    await this.appClient.send.scheduleApplicationUpdate({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      args: { approvalProgramHash },
     });
   }
 

@@ -5,6 +5,7 @@ import {
   INBOX_BOX_MBR,
   MIN_WITHDRAWAL,
   RollupVerifier,
+  approvalProgramCommitment,
   decodeSp1VkeyHash,
   deploymentDomain,
   exitMessage,
@@ -295,6 +296,17 @@ describe("rollup verifier", () => {
     );
   });
 
+  it("commits approval-program pages for a scheduled application update", () => {
+    expect(
+      Buffer.from(
+        approvalProgramCommitment([
+          new Uint8Array([1, 2]),
+          new Uint8Array([3]),
+        ]),
+      ).toString("hex"),
+    ).toBe("c1119571f59c979ab344dcc7efab03b4267cd13f36619ef4a795e930650bf82a");
+  });
+
   it("reproduces the Rust fixture commitments and withdrawal chains", () => {
     const domain = deploymentDomain(
       hex(fixture.genesisHash),
@@ -312,6 +324,7 @@ describe("rollup verifier", () => {
       const client = await RollupVerifier.create(algorand, sender, {
         groth16VerificationKey: hex(proofScenario.groth16VerificationKey),
         programVkeyHash: decodeSp1VkeyHash(proofScenario.vkey),
+        securityCouncil: sender.address,
         recursionVkeyRoot: hex(proofScenario.recursionVkeyRoot),
         testDeployment: true,
       });
@@ -1037,6 +1050,95 @@ describe("rollup verifier", () => {
         TEST_INBOX_TIMEOUT,
         TEST_ESCAPE_GRACE,
       );
+
+    it("lets the configured security council trigger the terminal escape immediately", async () => {
+      const council = await fundedOutsider();
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        TEST_INBOX_TIMEOUT,
+        TEST_ESCAPE_GRACE,
+        council.address,
+      );
+
+      await expect(client.securityCouncilEscape(sender)).rejects.toThrow();
+      await client.securityCouncilEscape(council);
+
+      expect((await client.appClient.state.global.getAll()).escaped).toBe(1n);
+      await expect(
+        client.deposit(sender, recipient(), 1_000n),
+      ).rejects.toThrow();
+    });
+
+    it("delays a security-council verifier rotation", async () => {
+      const council = await fundedOutsider();
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        TEST_INBOX_TIMEOUT,
+        TEST_ESCAPE_GRACE,
+        council.address,
+        3n,
+      );
+      const programVkeyHash = new Uint8Array(32).fill(1);
+      const recursionVkeyRoot = new Uint8Array(32).fill(2);
+
+      await client.scheduleVerifierUpdate(
+        council,
+        sender.address,
+        programVkeyHash,
+        recursionVkeyRoot,
+      );
+
+      await expect(client.executeVerifierUpdate(council)).rejects.toThrow();
+      await advanceRounds(3);
+      await client.executeVerifierUpdate(council);
+
+      const state = await client.appClient.state.global.getAll();
+      expect(state.verifierAddress).toBe(sender.address.toString());
+      expect(state.programVkeyHash?.asByteArray()).toEqual(programVkeyHash);
+      expect(state.recursionVkeyRoot?.asByteArray()).toEqual(recursionVkeyRoot);
+    });
+
+    it("only updates to the approval program scheduled after the delay", async () => {
+      const council = await fundedOutsider();
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        TEST_INBOX_TIMEOUT,
+        TEST_ESCAPE_GRACE,
+        council.address,
+        3n,
+      );
+      const program = await algorand.app.getById(client.appClient.appId);
+      const approvalPages = [program.approvalProgram];
+      const updateSelector = createHash("sha512-256")
+        .update("updateApplication()void")
+        .digest()
+        .subarray(0, 4);
+      const update = () =>
+        algorand.send.appUpdate({
+          sender: council.address,
+          signer: council.txnSigner,
+          appId: client.appClient.appId,
+          approvalProgram: program.approvalProgram,
+          clearStateProgram: program.clearStateProgram,
+          args: [updateSelector],
+        });
+
+      await expect(update()).rejects.toThrow();
+
+      await client.scheduleApplicationUpdate(council, new Uint8Array(32));
+      await advanceRounds(3);
+      await expect(update()).rejects.toThrow();
+
+      await client.scheduleApplicationUpdate(
+        council,
+        approvalProgramCommitment(approvalPages),
+      );
+      await advanceRounds(3);
+      await update();
+    });
 
     /** Deposit, let it go stale, and signal. Leaves the contract one grace period from escape. */
     const signalOverStaleDeposit = async (client: RollupVerifier) => {
