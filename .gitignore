@@ -3,5 +3,5 @@ benchmarks/signature-schemes/target/
 node_modules/
 contracts/contracts/out/
 contracts/contracts/clients/
-contracts/fixtures/
+contracts/fixtures/settlements.json
 .env

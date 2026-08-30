@@ -6,6 +6,12 @@ import {
   RollupVerifierClient,
   RollupVerifierComposer,
 } from "../contracts/clients/RollupVerifierClient";
+import {
+  Groth16Bn254LsigVerifier,
+  decodeGnarkGroth16Bn254Proof,
+  decodeGnarkGroth16Bn254Vk,
+  type Groth16Bn254Proof,
+} from "snarkjs-algorand";
 
 import { AlgorandClient, microAlgo } from "@algorandfoundation/algokit-utils";
 
@@ -61,6 +67,169 @@ const MAX_GROUP_SIZE = 16;
  */
 export const INBOX_TIMEOUT_ROUNDS = 216_000n;
 export const ESCAPE_GRACE_ROUNDS = 31_000n;
+
+/** SP1 6.4's recursion verification-key root. */
+export const SP1_RECURSION_VKEY_ROOT = Buffer.from(
+  "002f850ee998974d6cc00e50cd0814b098c05bfade466d28573240d057f25352",
+  "hex",
+);
+
+/** The proof fields emitted by SP1's Groth16 prover. */
+export type Sp1Groth16Proof = {
+  /** SP1's 352-byte encoding: three metadata words followed by the 256-byte gnark proof. */
+  encodedProof: Uint8Array;
+  /** vkey hash, journal hash, exit code, recursion-vkey root, and proof nonce. */
+  publicInputs: readonly [string, string, string, string, string];
+};
+
+export type RollupVerifierConfig = {
+  /** `sp1_verifier::GROTH16_VK_BYTES` for the SP1 release used by the prover. */
+  groth16VerificationKey: Uint8Array;
+  /** `SP1VerifyingKey::hash_bn254()`, encoded as a big-endian uint256. */
+  programVkeyHash: Uint8Array;
+  recursionVkeyRoot?: Uint8Array;
+  inboxTimeout?: bigint;
+  escapeGrace?: bigint;
+  /** Use the pre-generated Falcon fixture's zero-genesis, app-zero deployment domain. */
+  testDeployment?: boolean;
+};
+
+/** Decode SP1's `0x`-prefixed `SP1VerifyingKey::bytes32()` deployment value. */
+export function decodeSp1VkeyHash(value: string): Uint8Array {
+  const hex = value.startsWith("0x") ? value.slice(2) : value;
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error("SP1 program vkey must be exactly 32 hexadecimal bytes");
+  }
+  return new Uint8Array(Buffer.from(hex, "hex"));
+}
+
+interface BatchProofVerifier {
+  address(): Promise<algosdk.Address>;
+  validate(proof: Sp1Groth16Proof | undefined): void;
+  verify(
+    composer: RollupVerifierComposer<any>,
+    appClient: RollupVerifierClient,
+    sender: algosdk.AddressWithTransactionSigner,
+    publicValues: Uint8Array,
+    proof: Sp1Groth16Proof | undefined,
+  ): Promise<void>;
+}
+
+class LsigBatchProofVerifier implements BatchProofVerifier {
+  private readonly verifier: Groth16Bn254LsigVerifier;
+
+  constructor(algorand: AlgorandClient, verificationKey: Uint8Array) {
+    this.verifier = new Groth16Bn254LsigVerifier({
+      totalLsigs: 3,
+      appOffset: 1,
+      algorand,
+      vk: decodeGnarkGroth16Bn254Vk(verificationKey),
+    });
+  }
+
+  async address(): Promise<algosdk.Address> {
+    return (await this.verifier.lsigAccount()).addr;
+  }
+
+  validate(proof: Sp1Groth16Proof | undefined): void {
+    this.witness(proof);
+  }
+
+  private witness(proof: Sp1Groth16Proof | undefined) {
+    if (!proof) throw new Error("an SP1 Groth16 proof is required");
+    if (proof.encodedProof.byteLength !== 352) {
+      throw new Error("SP1's encoded Groth16 proof must be exactly 352 bytes");
+    }
+    if (proof.publicInputs.length !== 5) {
+      throw new Error(
+        "SP1 Groth16 proofs must have exactly five public inputs",
+      );
+    }
+    return {
+      proof: decodeGnarkGroth16Bn254Proof(proof.encodedProof.subarray(96)),
+      signals: proof.publicInputs.map((input) => BigInt(input)),
+    };
+  }
+
+  async verify(
+    composer: RollupVerifierComposer<any>,
+    appClient: RollupVerifierClient,
+    sender: algosdk.AddressWithTransactionSigner,
+    publicValues: Uint8Array,
+    proof: Sp1Groth16Proof | undefined,
+  ): Promise<void> {
+    const witness = this.witness(proof);
+    const verifierLsig = await this.verifier.lsigAccount();
+    await this.verifier.verificationParams({
+      composer,
+      ...witness,
+      paramsCallback: async ({ lsigParams, lsigsFee, args }) => {
+        const verifier = await appClient.algorand.createTransaction.payment({
+          ...lsigParams,
+          amount: microAlgo(0),
+          receiver: appClient.appAddress,
+        });
+        composer.verifyBatch({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: {
+            // `createTransaction` returns a bare transaction and drops the signer that
+            // `lsigParams` carried, so it has to be reattached here. Without it the group's
+            // default signer is asked for this one too, and the LogicSig address it is sent
+            // from has no key to sign with.
+            verifier: { txn: verifier, signer: verifierLsig.signer },
+            ...args,
+            publicValues,
+          },
+          extraFee: lsigsFee,
+        });
+      },
+    });
+  }
+}
+
+class MockBatchProofVerifier implements BatchProofVerifier {
+  constructor(private readonly signer: algosdk.AddressWithTransactionSigner) {}
+
+  async address(): Promise<algosdk.Address> {
+    return this.signer.address;
+  }
+
+  validate(): void {}
+
+  async verify(
+    composer: RollupVerifierComposer<any>,
+    appClient: RollupVerifierClient,
+    sender: algosdk.AddressWithTransactionSigner,
+    publicValues: Uint8Array,
+  ): Promise<void> {
+    const digest = createHash("sha256").update(publicValues).digest();
+    digest[0]! &= 0b00011111;
+    const verifier = await appClient.algorand.createTransaction.payment({
+      sender: this.signer.address,
+      signer: this.signer.txnSigner,
+      receiver: appClient.appAddress,
+      amount: microAlgo(0),
+      staticFee: microAlgo(0),
+    });
+    const emptyProof: Groth16Bn254Proof = {
+      piA: new Uint8Array(64),
+      piB: new Uint8Array(128),
+      piC: new Uint8Array(64),
+    };
+    composer.verifyBatch({
+      sender: sender.address,
+      signer: sender.txnSigner,
+      args: {
+        verifier,
+        signals: [0n, algosdk.bytesToBigInt(digest), 0n, 0n, 0n],
+        proof: emptyProof,
+        publicValues,
+      },
+      extraFee: microAlgo(1_000),
+    });
+  }
+}
 
 /**
  * The rollup address a key controls, mirroring `address_from_public_key`.
@@ -229,7 +398,16 @@ export class RollupVerifier {
   appClient: RollupVerifierClient;
   private algorand: AlgorandClient;
 
-  constructor(algorand: AlgorandClient, appId: bigint) {
+  private proofVerifier?: BatchProofVerifier;
+
+  private testDeployment: boolean;
+
+  constructor(
+    algorand: AlgorandClient,
+    appId: bigint,
+    proofVerifier?: BatchProofVerifier,
+    testDeployment = false,
+  ) {
     this.algorand = algorand;
     this.appClient = algorand.client.getTypedAppClientById(
       RollupVerifierClient,
@@ -237,9 +415,12 @@ export class RollupVerifier {
         appId,
       },
     );
+    this.proofVerifier = proofVerifier;
+    this.testDeployment = testDeployment;
   }
 
   async deploymentDomain(): Promise<Uint8Array> {
+    if (this.testDeployment) return deploymentDomain(new Uint8Array(32), 0n);
     const { genesisHash } = await this.algorand.getSuggestedParams();
     return deploymentDomain(genesisHash!, this.appClient.appId);
   }
@@ -253,19 +434,85 @@ export class RollupVerifier {
   static async create(
     algorand: AlgorandClient,
     creator: algosdk.AddressWithTransactionSigner,
+    config: RollupVerifierConfig,
+  ) {
+    const proofVerifier = new LsigBatchProofVerifier(
+      algorand,
+      config.groth16VerificationKey,
+    );
+    return this.createWithVerifier(
+      algorand,
+      creator,
+      proofVerifier,
+      config.programVkeyHash,
+      config.recursionVkeyRoot ?? SP1_RECURSION_VKEY_ROOT,
+      config.inboxTimeout ?? INBOX_TIMEOUT_ROUNDS,
+      config.escapeGrace ?? ESCAPE_GRACE_ROUNDS,
+      config.testDeployment ?? false,
+    );
+  }
+
+  /** Deploy with a trusted signer in place of the Groth16 LogicSig. Contract-state tests only. */
+  static async createForTesting(
+    algorand: AlgorandClient,
+    creator: algosdk.AddressWithTransactionSigner,
     inboxTimeout: bigint = INBOX_TIMEOUT_ROUNDS,
     escapeGrace: bigint = ESCAPE_GRACE_ROUNDS,
   ) {
-    const factory = algorand.client.getTypedAppFactory(RollupVerifierFactory);
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error("createForTesting is only available when NODE_ENV=test");
+    }
+    return this.createWithVerifier(
+      algorand,
+      creator,
+      new MockBatchProofVerifier(creator),
+      new Uint8Array(32),
+      new Uint8Array(32),
+      inboxTimeout,
+      escapeGrace,
+      false,
+    );
+  }
+
+  private static async createWithVerifier(
+    algorand: AlgorandClient,
+    creator: algosdk.AddressWithTransactionSigner,
+    proofVerifier: BatchProofVerifier,
+    programVkeyHash: Uint8Array,
+    recursionVkeyRoot: Uint8Array,
+    inboxTimeout: bigint,
+    escapeGrace: bigint,
+    testDeployment: boolean,
+  ) {
+    if (
+      programVkeyHash.byteLength !== 32 ||
+      recursionVkeyRoot.byteLength !== 32
+    ) {
+      throw new Error("SP1 verification-key hashes must be exactly 32 bytes");
+    }
+    const factory = algorand.client.getTypedAppFactory(RollupVerifierFactory, {
+      deployTimeParams: { TEST_DEPLOYMENT: testDeployment ? 1 : 0 },
+    });
 
     const result = await factory.send.create.createApplication({
       sender: creator.address,
       signer: creator.txnSigner,
       note: `Created on ${Date.now()}`,
-      args: { inboxTimeout, escapeGrace },
+      args: {
+        verifierAddress: await proofVerifier.address(),
+        programVkeyHash,
+        recursionVkeyRoot,
+        inboxTimeout,
+        escapeGrace,
+      },
     });
 
-    const verifier = new RollupVerifier(algorand, result.appClient.appId);
+    const verifier = new RollupVerifier(
+      algorand,
+      result.appClient.appId,
+      proofVerifier,
+      testDeployment,
+    );
 
     // The app holds real ALGO now, so it needs its own base minimum balance before anything can pay
     // it. Each deposit brings its own box's minimum balance with it; this is only the account.
@@ -277,6 +524,21 @@ export class RollupVerifier {
     });
 
     return verifier;
+  }
+
+  /** Reconnect to a deployed rollup with the SP1 key used to derive its verifier LogicSig. */
+  static connect(
+    algorand: AlgorandClient,
+    appId: bigint,
+    groth16VerificationKey: Uint8Array,
+    testDeployment = false,
+  ): RollupVerifier {
+    return new RollupVerifier(
+      algorand,
+      appId,
+      new LsigBatchProofVerifier(algorand, groth16VerificationKey),
+      testDeployment,
+    );
   }
 
   /** Index the next deposit or forced withdrawal request will take. */
@@ -631,12 +893,22 @@ export class RollupVerifier {
     sender: algosdk.AddressWithTransactionSigner,
     batch: Uint8Array,
     publicValues: Uint8Array,
-    targets: { inboxCursor?: bigint } = {},
+    options: { inboxCursor?: bigint; proof?: Sp1Groth16Proof } = {},
   ): Promise<void> {
+    if (publicValues.byteLength !== 192) {
+      throw new Error("public values must be exactly 192 bytes");
+    }
+    if (!this.proofVerifier) {
+      throw new Error(
+        "this client has no proof verifier; use RollupVerifier.create or connect",
+      );
+    }
+    this.proofVerifier.validate(options.proof);
+
     const batchLength = batch.byteLength;
     const senderSigner = { sender: sender.address, signer: sender.txnSigner };
     const settledInboxCursor = await this.settledInboxCursor();
-    const targetInboxCursor = targets.inboxCursor ?? (await this.inboxCursor());
+    const targetInboxCursor = options.inboxCursor ?? (await this.inboxCursor());
     const checkpointBoxes =
       targetInboxCursor > settledInboxCursor
         ? [inboxBoxName(targetInboxCursor - 1n)]
@@ -675,13 +947,33 @@ export class RollupVerifier {
 
     await composer.send();
 
+    await this.settlePostedBatch(sender, publicValues, options.proof);
+  }
+
+  /** Verify and settle a batch whose open/chunk transactions were submitted separately. */
+  async settlePostedBatch(
+    sender: algosdk.AddressWithTransactionSigner,
+    publicValues: Uint8Array,
+    proof?: Sp1Groth16Proof,
+  ): Promise<void> {
     if (publicValues.byteLength !== 192) {
       throw new Error("public values must be exactly 192 bytes");
     }
 
-    await this.appClient.send.verifyBatch({
-      ...senderSigner,
-      args: { publicValues },
-    });
+    if (!this.proofVerifier) {
+      throw new Error(
+        "this client has no proof verifier; use RollupVerifier.create or connect",
+      );
+    }
+    this.proofVerifier.validate(proof);
+    const verificationGroup = this.appClient.newGroup();
+    await this.proofVerifier.verify(
+      verificationGroup,
+      this.appClient,
+      sender,
+      publicValues,
+      proof,
+    );
+    await verificationGroup.send();
   }
 }

@@ -5,6 +5,7 @@ import {
   INBOX_BOX_MBR,
   MIN_WITHDRAWAL,
   RollupVerifier,
+  decodeSp1VkeyHash,
   deploymentDomain,
   exitMessage,
   l2Address,
@@ -17,6 +18,7 @@ import algosdk from "algosdk";
 import nacl from "tweetnacl";
 import { createHash } from "node:crypto";
 import fixture from "../fixtures/settlements.json";
+import falcon100 from "../fixtures/proofs/falcon-100.json";
 
 type Scenario = (typeof fixture.scenarios)[number];
 
@@ -302,9 +304,60 @@ describe("rollup verifier", () => {
     }
   });
 
+  it("settles the Falcon-100 batch with its Groth16 proof", async () => {
+    const client = await RollupVerifier.create(algorand, sender, {
+      groth16VerificationKey: hex(falcon100.groth16VerificationKey),
+      programVkeyHash: decodeSp1VkeyHash(falcon100.vkey),
+      recursionVkeyRoot: hex(falcon100.recursionVkeyRoot),
+      testDeployment: true,
+    });
+    const proof = {
+      encodedProof: hex(falcon100.scenario.groth16.encodedProof),
+      publicInputs: falcon100.scenario.groth16.publicInputs as [
+        string,
+        string,
+        string,
+        string,
+        string,
+      ],
+    };
+
+    for (const deposit of falcon100.scenario.deposits) {
+      await client.deposit(
+        sender,
+        hex(deposit.recipient),
+        BigInt(deposit.amount),
+      );
+    }
+
+    const preBalance = (
+      await algorand.client.algod.accountInformation(sender.address).do()
+    ).amount;
+    await client.verifyBatch(
+      sender,
+      hex(falcon100.scenario.batch),
+      hex(falcon100.scenario.publicValues),
+      { proof },
+    );
+
+    const postBalance = (
+      await algorand.client.algod.accountInformation(sender.address).do()
+    ).amount;
+
+    expect(preBalance - postBalance).toMatchSnapshot("verifyBatch cost");
+
+    const state = await client.appClient.state.global.getAll();
+    expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
+      falcon100.scenario.newRoot,
+    );
+    expect(state.settledInboxCursor).toBe(
+      BigInt(falcon100.scenario.inbox.length),
+    );
+  }, 120_000);
+
   for (const s of fixture.scenarios) {
     it(`should verify with scenario ${s.name}`, async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await replayL1(client, s);
 
@@ -332,8 +385,8 @@ describe("rollup verifier", () => {
 
   describe("batch posting", () => {
     it("rejects a settlement committed for another application", async () => {
-      const first = await RollupVerifier.create(algorand, sender);
-      const second = await RollupVerifier.create(algorand, sender);
+      const first = await RollupVerifier.createForTesting(algorand, sender);
+      const second = await RollupVerifier.createForTesting(algorand, sender);
       const fixtureScenario = scenario("genesis-empty-batch");
       const firstBound = await bindScenario(first, fixtureScenario);
       const secondBound = await bindScenario(second, fixtureScenario);
@@ -351,12 +404,11 @@ describe("rollup verifier", () => {
       expect(secondBound.batchCommitment).not.toBe(firstBound.batchCommitment);
     });
 
-    // There is nothing for the contract to compare a withdrawal chain against, so a fabricated one
-    // settles -- and then wedges the sequencer, because no payout can ever reproduce a head that
-    // came from nowhere. That is the honest statement of where the trust sits until the verifier
-    // lands, and it costs the sequencer rather than anybody's funds.
-    it("accepts any withdrawal chain and is then stuck with it", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+    // The test verifier deliberately trusts the creator and recomputes the public-values signal.
+    // This exercises the payout-chain state machine without requiring a paid proof per test; the
+    // production LogicSig would reject these altered values because its proof would no longer match.
+    it("the mock verifier can install a withdrawal chain and is then stuck with it", async () => {
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const empty = await bindScenario(client, scenario("genesis-empty-batch"));
       const publicValues = hex(empty.publicValues);
       publicValues.fill(1, 160, 192);
@@ -378,8 +430,49 @@ describe("rollup verifier", () => {
       await expect(settle(client, scenario("deposits-only"))).rejects.toThrow();
     });
 
+    it("rejects public values that do not match the proof signal", async () => {
+      const client = await RollupVerifier.createForTesting(algorand, sender);
+      const s = await bindScenario(client, scenario("genesis-empty-batch"));
+
+      await client.appClient.send.openBatch({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: { batchLength: s.batchLength, targetInboxCursor: 0n },
+      });
+      await client.appClient.send.accumulateChunk({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        args: { chunk: hex(s.chunks[0]) },
+      });
+
+      const verifier = await algorand.createTransaction.payment({
+        sender: sender.address,
+        signer: sender.txnSigner,
+        receiver: client.appClient.appAddress,
+        amount: microAlgo(0),
+        staticFee: microAlgo(0),
+      });
+      await expect(
+        client.appClient.send.verifyBatch({
+          sender: sender.address,
+          signer: sender.txnSigner,
+          args: {
+            verifier,
+            signals: [0n, 0n, 0n, 0n, 0n],
+            proof: {
+              piA: new Uint8Array(64),
+              piB: new Uint8Array(128),
+              piC: new Uint8Array(64),
+            },
+            publicValues: hex(s.publicValues),
+          },
+          extraFee: microAlgo(1_000),
+        }),
+      ).rejects.toThrow();
+    });
+
     it("restricts open, chunk, verify, and abandon to the creator", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const outsider = await fundedOutsider();
       const s = await bindScenario(client, scenario("deposits-only"));
       await replayDeposits(client, s);
@@ -419,18 +512,14 @@ describe("rollup verifier", () => {
         });
       }
       await expect(
-        client.appClient.send.verifyBatch({
-          sender: outsider.address,
-          signer: outsider.txnSigner,
-          args: { publicValues: hex(s.publicValues) },
-        }),
+        client.settlePostedBatch(outsider, hex(s.publicValues)),
       ).rejects.toThrow();
       await expect(client.abandonBatch(outsider)).rejects.toThrow();
       await client.abandonBatch(sender);
     });
 
     it("rejects an extra empty chunk after the declared batch is complete", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = await bindScenario(client, scenario("multi-chunk"));
       await client.appClient.send.openBatch({
         sender: sender.address,
@@ -460,7 +549,7 @@ describe("rollup verifier", () => {
     });
 
     it("chains a second settlement from the first settled root and inbox", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const firstFixture = scenario("deposits-only");
       await replayDeposits(client, firstFixture);
       const first = await settle(client, firstFixture);
@@ -503,7 +592,7 @@ describe("rollup verifier", () => {
     };
 
     it("rejects a batch that credits a deposit L1 never accepted", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = depositsOnly();
 
       // Only the first two of the three the batch claims.
@@ -519,7 +608,7 @@ describe("rollup verifier", () => {
     });
 
     it("rejects a batch that omits a pending deposit", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = depositsOnly();
 
       await replayDeposits(client, s);
@@ -530,7 +619,7 @@ describe("rollup verifier", () => {
     });
 
     it("rejects a batch whose deposits arrived in a different order", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = depositsOnly();
 
       // The same three deposits, the same amounts, the wrong order. A set commitment would not
@@ -547,7 +636,7 @@ describe("rollup verifier", () => {
     });
 
     it("rejects a batch that alters a deposit's amount", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = depositsOnly();
 
       for (const [index, deposit] of s.deposits.entries()) {
@@ -564,7 +653,7 @@ describe("rollup verifier", () => {
     // The empty-batch case needs no special handling: a batch with no deposits commits
     // `new == old`, which cannot equal a sealed chain that a pending deposit has moved.
     it("rejects an empty batch while a deposit is pending", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await client.deposit(
         sender,
@@ -578,7 +667,7 @@ describe("rollup verifier", () => {
     // Deposits are accepted throughout a batch's posting; they simply belong to the next one. This
     // is what the copy-don't-reset seal buys, and it has to keep working.
     it("accepts a deposit that lands while a batch is being posted", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = await bindScenario(client, depositsOnly());
 
       await replayDeposits(client, s);
@@ -604,11 +693,7 @@ describe("rollup verifier", () => {
         });
       }
 
-      await client.appClient.send.verifyBatch({
-        sender: sender.address,
-        signer: sender.txnSigner,
-        args: { publicValues: hex(s.publicValues) },
-      });
+      await client.settlePostedBatch(sender, hex(s.publicValues));
 
       // The batch settled against the sealed chain, and the late deposit is still pending.
       const state = await client.appClient.state.global.getAll();
@@ -617,7 +702,7 @@ describe("rollup verifier", () => {
     });
 
     it("allows a batch to stop before a later pending deposit", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = await bindScenario(client, depositsOnly());
 
       await replayDeposits(client, s);
@@ -636,7 +721,7 @@ describe("rollup verifier", () => {
 
   describe("box lifecycle", () => {
     it("charges the depositor the box minimum balance and refunds it on prune", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = scenario("deposits-only");
       const app = client.appClient.appAddress;
 
@@ -669,7 +754,7 @@ describe("rollup verifier", () => {
     });
 
     it("refuses to prune a deposit that has not settled", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await client.deposit(
         sender,
@@ -686,7 +771,7 @@ describe("rollup verifier", () => {
 
     /** Deploy, replay the inbox, and settle, leaving the payout chain outstanding. */
     const settled = async (s: Scenario) => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       await replayL1(client, s);
       const bound = await settle(client, s);
 
@@ -819,7 +904,7 @@ describe("rollup verifier", () => {
     // advanced at settlement and none is returned at the end, because there is no box.
     it("pays out exactly the withdrawals, with no box minimum balance either way", async () => {
       const s = withdrawing();
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       await replayDeposits(client, s);
 
       const app = client.appClient.appAddress;
@@ -844,7 +929,7 @@ describe("rollup verifier", () => {
     // whole mechanism.
     it("leaves no chain for a batch that withdraws nothing", async () => {
       const s = scenario("deposits-only");
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await replayDeposits(client, s);
       await settle(client, s);
@@ -873,7 +958,7 @@ describe("rollup verifier", () => {
     // happens to the rollup afterwards. Being permissionless, the drain needs nobody's cooperation
     // either -- which is what stops an outstanding chain from becoming a hostage.
     it("still pays out after the rollup has escaped", async () => {
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -937,7 +1022,7 @@ describe("rollup verifier", () => {
 
     /** A rollup whose escape parameters are small enough to actually cross. */
     const escapable = () =>
-      RollupVerifier.create(
+      RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1030,11 +1115,7 @@ describe("rollup verifier", () => {
           args: { chunk: hex(chunk) },
         });
       }
-      await client.appClient.send.verifyBatch({
-        sender: sender.address,
-        signer: sender.txnSigner,
-        args: { publicValues: hex(s.publicValues) },
-      });
+      await client.settlePostedBatch(sender, hex(s.publicValues));
 
       const state = await client.appClient.state.global.getAll();
       expect(state.settledInboxCursor).toBe(3n);
@@ -1134,13 +1215,10 @@ describe("rollup verifier", () => {
         }),
       ).rejects.toThrow();
       await expect(
-        client.appClient.send.verifyBatch({
-          sender: sender.address,
-          signer: sender.txnSigner,
-          args: {
-            publicValues: hex((await bindScenario(client, s)).publicValues),
-          },
-        }),
+        client.settlePostedBatch(
+          sender,
+          hex((await bindScenario(client, s)).publicValues),
+        ),
       ).rejects.toThrow();
     });
 
@@ -1249,7 +1327,7 @@ describe("rollup verifier", () => {
 
     it("forces a batch to answer the request", async () => {
       const s = forcing();
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await replayL1(client, s);
       await settle(client, s);
@@ -1265,7 +1343,7 @@ describe("rollup verifier", () => {
     // forever while quietly dropping every withdrawal, and L1 had no way to tell.
     it("refuses to settle a batch that ignores a pending request", async () => {
       const s = scenario("forced-exit");
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request, pair } = subject();
 
       // The same two deposits the forced-exit batch credits, so that batch is otherwise settleable.
@@ -1287,7 +1365,7 @@ describe("rollup verifier", () => {
 
     it("pays the whole balance out to the account the request named", async () => {
       const s = forcing();
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await replayL1(client, s);
       const bound = await settle(client, s);
@@ -1307,7 +1385,7 @@ describe("rollup verifier", () => {
     // and simply pays nothing. What must not happen is the queue refusing to drain.
     it("lets an answered request be pruned and its minimum balance returned", async () => {
       const s = forcing();
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const app = client.appClient.appAddress;
 
       await replayL1(client, s);
@@ -1330,7 +1408,7 @@ describe("rollup verifier", () => {
     });
 
     it("refuses to prune a request that has not been answered", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request, pair } = subject();
 
       await client.requestWithdrawal(
@@ -1347,7 +1425,7 @@ describe("rollup verifier", () => {
     // The request names an account, not a person, so authorization has to come from the key that
     // account derives from. Otherwise anyone could drain anyone to an address of their choosing.
     it("refuses a request signed by the wrong key", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request } = subject();
 
       await expect(
@@ -1363,7 +1441,7 @@ describe("rollup verifier", () => {
     });
 
     it("refuses a key that does not derive the account", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request } = subject();
 
       await expect(
@@ -1380,7 +1458,7 @@ describe("rollup verifier", () => {
     // The nonce is inside the signed message, so a signature authorizes one request rather than an
     // unbounded stream of replays of it lifted off the chain.
     it("refuses a replayed signature", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request, pair } = subject();
       const recipient = algosdk.encodeAddress(hex(request.recipient));
 
@@ -1436,7 +1514,7 @@ describe("rollup verifier", () => {
 
     it("allows an open batch to stop before a later pending request", async () => {
       const s = scenario("forced-exit");
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const { request, pair } = subject();
 
       await replayDeposits(client, s);
@@ -1486,7 +1564,12 @@ describe("rollup verifier", () => {
 
     it("does not extend for a sub-256 mixed FIFO prefix and clears at its fixed target", async () => {
       const grace = 20n;
-      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        1n,
+        grace,
+      );
       const { request, pair } = subject();
       const depositRecipient = hex(
         scenario("deposits-only").deposits[0].recipient,
@@ -1556,7 +1639,12 @@ describe("rollup verifier", () => {
 
     it("extends exactly once for the first 256 of 257 FIFO entries, then clears", async () => {
       const grace = 20n;
-      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        1n,
+        grace,
+      );
       const recipient = hex(scenario("deposits-only").deposits[0].recipient);
       let chain = Buffer.alloc(32);
       let firstTrancheChain = Buffer.alloc(32);
@@ -1610,7 +1698,12 @@ describe("rollup verifier", () => {
     // was missed. Here 255 consumed inbox entries plus one payout make a tranche between them.
     it("lets a settlement and a payout share one obligation tranche", async () => {
       const grace = 20n;
-      const client = await RollupVerifier.create(algorand, sender, 1n, grace);
+      const client = await RollupVerifier.createForTesting(
+        algorand,
+        sender,
+        1n,
+        grace,
+      );
       const recipient = hex(scenario("deposits-only").deposits[0].recipient);
       let chain = Buffer.alloc(32);
       let shortOfTranche = Buffer.alloc(32);
@@ -1684,7 +1777,7 @@ describe("rollup verifier", () => {
     // A request arriving mid-batch lies beyond the selected checkpoint and belongs to a later
     // batch, so a batch in flight is not invalidated by somebody demanding an exit.
     it("accepts a request that lands while a batch is being posted", async () => {
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
       const s = await bindScenario(client, scenario("forced-exit"));
       const { request, pair } = subject();
 
@@ -1714,11 +1807,7 @@ describe("rollup verifier", () => {
           args: { chunk: hex(chunk) },
         });
       }
-      await client.appClient.send.verifyBatch({
-        sender: sender.address,
-        signer: sender.txnSigner,
-        args: { publicValues: hex(s.publicValues) },
-      });
+      await client.settlePostedBatch(sender, hex(s.publicValues));
 
       const state = await client.appClient.state.global.getAll();
       expect(state.settledInboxCursor).toBe(2n);
@@ -1728,7 +1817,7 @@ describe("rollup verifier", () => {
     // A sequencer that credited the earlier deposits but ignores the next request still leaves a
     // stale unified inbox head that can trigger escape.
     it("lets a censored withdrawal trigger the escape on its own", async () => {
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1763,7 +1852,7 @@ describe("rollup verifier", () => {
     });
 
     it("does not fire the escape while the request is still fresh", async () => {
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1785,7 +1874,7 @@ describe("rollup verifier", () => {
     // An escape means the request will never be answered, so its box has nothing left to wait for
     // and the account comes out through forceExit instead.
     it("lets an unanswered request be pruned after an escape", async () => {
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1810,7 +1899,7 @@ describe("rollup verifier", () => {
     });
 
     it("refuses a request once the rollup has escaped", async () => {
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1844,7 +1933,7 @@ describe("rollup verifier", () => {
     /** Deploy an escapable rollup, settle the forced-exit batch, and pull the hatch. */
     const escaped = async () => {
       const s = scenario("forced-exit");
-      const client = await RollupVerifier.create(
+      const client = await RollupVerifier.createForTesting(
         algorand,
         sender,
         TEST_INBOX_TIMEOUT,
@@ -1953,7 +2042,7 @@ describe("rollup verifier", () => {
 
     it("refuses before the rollup has escaped", async () => {
       const s = scenario("forced-exit");
-      const client = await RollupVerifier.create(algorand, sender);
+      const client = await RollupVerifier.createForTesting(algorand, sender);
 
       await replayDeposits(client, s);
       await settle(client, s);
@@ -2112,7 +2201,7 @@ describe("rollup verifier", () => {
   // Without this a batch that cannot settle wedges the contract permanently: `openBatch` refuses
   // while one is in flight, and only `verifyBatch` used to clear that.
   it("can abandon a stuck batch and settle a clean one after", async () => {
-    const client = await RollupVerifier.create(algorand, sender);
+    const client = await RollupVerifier.createForTesting(algorand, sender);
     const s = scenario("deposits-only");
 
     await replayDeposits(client, s);

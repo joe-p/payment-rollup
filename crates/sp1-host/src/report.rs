@@ -105,7 +105,7 @@ fn syscalls(report: &ExecutionReport) -> Vec<(String, u64)> {
         .collect();
 
     // Descending by count, then by name, so two runs of the same block print identically rather
-        // than in whatever order ties happened to fall.
+    // than in whatever order ties happened to fall.
     used.sort_by(|(left_name, left), (right_name, right)| {
         right.cmp(left).then_with(|| left_name.cmp(right_name))
     });

@@ -11,6 +11,7 @@ import {
   gtxn,
   GlobalState,
   itxn,
+  TemplateVar,
   Txn,
   uint64,
   Account,
@@ -36,6 +37,9 @@ import {
  * chunks and never reach the same commitment.
  */
 const CHUNK_SIZE = 4094;
+
+/** Set at deployment to admit fixture proofs bound to the zero-genesis, app-zero domain. */
+const TEST_DEPLOYMENT = TemplateVar<uint64>("TEST_DEPLOYMENT");
 
 /**
  * One posted fragment of a batch.
@@ -72,6 +76,14 @@ export type Chunk = bytes;
  * one: reaching the terminal is what says there are no more.
  */
 export type PublicValues = bytes<192>;
+
+/** Public inputs and proof shape consumed by the BN254 Groth16 verifier LogicSig. */
+export type Signals = arc4.Uint256[];
+export type Groth16Bn254Proof = {
+  piA: bytes<64>;
+  piB: bytes<128>;
+  piC: bytes<64>;
+};
 
 /**
  * Obligations the rollup must discharge to earn one escape grace extension.
@@ -151,6 +163,11 @@ function appMinBalance(): uint64 {
 
 /** The network- and application-specific domain shared with the guest and signing clients. */
 function deploymentDomain(): bytes<32> {
+  if (TEST_DEPLOYMENT) {
+    return Bytes.fromHex(
+      "0b3bf74fb87b14782088e606f38c5f1a58252cf7d1fc3ce19046fdfdaaa379ef",
+    ).toFixed({ length: 32 });
+  }
   return sha256(
     Bytes("PAYMENT_ROLLUP_V1")
       .concat(Global.genesisHash)
@@ -173,6 +190,15 @@ function withdrawalTerminal(): bytes<32> {
 }
 
 export class RollupVerifier extends Contract {
+  /** LogicSig address compiled with SP1's Groth16 verification key. */
+  verifierAddress = GlobalState<Account>();
+
+  /** BN254 representation of this guest ELF's SP1 verification-key hash. */
+  programVkeyHash = GlobalState<bytes<32>>();
+
+  /** SP1 recursion verification-key root for the SP1 release used to prove batches. */
+  recursionVkeyRoot = GlobalState<bytes<32>>();
+
   /**
    * The root the chain has settled on: the state every future batch must start from.
    *
@@ -331,7 +357,13 @@ export class RollupVerifier extends Contract {
    * halt; too high, and whoever is stuck in the inbox -- a depositor waiting to be credited, or an
    * account waiting to be let out -- waits that long for the hatch to open.
    */
-  createApplication(inboxTimeout: uint64, escapeGrace: uint64): void {
+  createApplication(
+    verifierAddress: Account,
+    programVkeyHash: bytes<32>,
+    recursionVkeyRoot: bytes<32>,
+    inboxTimeout: uint64,
+    escapeGrace: uint64,
+  ): void {
     this.stateRoot.value = bzero(32);
     this.inboxChain.value = bzero(32);
     this.settledInboxChain.value = bzero(32);
@@ -340,6 +372,9 @@ export class RollupVerifier extends Contract {
     this.requestCursor.value = 0;
 
     this.escaped.value = false;
+    this.verifierAddress.value = verifierAddress;
+    this.programVkeyHash.value = programVkeyHash;
+    this.recursionVkeyRoot.value = recursionVkeyRoot;
     this.inboxTimeout.value = inboxTimeout;
     this.escapeGrace.value = escapeGrace;
   }
@@ -1118,14 +1153,9 @@ export class RollupVerifier extends Contract {
    * The two inbox checks make the selected FIFO prefix exactly L1's: inventing, dropping, reordering
    * or altering either kind of entry diverges the fold and never recovers.
    *
-   * **None of that binds yet.** The proof is not verified -- see the TODO below -- and
-   * `publicValues` is an ordinary argument, so a dishonest sequencer can read `sealedInboxChain`
-   * straight out of global state and hand it back while the batch bytes say something else -- and
-   * can put whatever it likes in the withdrawal chain. The
-   * chain is the right mechanism and becomes airtight the moment the verifier lands, with no
-   * redesign; until then the sequencer is trusted here exactly as it is already trusted with
-   * `stateRoot`. What does hold today is data availability: the accumulator forces the real bytes
-   * on-chain, so the fraud is detectable by replay, just not preventable.
+   * The preceding payment is signed by a LogicSig compiled with SP1's Groth16 verification key.
+   * That LogicSig verifies `proof` against all five `signals`; the checks below bind those signals
+   * to this guest program, these exact public values, successful execution, and this SP1 release.
    *
    * No box is read here, and none should ever be. That is what keeps the cost of settling
    * independent of how many inbox entries are queued -- and now of how much the batch withdrew, too,
@@ -1141,7 +1171,12 @@ export class RollupVerifier extends Contract {
    * obligations discharged, on the same counter `payWithdrawal` feeds. Later arrivals never move the
    * target. Once the deadline has passed no settlement can race `executeEscape`.
    */
-  verifyBatch(publicValues: PublicValues): void {
+  verifyBatch(
+    verifier: gtxn.PaymentTxn,
+    signals: Signals,
+    proof: Groth16Bn254Proof,
+    publicValues: PublicValues,
+  ): void {
     assert(
       Txn.sender === Global.creatorAddress,
       "only the creator may settle a batch",
@@ -1156,6 +1191,29 @@ export class RollupVerifier extends Contract {
     assert(
       this.postedLength.value === this.batchLength.value,
       "the batch is not fully posted",
+    );
+    assert(
+      verifier.sender === this.verifierAddress.value,
+      "invalid proof verifier",
+    );
+    assert(signals.length === 5, "SP1 proofs have five public inputs");
+    assert(
+      signals.at(0)!.bytes === this.programVkeyHash.value,
+      "the proof is for a different program",
+    );
+    assert(
+      signals.at(1)!.bytes ===
+        sha256(publicValues).bitwiseAnd(
+          Bytes.fromHex(
+            "1fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          ),
+        ),
+      "the proof commits different public values",
+    );
+    assert(signals.at(2)!.bytes === bzero(32), "the guest execution failed");
+    assert(
+      signals.at(3)!.bytes === this.recursionVkeyRoot.value,
+      "the proof is from a different SP1 verifier set",
     );
 
     const oldRoot = publicValues.slice(0, 32);
@@ -1197,8 +1255,6 @@ export class RollupVerifier extends Contract {
     if (withdrawalChain !== withdrawalTerminal()) {
       this.pendingWithdrawals.value = withdrawalChain.toFixed({ length: 32 });
     }
-
-    // TODO: Actual ZK verification
 
     this.chunkAccumulator.delete();
     this.batchLength.delete();

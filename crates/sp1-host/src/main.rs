@@ -21,6 +21,9 @@ use sp1_host::{
 /// that cannot prove as well as by one that can.
 const NETWORKS: [&str; 4] = ["mainnet", "auction", "reserved", "hosted"];
 
+/// Standalone e2e inputs written after each paid proof completes.
+const PROOF_FIXTURES_DIR: &str = "contracts/fixtures/proofs";
+
 const USAGE: &str = "\
 Emit settlement fixtures for the rollup verifier contract.
 
@@ -32,7 +35,7 @@ by accident and so do not appear in --list or an unnamed run -- name one directl
 (see scenarios::heavy in sp1-host's source for what those are and why).
 
 Options:
-  --out <PATH>       write the JSON here instead of to stdout
+  --out <PATH>       write the combined JSON here instead of to stdout
   --include-sidecar  include the prover-only sidecar bytes, which the contract does not need
   --genesis-hash <HEX>  32-byte settlement-chain genesis hash (default: zero)
   --app-id <U64>        settlement application ID (default: 0)
@@ -40,7 +43,8 @@ Options:
                      Groth16 proof alongside its fixture. Needs a binary built with
                      `--features prove` (see this crate's Cargo.toml for what that needs
                      installed) and NETWORK_PRIVATE_KEY in the environment. Scenarios must be
-                     named: each one is a paid request.
+                      named: each one is a paid request. Writes each proved scenario's standalone
+                      e2e fixture to contracts/fixtures/proofs/<scenario>.json.
   --report           execute each scenario's block in the zkVM locally and report what it cost:
                      instructions, gas, and the per-precompile syscall counts. Free, needs no
                      network, and needs the same `--features prove` build as --prove, which is
@@ -163,6 +167,23 @@ fn parse_args() -> Result<Option<Args>, String> {
     Ok(Some(args))
 }
 
+fn write_json(path: &std::path::Path, document: &Value) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+    }
+
+    let mut json = serde_json::to_string_pretty(document).map_err(|error| error.to_string())?;
+    json.push('\n');
+    std::fs::write(path, json).map_err(|error| format!("writing {}: {error}", path.display()))?;
+    eprintln!("wrote {}", path.display());
+
+    Ok(())
+}
+
 #[cfg(feature = "prove")]
 use sp1_host::{prove::Groth16Prover, report::Reporter};
 
@@ -191,6 +212,14 @@ impl Groth16Prover {
 
     fn prove(&self, _settlement: &Settlement) -> Result<ProofFixture, String> {
         match *self {}
+    }
+
+    fn groth16_verification_key() -> &'static [u8] {
+        &[]
+    }
+
+    fn recursion_vkey_root() -> [u8; 32] {
+        [0; 32]
     }
 }
 
@@ -309,12 +338,33 @@ fn run() -> Result<(), String> {
             None => None,
         };
 
-        emitted.push(fixture(
-            scenario,
-            &settlement,
-            args.include_sidecar,
-            proof.as_ref(),
-        ));
+        let fixture = fixture(scenario, &settlement, args.include_sidecar, proof.as_ref());
+
+        // A paid proof is useful only if its exact batch, public values, and verifier configuration
+        // survive with it. Keep each one self-contained so an e2e test need not match it to a
+        // separate deployment fixture.
+        if let Some(prover) = &prover {
+            let artifact = json!({
+                "chunkSize": sp1_host::CHUNK_SIZE,
+                "publicValuesSize": PUBLIC_VALUES_SIZE,
+                "minWithdrawal": MIN_WITHDRAWAL,
+                "deploymentDomain": hex(&domain),
+                "genesisHash": hex(&args.genesis_hash),
+                "appId": args.app_id,
+                "genesisRoot": hex(&GENESIS_ROOT),
+                "inboxChainGenesis": hex(&INBOX_CHAIN_GENESIS),
+                "vkey": prover.vkey(),
+                "groth16VerificationKey": hex(Groth16Prover::groth16_verification_key()),
+                "recursionVkeyRoot": hex(&Groth16Prover::recursion_vkey_root()),
+                "network": args.network,
+                "scenario": fixture,
+            });
+            let path =
+                std::path::Path::new(PROOF_FIXTURES_DIR).join(format!("{}.json", scenario.name));
+            write_json(&path, &artifact)?;
+        }
+
+        emitted.push(fixture);
     }
 
     let mut document = json!({
@@ -336,28 +386,21 @@ fn run() -> Result<(), String> {
     // cannot mistake a stale key for the one these proofs verify under.
     if let Some(prover) = &prover {
         document["vkey"] = json!(prover.vkey());
+        document["groth16VerificationKey"] = json!(hex(Groth16Prover::groth16_verification_key()));
+        document["recursionVkeyRoot"] = json!(hex(&Groth16Prover::recursion_vkey_root()));
         document["network"] = json!(args.network);
     }
 
-    let mut json = serde_json::to_string_pretty(&document).map_err(|error| error.to_string())?;
-    json.push('\n');
-
     match &args.out {
         Some(path) => {
-            let path = std::path::Path::new(path);
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-            }
-
-            std::fs::write(path, &json)
-                .map_err(|error| format!("writing {}: {error}", path.display()))?;
-            eprintln!("wrote {}", path.display());
+            write_json(std::path::Path::new(path), &document)?;
         }
-        None => print!("{json}"),
+        None => {
+            let mut json =
+                serde_json::to_string_pretty(&document).map_err(|error| error.to_string())?;
+            json.push('\n');
+            print!("{json}");
+        }
     }
 
     Ok(())
