@@ -19,6 +19,9 @@ import nacl from "tweetnacl";
 import { createHash } from "node:crypto";
 import fixture from "../fixtures/settlements.json";
 import falcon100 from "../fixtures/proofs/falcon-100.json";
+import falcon1000 from "../fixtures/proofs/falcon-1000.json";
+
+const PROOFS = [falcon100, falcon1000];
 
 type Scenario = (typeof fixture.scenarios)[number];
 
@@ -304,56 +307,62 @@ describe("rollup verifier", () => {
     }
   });
 
-  it("settles the Falcon-100 batch with its Groth16 proof", async () => {
-    const client = await RollupVerifier.create(algorand, sender, {
-      groth16VerificationKey: hex(falcon100.groth16VerificationKey),
-      programVkeyHash: decodeSp1VkeyHash(falcon100.vkey),
-      recursionVkeyRoot: hex(falcon100.recursionVkeyRoot),
-      testDeployment: true,
-    });
-    const proof = {
-      encodedProof: hex(falcon100.scenario.groth16.encodedProof),
-      publicInputs: falcon100.scenario.groth16.publicInputs as [
-        string,
-        string,
-        string,
-        string,
-        string,
-      ],
-    };
+  for (const proofScenario of PROOFS) {
+    it(`settles the ${proofScenario.scenario.name} batch with its Groth16 proof`, async () => {
+      const client = await RollupVerifier.create(algorand, sender, {
+        groth16VerificationKey: hex(proofScenario.groth16VerificationKey),
+        programVkeyHash: decodeSp1VkeyHash(proofScenario.vkey),
+        recursionVkeyRoot: hex(proofScenario.recursionVkeyRoot),
+        testDeployment: true,
+      });
+      const proof = {
+        encodedProof: hex(proofScenario.scenario.groth16.encodedProof),
+        publicInputs: proofScenario.scenario.groth16.publicInputs as [
+          string,
+          string,
+          string,
+          string,
+          string,
+        ],
+      };
 
-    for (const deposit of falcon100.scenario.deposits) {
-      await client.deposit(
+      for (const deposit of proofScenario.scenario.deposits) {
+        await client.deposit(
+          sender,
+          hex(deposit.recipient),
+          BigInt(deposit.amount),
+        );
+      }
+
+      const preBalance = (
+        await algorand.client.algod.accountInformation(sender.address).do()
+      ).amount;
+      await client.verifyBatch(
         sender,
-        hex(deposit.recipient),
-        BigInt(deposit.amount),
+        hex(proofScenario.scenario.batch),
+        hex(proofScenario.scenario.publicValues),
+        { proof },
       );
-    }
 
-    const preBalance = (
-      await algorand.client.algod.accountInformation(sender.address).do()
-    ).amount;
-    await client.verifyBatch(
-      sender,
-      hex(falcon100.scenario.batch),
-      hex(falcon100.scenario.publicValues),
-      { proof },
-    );
+      const postBalance = (
+        await algorand.client.algod.accountInformation(sender.address).do()
+      ).amount;
 
-    const postBalance = (
-      await algorand.client.algod.accountInformation(sender.address).do()
-    ).amount;
+      expect(preBalance - postBalance).toMatchSnapshot("verifyBatch cost");
+      const txnCount = BigInt(proofScenario.scenario.name.split("-")[1]!);
+      expect((preBalance - postBalance) / txnCount).toMatchSnapshot(
+        "verifyBatch cost per txn",
+      );
 
-    expect(preBalance - postBalance).toMatchSnapshot("verifyBatch cost");
-
-    const state = await client.appClient.state.global.getAll();
-    expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
-      falcon100.scenario.newRoot,
-    );
-    expect(state.settledInboxCursor).toBe(
-      BigInt(falcon100.scenario.inbox.length),
-    );
-  }, 120_000);
+      const state = await client.appClient.state.global.getAll();
+      expect(Buffer.from(state.stateRoot!.asByteArray()!).toString("hex")).toBe(
+        proofScenario.scenario.newRoot,
+      );
+      expect(state.settledInboxCursor).toBe(
+        BigInt(proofScenario.scenario.inbox.length),
+      );
+    }, 120_000);
+  }
 
   for (const s of fixture.scenarios) {
     it(`should verify with scenario ${s.name}`, async () => {

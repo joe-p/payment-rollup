@@ -1,3 +1,11 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`rollup verifier > settles the Falcon-100 batch with its Groth16 proof > verifyBatch cost 1`] = `6531n`;
+
+exports[`rollup verifier > settles the falcon-100 batch with its Groth16 proof > verifyBatch cost 1`] = `6531n`;
+
+exports[`rollup verifier > settles the falcon-100 batch with its Groth16 proof > verifyBatch cost per txn 1`] = `65n`;
+
+exports[`rollup verifier > settles the falcon-1000 batch with its Groth16 proof > verifyBatch cost 1`] = `8062n`;
+
+exports[`rollup verifier > settles the falcon-1000 batch with its Groth16 proof > verifyBatch cost per txn 1`] = `8n`;
